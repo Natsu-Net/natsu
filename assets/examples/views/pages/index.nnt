@@ -1,0 +1,17 @@
+<html lang="en">
+
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Document</title>
+	</head>
+
+	<body>
+		{{> layouts/head }}
+		<h3>This is index page ! : {{name}}</h3>
+		<span>index page!</span>
+        {{> layouts/test/comp }}
+		{{> layouts/foot }}
+	</body>
+
+</html>

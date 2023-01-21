@@ -1,0 +1,26 @@
+{
+	"General": {
+		"url": "http://127.0.0.1:8083",
+		"bantime": 300,
+		"port": 8083,
+		"listenOn": "0.0.0.0",
+		"logFormat": "[<yellow>{{ctx.request.method}}</yellow>] {{ctx.request.ip}} - <magenta>{{ctx.request.url}}</magenta> in <{{color}}>{{ms}}ms</{{color}}>"
+	},
+	"Cache" : {
+		"enablePublicCache": true,
+		"publicCacheTTL": 900,
+		"autoUpdatePublicCache": true,
+		"logPublicHit": true
+	},
+	"MySQL": {
+		"host": "",
+		"database": "",
+		"username": "",
+		"password": "",
+		"charset": ""
+	},
+	"Session" : {
+		"CookieName": "NASTU_SESSION",
+		"driver": "none"
+	}
+}

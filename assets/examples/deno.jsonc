@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"allowJs": true,
+		"lib": ["deno.window"],
+		"strict": true,
+		"types": [
+			"global.d.ts"
+		]
+	},
+	"tasks": {
+		"dev": "deno run -A --unstable --import-map=import_map.json ../cli/mod.ts dev",
+		"start": "deno run -A --unstable --import-map=import_map.json ../cli/mod.ts start",
+		"init": "deno run -A --unstable --import-map=import_map.json ../cli/mod.ts init",
+		"up": "deno cache -r ../cli/mod.ts"
+	}
+}
