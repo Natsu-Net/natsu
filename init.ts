@@ -1,6 +1,6 @@
 import { decompress } from "https://deno.land/x/zip@v1.2.4/mod.ts";
 
-const filesURL = "https://natsu-net.xyz/templates.zip";
+const filesURL = "";
 const ZipFile = "templates.zip";
 
 async function download( dest : string ) {
