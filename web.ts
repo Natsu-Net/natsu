@@ -143,10 +143,10 @@ async function loadServerstuff(dev = false): Promise<void> {
 	}
 
 	// make sure all files in controllers are read
-	await RecurisveImport(`${Deno.cwd()}/controller`, dev);
-
 	await RecurisveImport(`${Deno.cwd()}/routes`, dev);
-
+	
+	await RecurisveImport(`${Deno.cwd()}/controller`, dev);
+	
 	app.use(Router.routes());
 
 	uwu.InitView();
