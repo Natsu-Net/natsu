@@ -13,7 +13,7 @@ import { config } from "./src/global/config.ts";
 ExtMapping[".svg"] = ["image/svg+xml"];
 
 // extract Application, send, isHttpError, ErrorStatus from oak
-const { Application, FlashServer, hasFlash } = Oak;
+const { Application } = Oak;
 
 // create a function to check if file exists
 function exists(path: string): boolean {
@@ -25,8 +25,8 @@ function exists(path: string): boolean {
 	}
 }
 //const appOptions = hasFlash() ? { serverConstructor: FlashServer } : undefined;
-const appOptions = hasFlash() ? { serverConstructor: FlashServer } : undefined;
-const app = new Application({ ...appOptions,proxy: config.General.proxy });
+
+const app = new Application({ proxy: config.General.proxy });
 let listenPromise: Promise<void>;
 
 let controller: AbortController;
