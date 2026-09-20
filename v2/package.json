@@ -1,0 +1,23 @@
+{
+	"name": "natsu",
+	"version": "2.0.0-alpha.1",
+	"description": "natsu web framework — Bun core (v2). Zero runtime dependencies; the devDependencies exist only to typecheck.",
+	"private": true,
+	"type": "module",
+	"module": "index.ts",
+	"main": "index.ts",
+	"types": "index.ts",
+	"scripts": {
+		"test": "bun test",
+		"bench": "bun run bench/bench.ts",
+		"dev": "bun run --watch example/app.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"engines": {
+		"bun": ">=1.3.0"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.2",
+		"typescript": "^7.0.2"
+	}
+}
