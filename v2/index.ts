@@ -9,7 +9,7 @@
  */
 
 import { Cache, defaultCache } from "./src/cache.ts";
-import { config, loadConfig, resetConfig, setConfig } from "./src/config.ts";
+import { config, envOverlay, loadConfig, resetConfig, setConfig } from "./src/config.ts";
 import { Context, NatsuResponse } from "./src/context.ts";
 import { Controller, GetController, clearControllers, controllerNames, hasController } from "./src/controller.ts";
 import { CLog, colorize, log, setColorEnabled, setLogLevel, setLogSink, stripTags } from "./src/logger.ts";
@@ -25,7 +25,7 @@ export { Router, All, Delete, Get, Head, Options, Patch, Post, Put };
 export { Controller, GetController, clearControllers, controllerNames, hasController };
 export { Context, NatsuResponse };
 export { Cache, defaultCache };
-export { config, loadConfig, setConfig, resetConfig };
+export { config, loadConfig, setConfig, resetConfig, envOverlay };
 export { CLog, colorize, log, setColorEnabled, setLogLevel, setLogSink, stripTags };
 export { StaticFiles, parseRange };
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };

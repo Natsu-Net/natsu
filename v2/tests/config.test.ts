@@ -1,10 +1,12 @@
 import { describe, expect, test, afterEach } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	ConfigError,
 	config,
 	defaultConfig,
+	envOverlay,
 	loadConfig,
 	mergeConfig,
 	resetConfig,
@@ -146,5 +148,80 @@ describe("staticRoot", () => {
 		const cfg = defaultConfig();
 		cfg.Static.root = "/var/www";
 		expect(staticRoot(cfg, "/srv/app")).toBe("/var/www");
+	});
+});
+
+describe("environment overlay", () => {
+	test("a value lands at the path its name spells", () => {
+		const config = loadConfig({
+			cwd: "/nonexistent",
+			env: { NATSU__General__logLevel: "debug", NATSU__Session__CookieName: "SID" },
+		});
+		expect(config.General.logLevel).toBe("debug");
+		expect(config.Session.CookieName).toBe("SID");
+	});
+
+	test("values are coerced to the type of the default underneath", () => {
+		const config = loadConfig({
+			cwd: "/nonexistent",
+			env: {
+				NATSU__General__port: "9000",
+				NATSU__General__proxy: "true",
+				NATSU__Static__etag: "0",
+				NATSU__General__logIgnore: '["/health"]',
+			},
+		});
+		expect(config.General.port).toBe(9000);
+		expect(config.General.proxy).toBe(true);
+		expect(config.Static.etag).toBe(false);
+		expect(config.General.logIgnore).toEqual(["/health"]);
+	});
+
+	test("a single underscore stays part of the name", () => {
+		// `Discord.CLIENT_ID` is one key, not two levels.
+		const overlay = envOverlay({ NATSU__Discord__CLIENT_ID: "123" }) as { Discord: Record<string, unknown> };
+		expect(overlay.Discord).toEqual({ CLIENT_ID: "123" });
+	});
+
+	test("a section natsu knows nothing about comes through as typed", () => {
+		const overlay = envOverlay({
+			NATSU__Surreal__password: "12345",
+			NATSU__Surreal__applySchema: "true",
+			NATSU__Player__adsUrl: "",
+		}) as { Surreal: Record<string, unknown>; Player: Record<string, unknown> };
+		// A password that looks like a number is still a password.
+		expect(overlay.Surreal.password).toBe("12345");
+		// With no default to learn from, a bare word stays a string; the app's
+		// own types say what it means.
+		expect(overlay.Surreal.applySchema).toBe("true");
+		expect(overlay.Player.adsUrl).toBe("");
+	});
+
+	test("_FILE reads the value out of a file, without its trailing newline", () => {
+		const path = `${tmpdir()}/natsu-secret-${Math.random().toString(36).slice(2)}`;
+		writeFileSync(path, "s3cret\n");
+		try {
+			const overlay = envOverlay({ NATSU__MySQL__password_FILE: path }) as { MySQL: Record<string, unknown> };
+			expect(overlay.MySQL.password).toBe("s3cret");
+		} finally {
+			unlinkSync(path);
+		}
+	});
+
+	test("_FILE pointing at nothing is an error, not an empty password", () => {
+		expect(() => envOverlay({ NATSU__MySQL__password_FILE: "/nope/nothing" })).toThrow(ConfigError);
+	});
+
+	test("the environment beats config.json but code overrides beat both", () => {
+		const config = loadConfig({
+			cwd: "/nonexistent",
+			env: { NATSU__General__port: "9000" },
+			overrides: { General: { port: 7000 } },
+		});
+		expect(config.General.port).toBe(7000);
+	});
+
+	test("variables without the prefix are ignored", () => {
+		expect(envOverlay({ PATH: "/usr/bin", HOME: "/root" })).toEqual({});
 	});
 });

@@ -205,12 +205,108 @@ export function staticRoot(config: NatsuConfig, cwd: string = process.cwd()): st
 	return isAbsolute(root) ? resolve(root) : resolve(cwd, root);
 }
 
+// --- environment overlay ---------------------------------------------------
+
+/** Prefix that marks an environment variable as configuration. */
+const ENV_PREFIX = "NATSU__";
+/** Separator between path segments, so a key may contain a single underscore. */
+const ENV_SEPARATOR = "__";
+/** Suffix naming a file to read the value from, for Docker and systemd secrets. */
+const ENV_FILE_SUFFIX = "_FILE";
+
+/**
+ * Turn `NATSU__Section__key=value` environment variables into a config patch.
+ *
+ * This exists so a deployment can supply secrets without writing them to disk:
+ * a container gets `NATSU__Surreal__password` from its orchestrator, or
+ * `NATSU__Surreal__password_FILE=/run/secrets/db` pointing at a mounted secret,
+ * and `config.json` never has to hold anything sensitive.
+ *
+ * Section and key names are **case-sensitive and spelled as they are in the
+ * config**, because that is what makes the mapping obvious in both directions:
+ * `NATSU__General__logLevel` is `General.logLevel`. The separator is a double
+ * underscore so that a single one stays part of a name — `Discord.CLIENT_ID`
+ * is `NATSU__Discord__CLIENT_ID`, not three levels of nesting.
+ *
+ * Values are strings. Each is coerced to the type of the default sitting at
+ * that path: a number stays a number, `"true"`/`"1"`/`"yes"`/`"on"` become
+ * booleans, arrays and objects are parsed as JSON. A path with no default —
+ * an application's own section — is parsed as JSON when it looks like JSON and
+ * left as a string otherwise, which is what a password wants.
+ */
+export function envOverlay(
+	env: Record<string, string | undefined> = process.env,
+	base: NatsuConfig = defaultConfig(),
+): NatsuConfigInput {
+	const patch: Record<string, unknown> = {};
+
+	for (const [name, raw] of Object.entries(env)) {
+		if (raw === undefined || !name.startsWith(ENV_PREFIX)) continue;
+
+		let key = name.slice(ENV_PREFIX.length);
+		let value = raw;
+		if (key.endsWith(ENV_FILE_SUFFIX)) {
+			key = key.slice(0, -ENV_FILE_SUFFIX.length);
+			try {
+				// Trailing newline: every tool that writes a secret file adds one.
+				value = readFileSync(raw, "utf8").replace(/\r?\n$/, "");
+			} catch (error) {
+				throw new ConfigError(`${name} points at ${raw}, which cannot be read: ${(error as Error).message}`);
+			}
+		}
+
+		const path = key.split(ENV_SEPARATOR).filter(Boolean);
+		if (path.length === 0) continue;
+
+		let cursor = patch;
+		let defaults: unknown = base;
+		for (const segment of path.slice(0, -1)) {
+			const next = cursor[segment];
+			cursor = isPlainObject(next) ? (next as Record<string, unknown>) : (cursor[segment] = {});
+			defaults = isPlainObject(defaults) ? (defaults as Record<string, unknown>)[segment] : undefined;
+		}
+		const last = path[path.length - 1];
+		if (last === undefined) continue;
+		const fallback = isPlainObject(defaults) ? (defaults as Record<string, unknown>)[last] : undefined;
+		cursor[last] = coerceEnvValue(value, fallback);
+	}
+
+	return patch as NatsuConfigInput;
+}
+
+function coerceEnvValue(value: string, fallback: unknown): unknown {
+	if (typeof fallback === "number") {
+		const n = Number(value);
+		if (Number.isNaN(n)) throw new ConfigError(`${JSON.stringify(value)} is not a number`);
+		return n;
+	}
+	if (typeof fallback === "boolean") return /^(1|true|yes|on)$/i.test(value);
+	if (Array.isArray(fallback) || isPlainObject(fallback)) return parseJson(value);
+	if (typeof fallback === "string") return value;
+
+	// No default to learn from: this is an application's own section. Parse it
+	// as JSON only when it unambiguously is, so a password of "null" or "12"
+	// stays the string the operator typed.
+	const trimmed = value.trim();
+	return trimmed.startsWith("{") || trimmed.startsWith("[") ? parseJson(trimmed) : value;
+}
+
+function parseJson(value: string): unknown {
+	try {
+		return JSON.parse(value);
+	} catch (error) {
+		throw new ConfigError(`${JSON.stringify(value)} is not valid JSON: ${(error as Error).message}`);
+	}
+}
+
 export interface LoadOptions {
 	cwd?: string;
 	/** Config file name, relative to cwd. */
 	file?: string;
 	/** Applied after the file, so code can pin values a file cannot override. */
 	overrides?: NatsuConfigInput;
+	/** Defaults to `process.env`. Tests pass their own. */
+	env?: Record<string, string | undefined>;
 }
 
 /**
@@ -238,6 +334,10 @@ export function loadConfig(options: LoadOptions = {}): NatsuConfig {
 		}
 		merged = mergeConfig(merged, parsed);
 	}
+
+	// After the file, before code overrides: an operator's environment beats a
+	// file that was baked into an image, and code still has the last word.
+	merged = mergeConfig(merged, envOverlay(options.env ?? process.env, merged));
 
 	if (options.overrides) merged = mergeConfig(merged, options.overrides);
 	return validate(merged);
