@@ -10,6 +10,6 @@
     },
   },
   "packages": {
-    "uwu-template": ["uwu-template@github:beingsuz/uwu-template#1b40792ef3ac1b904464b5a5bea54273ff4f1214", {}, "beingsuz-uwu-template-1b40792ef3ac1b904464b5a5bea54273ff4f1214", "sha512-WOerhpPhj0Yx0Mlircrk4af9wJa+TQR/9yG75m8wSoGXmk6dzB9MdQ41XqtsGM1F79w/LUYaLOb9IP+auhyd8g=="],
+    "uwu-template": ["uwu-template@github:beingsuz/uwu-template#8e485226e6d168f752cc8ca9768cdec645df10a2", {}, "beingsuz-uwu-template-8e485226e6d168f752cc8ca9768cdec645df10a2", "sha512-+l9eZ/x9MnbSp4uxp7LdvIbd3ihAkN0WE22e78/TQVw/9kYvKjGKnccQCi/MfKIR05/DHJZe2jK01VmlgvLaXQ=="],
   }
 }

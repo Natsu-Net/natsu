@@ -1,42 +1,90 @@
 import { chromium } from 'playwright';
 const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium' });
 const p = await b.newPage();
-p.on('console', m => console.log('  [browser]', m.text()));
-p.on('pageerror', e => console.log('  [pageerror]', e.message));
+p.on('pageerror', e => console.log('[pageerror]', e.message));
+const pass = (n, ok, extra='') => console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${extra ? '  — ' + extra : ''}`);
+
 await p.goto('http://127.0.0.1:8099/', { waitUntil: 'networkidle' });
+await p.waitForFunction(() => window.__uwu?.status === 'open');
 
-const first = await p.textContent('#online');
-console.log('initial online:', first);
+// 1. server push reaches the DOM
+const a = await p.textContent('#online');
+await p.waitForFunction(v => document.getElementById('online').textContent !== v, a, {timeout:5000});
+pass('server push updates the DOM', true, `${a} -> ${await p.textContent('#online')}`);
 
-// server pushes bump() every 300ms; wait for the text to change with no reload
-await p.waitForFunction(
-  (prev) => document.getElementById('online').textContent !== prev,
-  first, { timeout: 5000 }
-);
-const second = await p.textContent('#online');
-console.log('after server push:', second, '->', Number(second) > Number(first) ? 'PASS' : 'FAIL');
+// 2. PRECISE TARGETING: rename row 1, count what mutates
+const report = await p.evaluate(async () => {
+  const records = [];
+  const obs = new MutationObserver(l => records.push(...l));
+  obs.observe(document.getElementById('rows'), {childList:true, subtree:true, attributes:true, characterData:true, characterDataOldValue:true});
+  window.__uwu.call('room', 'renameRow', 1, 'BETA!');
+  await new Promise(r => setTimeout(r, 600));
+  obs.disconnect();
+  return {
+    types: records.map(r => r.type),
+    added: records.reduce((n,r) => n + (r.addedNodes?.length||0), 0),
+    removed: records.reduce((n,r) => n + (r.removedNodes?.length||0), 0),
+    oldValues: records.filter(r=>r.type==='characterData').map(r=>r.oldValue),
+    rows: [...document.querySelectorAll('#rows li')].map(li => li.textContent.trim()),
+    attrs: [...document.querySelectorAll('#rows li')].map(li => li.getAttribute('data-name')),
+  };
+});
+pass('one row field -> zero structural churn', report.added === 0 && report.removed === 0,
+     `${report.added} added, ${report.removed} removed`);
+pass('only characterData + attribute mutations', report.types.every(t => t==='characterData' || t==='attributes'),
+     report.types.join(','));
+pass('sibling rows untouched', report.rows[0]==='alpha x1' && report.rows[2]==='gamma x3', JSON.stringify(report.rows));
+pass('attribute binding followed the same path', report.attrs[1]==='BETA!', JSON.stringify(report.attrs));
 
-// client-initiated action: click bump (args [5])
-const before = Number(await p.textContent('#online'));
-await p.click('#bump');
-await p.waitForFunction((n) => Number(document.getElementById('online').textContent) >= n + 5, before, { timeout: 5000 });
-console.log('after client action:  PASS (jumped >= +5 from', before + ')');
+// 3. list growth adds one row only
+const grow = await p.evaluate(async () => {
+  const before = document.querySelectorAll('#rows li').length;
+  const firstNode = document.querySelector('#rows li');
+  const records = [];
+  const obs = new MutationObserver(l => records.push(...l));
+  obs.observe(document.getElementById('rows'), {childList:true, subtree:true});
+  window.__uwu.call('room','addRow');
+  await new Promise(r => setTimeout(r, 600));
+  obs.disconnect();
+  const after = document.querySelectorAll('#rows li').length;
+  return { before, after, sameFirstNode: document.querySelector('#rows li') === firstNode,
+           last: document.querySelectorAll('#rows li')[after-1]?.textContent.trim() };
+});
+pass('adding a row grows the list by one', grow.after === grow.before + 1, `${grow.before} -> ${grow.after}`);
+pass('existing rows keep their DOM nodes', grow.sameFirstNode);
+pass('new row rendered with its own values', /row-3/.test(grow.last||''), grow.last);
 
-// confirm no full reload happened: mark the document and re-check
-await p.evaluate(() => (window.__marker = 'alive'));
+// 4. attribute binding on <body class>
+await p.evaluate(() => window.__uwu.call('room','setTheme','vivid'));
+await p.waitForFunction(() => document.body.className === 'vivid', null, {timeout:5000});
+pass('attribute binding updates its element', true, 'body.class -> vivid');
+
+// 5. two-way input
+await p.fill('#topic-input', 'typed-by-user');
+await p.waitForFunction(() => document.getElementById('topic').textContent === 'typed-by-user', null, {timeout:5000});
+pass('two-way input writes back to the server', true);
+
+// 6. read-only field refused
+const before = await p.textContent('#online');
+await p.evaluate(() => window.__uwu.stores.room.online = 99999);
 await p.waitForTimeout(700);
-const marker = await p.evaluate(() => window.__marker);
-console.log('no reload during patches:', marker === 'alive' ? 'PASS' : 'FAIL');
+const after = Number(await p.textContent('#online'));
+pass('read-only field refused by the server', after !== 99999, `${before} -> ${after}`);
 
-// writable field enforcement: topic is writable, online is not
-await p.evaluate(() => window.__uwu.socket.send(JSON.stringify({t:'set', store:'room', key:'topic', value:'changed-by-client'})));
-await p.waitForFunction(() => document.getElementById('topic').textContent === 'changed-by-client', null, { timeout: 5000 });
-console.log('writable field accepted: PASS');
+// 7. partial hydration: static text never touched
+const staticMutations = await p.evaluate(async () => {
+  let n = 0;
+  const obs = new MutationObserver(l => n += l.length);
+  obs.observe(document.getElementById('static'), {childList:true, subtree:true, characterData:true});
+  await new Promise(r => setTimeout(r, 1200));
+  obs.disconnect();
+  return n;
+});
+pass('static region never mutated (partial hydration)', staticMutations === 0, `${staticMutations} mutations`);
 
-const onlineBefore = await p.textContent('#online');
-await p.evaluate(() => window.__uwu.socket.send(JSON.stringify({t:'set', store:'room', key:'online', value:99999})));
-await p.waitForTimeout(600);
-const onlineAfter = Number(await p.textContent('#online'));
-console.log('read-only field refused:', onlineAfter !== 99999 ? 'PASS' : 'FAIL', `(${onlineBefore} -> ${onlineAfter})`);
+// 8. no page reload throughout
+await p.evaluate(() => window.__marker = 'alive');
+await p.waitForTimeout(700);
+pass('no page reload during any of it', await p.evaluate(() => window.__marker) === 'alive');
 
 await b.close();
