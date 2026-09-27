@@ -10,12 +10,13 @@
 import type { BunRequest, ServeOptions } from "bun";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { Context, type Handler, type Middleware, type NatsuServer, type ResponseBody } from "./context.ts";
+import { Context, type Handler, type Middleware, type NatsuServer, type NatsuSocketData, type ResponseBody } from "./context.ts";
 import { config as globalConfig, type NatsuConfig } from "./config.ts";
 import { CLog, formatLine, log, setLogLevel } from "./logger.ts";
 import { Router, type RouteEntry } from "./router.ts";
 import { SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
+import { SOCKET_PATH, liveWebSocketHandler, setLiveServer, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
 
@@ -35,6 +36,25 @@ export interface StartOptions {
 	reusePort?: boolean;
 	/** Suppress the boot banner. */
 	quiet?: boolean;
+	/**
+	 * The app's own WebSocket handler.
+	 *
+	 * natsu serves its live-state socket on the same port and hands this
+	 * anything it does not recognise, so an app with its own protocol no longer
+	 * has to bypass `start()` and call `Bun.serve` itself — which is what every
+	 * app that wanted a socket used to do.
+	 */
+	websocket?: Partial<Bun.WebSocketHandler<never>>;
+	/**
+	 * Serve the live-state socket at `/_uwu/socket`. On by default; turn it off
+	 * for an app that uses no `@State` classes and wants the path free.
+	 */
+	live?: boolean;
+	/**
+	 * Called to upgrade a request the app's own handler wants. Return a
+	 * Response to refuse, or undefined once upgraded.
+	 */
+	upgrade?: (request: Request, server: NatsuServer) => Response | undefined;
 }
 
 type Terminal = (ctx: Context) => Promise<void>;
@@ -254,23 +274,65 @@ export class Application {
 		return routes;
 	}
 
-	private serveOptions(options: StartOptions): ServeOptions {
+	private serveOptions(options: StartOptions): ServeOptions<NatsuSocketData> {
+		const live = options.live !== false;
+		const terminal = this.terminalFor(undefined);
+
 		return {
 			port: options.port ?? this.config.General.port,
 			hostname: options.hostname ?? this.config.General.listenOn,
 			development: options.development ?? this.config.General.development,
 			reusePort: options.reusePort ?? false,
 			routes: this.buildRoutes(),
-			fetch: ((terminal: Terminal) => (request: Request, server: NatsuServer) => this.run(request, server, terminal))(
-				this.terminalFor(undefined),
-			),
+			websocket: options.websocket || live ? liveWebSocketHandler(options.websocket) : undefined,
+			fetch: async (request: Request, server: NatsuServer) => {
+				// The upgrade has to happen before the middleware chain: a
+				// handshake that went through the chain would get a body, and a
+				// request with a body cannot be upgraded.
+				if (live && new URL(request.url).pathname === SOCKET_PATH) {
+					// The session decides which state this connection can see,
+					// so it is resolved here and nowhere else — a frame never
+					// names a scope.
+					const scopeId = await this.socketScope(request);
+					return upgradeLive(request, server, scopeId) ?? (undefined as unknown as Response);
+				}
+				if (options.upgrade) {
+					const refused = options.upgrade(request, server);
+					if (refused !== undefined) return refused;
+					if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+						return undefined as unknown as Response;
+					}
+				}
+				return this.run(request, server, terminal);
+			},
 			error: (error: Error) => {
 				// Only reached if the pipeline itself failed to produce a
 				// Response, which means something is wrong with natsu.
 				log.error(`<red>unhandled</red> ${error.stack ?? error.message}`);
 				return new Response("Internal Server Error", { status: 500 });
 			},
-		} as ServeOptions;
+		} as unknown as ServeOptions<NatsuSocketData>;
+	}
+
+	/**
+	 * The session id a live socket belongs to, or "" when there is none.
+	 *
+	 * A handshake carries cookies like any other request, so the session is
+	 * read the same way — but it is never *created* here: an unauthenticated
+	 * socket gets no session rather than minting one, so a global store still
+	 * works and a session store simply has nothing to resolve against.
+	 */
+	private async socketScope(request: Request): Promise<string> {
+		if (!this.sessions) return "";
+		try {
+			const ctx = new Context(request);
+			const id = ctx.cookies.get(this.sessions.cookieName);
+			if (!id) return "";
+			const session = await this.sessions.get(id);
+			return session?.id ?? "";
+		} catch {
+			return "";
+		}
 	}
 
 	/** Bind and start serving. Starting an already-running app reloads it instead. */
@@ -279,6 +341,7 @@ export class Application {
 
 		this.chain = compose([...this.builtins(), ...this.userMiddleware]);
 		this.serverRef = Bun.serve(this.serveOptions(options));
+		setLiveServer(this.serverRef);
 
 		if (!options.quiet) {
 			CLog(`[<green>natsu</green>] listening on <cyan>${this.serverRef.url.href}</cyan>`);

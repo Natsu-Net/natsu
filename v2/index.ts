@@ -19,6 +19,8 @@ import { Session, SessionManager, sessionMiddleware } from "./src/session/sessio
 import { MemoryAdapter } from "./src/session/adapter.ts";
 import { SqliteAdapter } from "./src/session/sqlite.ts";
 import { StaticFiles, parseRange } from "./src/static.ts";
+import { Action, Networked, State, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch } from "./src/state.ts";
+import { SOCKET_PATH, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
 
 export { Application, compose, getApp, loadDirectory, resetApp, restart, start, stop };
 export { Router, All, Delete, Get, Head, Options, Patch, Post, Put };
@@ -29,11 +31,14 @@ export { config, loadConfig, setConfig, resetConfig, envOverlay };
 export { CLog, colorize, log, setColorEnabled, setLogLevel, setLogSink, stripTags };
 export { StaticFiles, parseRange };
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };
+export { Action, Networked, State };
+export { callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch };
+export { SOCKET_PATH, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
 
 export type { ApplicationOptions, ErrorHandler, StartOptions } from "./src/server.ts";
-export type { CookieOptions, Handler, Middleware, ResponseBody } from "./src/context.ts";
+export type { CookieOptions, Handler, Middleware, NatsuSocketData, ResponseBody } from "./src/context.ts";
 export type { CompiledRoutes, PrefixMiddleware, RouteEntry, RouteMethod, RouteRecord } from "./src/router.ts";
 export type { ControllerFactory, ControllerNamespaceApi, ControllerOptions } from "./src/controller.ts";
 export type { RejectReason, StaticOptions } from "./src/static.ts";
@@ -52,6 +57,8 @@ export type {
 	StaticConfig,
 } from "./src/config.ts";
 export type { ControllerBinding, DecoratedRoute, HttpMethod } from "./src/metadata.ts";
+export type { Patch as StatePatch, Scope, StateClass, StateOptions } from "./src/state.ts";
+export type { LiveServer, LiveSocketData } from "./src/live.ts";
 export type { LogLevel } from "./src/logger.ts";
 
 declare global {

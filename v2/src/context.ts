@@ -11,13 +11,33 @@
 import type { Server } from "bun";
 import { Cache, defaultCache } from "./cache.ts";
 import type { Session, SessionManager } from "./session/session.ts";
+import { type StateClass, resolveState } from "./state.ts";
 
 /**
  * `Bun.serve`'s Server type is generic over the data attached to websockets.
  * natsu's core opens none yet, so it is parameterised as `undefined` in one
  * place rather than spelled out at every use.
  */
-export type NatsuServer = Server<undefined>;
+/**
+ * The running server.
+ *
+ * Socket data is `unknown` rather than `undefined` because natsu serves a
+ * WebSocket of its own now (`src/live.ts`) and an app may add another on the
+ * same port. `Server<undefined>` would refuse both.
+ */
+/**
+ * What a WebSocket on a natsu server carries.
+ *
+ * natsu serves a live-state socket of its own (`src/live.ts`) and an app may
+ * add another on the same port, so the data is open rather than a single
+ * closed shape. `live` is how natsu tells its own sockets from an app's.
+ */
+export interface NatsuSocketData {
+	live?: boolean;
+	[key: string]: unknown;
+}
+
+export type NatsuServer = Server<NatsuSocketData>;
 
 export type ResponseBody = Response | BodyInit | Record<string, unknown> | unknown[] | number | boolean | null | undefined;
 
@@ -252,6 +272,25 @@ export class Context {
 	/** Whether a session was loaded or created — used to skip cookie work. */
 	public get sessionLoaded(): boolean {
 		return this._session !== undefined;
+	}
+
+	/**
+	 * The networkable state instance for this request.
+	 *
+	 * Which instance depends on the class's scope: a `global` one is shared by
+	 * everybody, a `session` one is this visitor's, and a `request` one is
+	 * fresh and never reaches the wire. Writing to what comes back is what
+	 * pushes a patch — see `src/state.ts`.
+	 *
+	 *   const room = ctx.state(Room);
+	 *   room.online++;
+	 *
+	 * Touching a session-scoped class creates the session if there is not one
+	 * already, because the state has to belong to somebody.
+	 */
+	public state<T extends object>(Class: StateClass<T>): T {
+		const scopeId = Class.scope === "session" ? this.session.id : "";
+		return resolveState(Class, scopeId);
 	}
 
 	/** Build the outgoing `Response`. Called once, by the server. */

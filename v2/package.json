@@ -1,7 +1,7 @@
 {
 	"name": "natsu",
 	"version": "2.0.0-alpha.1",
-	"description": "natsu web framework — Bun core (v2). Zero runtime dependencies; the devDependencies exist only to typecheck.",
+	"description": "natsu web framework \u2014 Bun core (v2). Zero runtime dependencies; the devDependencies exist only to typecheck.",
 	"private": true,
 	"type": "module",
 	"module": "index.ts",
@@ -19,5 +19,8 @@
 	"devDependencies": {
 		"@types/bun": "^1.4.2",
 		"typescript": "^7.0.2"
+	},
+	"dependencies": {
+		"uwu-template": "file:../../uwu-template"
 	}
 }

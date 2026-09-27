@@ -1,0 +1,252 @@
+/**
+ * The live link: the server half of uwu-template's `live()`.
+ *
+ * One WebSocket at `/_uwu/socket`. A client says which stores it is holding,
+ * the server sends a snapshot of each and then streams patches as they happen;
+ * the client may write a field or call a method, and both are refused unless
+ * the state class opted in.
+ *
+ * Wire protocol, matching `uwu-template/live`:
+ *
+ *   client -> server  { t: "hello", stores: string[] }
+ *                     { t: "set",  store, key, value }
+ *                     { t: "call", store, method, args }
+ *   server -> client  { t: "sync",  store, value }
+ *                     { t: "patch", store, patches: [{ path, value }] }
+ *
+ * **A frame never names a scope.** It names a store by its class key; which
+ * instance that is comes from the connection — the session it authenticated
+ * as. That is the whole isolation model, and it means a client cannot reach
+ * another person's state by asking nicely, because there is no field in the
+ * protocol with which to ask.
+ *
+ * Fan-out is Bun's own pub/sub: one `server.publish` per topic, so a global
+ * store with ten thousand listeners is one call, not ten thousand sends.
+ */
+
+import type { ServerWebSocket } from "bun";
+
+/**
+ * The two things this layer needs from a running server.
+ *
+ * Structural rather than Bun's `Server<T>`, which is invariant in its
+ * socket-data type: an app that types its own sockets would otherwise be
+ * unable to hand its server to natsu at all.
+ */
+export interface LiveServer {
+	publish(topic: string, data: string): number;
+	// Data is required, not optional: a server whose sockets carry data has
+	// no meaningful upgrade without it, and Bun's own typing says so.
+	upgrade(request: Request, options: { data: NatsuSocketData; headers?: HeadersInit }): boolean;
+}
+
+import type { NatsuSocketData } from "./context.ts";
+import { log } from "./logger.ts";
+import {
+	type Patch,
+	type StateClass,
+	applyWrite,
+	callAction,
+	resolveState,
+	snapshotOf,
+	stateClass,
+	topicFor,
+	watch,
+} from "./state.ts";
+
+/** The path the client runtime connects to. Matches uwu-template's default. */
+export const SOCKET_PATH = "/_uwu/socket";
+
+/** What natsu keeps on every live connection. */
+export interface LiveSocketData {
+	/** Always true on natsu's own sockets. */
+	live: true;
+	/** Session id, or "" for a client with no session. */
+	scopeId: string;
+	/** Topics this connection is subscribed to, so close can undo them. */
+	topics: Set<string>;
+}
+
+interface ClientFrame {
+	t?: unknown;
+	store?: unknown;
+	key?: unknown;
+	value?: unknown;
+	method?: unknown;
+	args?: unknown;
+	stores?: unknown;
+}
+
+/**
+ * The server, for publishing.
+ *
+ * `Bun.serve`'s websocket callbacks are handed the socket, not the server, and
+ * publishing needs the server. It is set once at start.
+ */
+let liveServer: LiveServer | undefined;
+
+export function setLiveServer(server: LiveServer): void {
+	liveServer = server;
+}
+
+/**
+ * Patch fan-out, one subscription per (class, scope) pair.
+ *
+ * Subscribing to a store's patches is a process-wide side effect, so it must
+ * happen once however many clients are connected — otherwise the tenth client
+ * to open a page makes every write publish ten times.
+ */
+const publishing = new Map<string, () => void>();
+
+function ensurePublishing(server: LiveServer, Class: StateClass, scopeId: string): void {
+	const topic = topicFor(Class, scopeId);
+	if (publishing.has(topic)) return;
+
+	const instance = resolveState(Class, scopeId);
+	// Patches arrive already batched per microtask by the store, so a burst of
+	// writes in one tick is one frame on the wire.
+	const stop = watch(instance, (patches: Patch[]) => {
+		server.publish(topic, JSON.stringify({ t: "patch", store: Class.stateKey, patches }));
+	});
+	publishing.set(topic, stop);
+}
+
+/** Stop publishing for a scope — call when a session ends. */
+export function stopPublishing(scopeId: string): void {
+	for (const [topic, stop] of publishing) {
+		if (!topic.endsWith(`:${scopeId}`)) continue;
+		stop();
+		publishing.delete(topic);
+	}
+}
+
+/** Forget every subscription. Tests and hot reload. */
+export function resetLive(): void {
+	for (const stop of publishing.values()) stop();
+	publishing.clear();
+}
+
+/**
+ * Resolve the instance a frame is talking about, for this connection.
+ *
+ * Returns undefined rather than throwing for anything the connection may not
+ * have: an unknown key, or a session-scoped store on a connection with no
+ * session. A socket is a hostile input surface and a thrown error here would
+ * take the connection down on a malformed frame.
+ */
+function instanceFor(data: LiveSocketData, key: unknown): { Class: StateClass; instance: object } | undefined {
+	if (typeof key !== "string") return undefined;
+	const Class = stateClass(key);
+	if (!Class) return undefined;
+	// A request-scoped store exists for the length of one render. There is
+	// nothing on the wire to talk to.
+	if (Class.scope === "request") return undefined;
+	if (Class.scope === "session" && !data.scopeId) return undefined;
+	try {
+		return { Class, instance: resolveState(Class, data.scopeId) };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The `websocket` handler for `Bun.serve`.
+ *
+ * `next` is an app's own handler, if it has one. natsu takes the frames it
+ * recognises on its own socket and hands everything else on, so an app that
+ * already speaks its own protocol keeps working on the same port.
+ */
+export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>) {
+	return {
+		open(ws: ServerWebSocket<LiveSocketData>) {
+			if (!isLive(ws)) return next?.open?.(ws as never);
+			// Nothing is subscribed until `hello` says which stores the page
+			// actually holds: a connection that subscribed to everything would
+			// receive patches for state its page never rendered.
+			ws.data.topics = new Set();
+		},
+
+		message(ws: ServerWebSocket<LiveSocketData>, raw: string | Buffer) {
+			if (!isLive(ws)) return next?.message?.(ws as never, raw as never);
+
+			let frame: ClientFrame;
+			try {
+				frame = JSON.parse(String(raw)) as ClientFrame;
+			} catch {
+				return;
+			}
+
+			if (frame.t === "hello") {
+				const asked = Array.isArray(frame.stores) ? frame.stores : [];
+				for (const key of asked.slice(0, 64)) {
+					const found = instanceFor(ws.data, key);
+					if (!found) continue;
+					const topic = topicFor(found.Class, ws.data.scopeId);
+					// Publishing before subscribing, so a write that lands between
+					// the two is not lost between the snapshot and the stream.
+					if (liveServer) ensurePublishing(liveServer, found.Class, ws.data.scopeId);
+					ws.subscribe(topic);
+					ws.data.topics.add(topic);
+					ws.send(JSON.stringify({ t: "sync", store: found.Class.stateKey, value: snapshotOf(found.instance) }));
+				}
+				return;
+			}
+
+			if (frame.t === "set") {
+				const found = instanceFor(ws.data, frame.store);
+				if (!found || typeof frame.key !== "string") return;
+				// Re-checked here whatever the client believes. The manifest it
+				// holds says which fields the UI should offer to edit; it is not
+				// a capability.
+				if (!applyWrite(found.instance, frame.key, frame.value)) {
+					log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.Class.stateKey}.${frame.key}</cyan>`);
+				}
+				return;
+			}
+
+			if (frame.t === "call") {
+				const found = instanceFor(ws.data, frame.store);
+				if (!found || typeof frame.method !== "string") return;
+				const args = Array.isArray(frame.args) ? frame.args : [];
+				try {
+					callAction(found.instance, frame.method, args);
+				} catch (error) {
+					log.warn(`[<yellow>live</yellow>] refused call ${found.Class.stateKey}.${frame.method}: ${(error as Error).message}`);
+				}
+				return;
+			}
+
+			// Not ours. An app sharing the socket gets first refusal on
+			// anything natsu does not recognise.
+			next?.message?.(ws as never, raw as never);
+		},
+
+		close(ws: ServerWebSocket<LiveSocketData>, code: number, reason: string) {
+			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
+			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
+		},
+
+		drain(ws: ServerWebSocket<LiveSocketData>) {
+			if (!isLive(ws)) return next?.drain?.(ws as never);
+		},
+	};
+}
+
+/** Is this one of natsu's live sockets, or an app's own? */
+function isLive(ws: ServerWebSocket<LiveSocketData>): boolean {
+	return (ws.data as unknown as { live?: boolean })?.live === true;
+}
+
+/**
+ * Upgrade a request to a live socket, if it is one.
+ *
+ * `scopeId` is the caller's session id — natsu's server middleware resolves it
+ * before calling this, because the session is what decides which state the
+ * connection can see.
+ */
+export function upgradeLive(request: Request, server: LiveServer, scopeId: string): Response | undefined {
+	const upgraded = server.upgrade(request, {
+		data: { live: true, scopeId, topics: new Set<string>() },
+	});
+	return upgraded ? undefined : new Response("expected a websocket", { status: 400 });
+}
