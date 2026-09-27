@@ -47,7 +47,10 @@ import {
 	type StateClass,
 	applyWrite,
 	callAction,
+	dropScope,
+	hasRoom,
 	resolveState,
+	revokeSession,
 	snapshotOf,
 	stateClass,
 	topicFor,
@@ -98,15 +101,17 @@ export function setLiveServer(server: LiveServer): void {
  */
 const publishing = new Map<string, () => void>();
 
-function ensurePublishing(server: LiveServer, Class: StateClass, scopeId: string): void {
-	const topic = topicFor(Class, scopeId);
+function ensurePublishing(server: LiveServer, found: Addressed): void {
+	const topic = topicFor(found.Class, found.scopeId);
 	if (publishing.has(topic)) return;
 
-	const instance = resolveState(Class, scopeId);
+	// The frame names the store the way the client holds it — `party:abc-123`
+	// for a room — because that is the key its own store was created under.
+	const wire = found.wire;
 	// Patches arrive already batched per microtask by the store, so a burst of
 	// writes in one tick is one frame on the wire.
-	const stop = watch(instance, (patches: Patch[]) => {
-		server.publish(topic, JSON.stringify({ t: "patch", store: Class.stateKey, patches }));
+	const stop = watch(found.instance, (patches: Patch[]) => {
+		server.publish(topic, JSON.stringify({ t: "patch", store: wire, patches }));
 	});
 	publishing.set(topic, stop);
 }
@@ -120,30 +125,78 @@ export function stopPublishing(scopeId: string): void {
 	}
 }
 
+/**
+ * A session has ended: forget its state, its room grants and its fan-out.
+ *
+ * Called by the session manager on destroy and on sweep. Without it every
+ * session that ever connected leaves a store, a grant and a live subscription
+ * behind — a slow leak that only shows up in production.
+ */
+export function endSession(sessionId: string): void {
+	if (!sessionId) return;
+	stopPublishing(sessionId);
+	revokeSession(sessionId);
+	dropScope(sessionId);
+}
+
 /** Forget every subscription. Tests and hot reload. */
 export function resetLive(): void {
 	for (const stop of publishing.values()) stop();
 	publishing.clear();
 }
 
+/** A store a connection is allowed to address, and where it lives. */
+interface Addressed {
+	Class: StateClass;
+	instance: object;
+	/** The key the client holds this store under — `party:abc-123` for a room. */
+	wire: string;
+	/** The scope id the instance lives under: "" global, session id, or room id. */
+	scopeId: string;
+}
+
 /**
  * Resolve the instance a frame is talking about, for this connection.
  *
  * Returns undefined rather than throwing for anything the connection may not
- * have: an unknown key, or a session-scoped store on a connection with no
- * session. A socket is a hostile input surface and a thrown error here would
- * take the connection down on a malformed frame.
+ * have: an unknown key, a session-scoped store on a connection with no
+ * session, or a room this session was never granted. A socket is a hostile
+ * input surface and a thrown error here would take the connection down on a
+ * malformed frame.
  */
-function instanceFor(data: LiveSocketData, key: unknown): { Class: StateClass; instance: object } | undefined {
+function instanceFor(data: LiveSocketData, key: unknown): Addressed | undefined {
 	if (typeof key !== "string") return undefined;
-	const Class = stateClass(key);
-	if (!Class) return undefined;
-	// A request-scoped store exists for the length of one render. There is
-	// nothing on the wire to talk to.
-	if (Class.scope === "request") return undefined;
-	if (Class.scope === "session" && !data.scopeId) return undefined;
+
+	const direct = stateClass(key);
+	if (direct) {
+		// A request-scoped store exists for the length of one render. There is
+		// nothing on the wire to talk to.
+		if (direct.scope === "request") return undefined;
+		// A room store is only ever addressed with its room id attached, below.
+		// The bare key names no instance.
+		if (direct.scope === "room") return undefined;
+		if (direct.scope === "session" && !data.scopeId) return undefined;
+		const scopeId = direct.scope === "global" ? "" : data.scopeId;
+		try {
+			return { Class: direct, instance: resolveState(direct, scopeId), wire: key, scopeId };
+		} catch {
+			return undefined;
+		}
+	}
+
+	// `party:abc-123`. The room id came off the client, unlike a session id, so
+	// the only thing that makes it addressable is a grant the server issued
+	// while it still had the request in hand. Naming a room is not joining it.
+	const cut = key.lastIndexOf(":");
+	if (cut < 1) return undefined;
+	const stateKey = key.slice(0, cut);
+	const roomId = key.slice(cut + 1);
+	if (!roomId) return undefined;
+	const Class = stateClass(stateKey);
+	if (!Class || Class.scope !== "room") return undefined;
+	if (!data.scopeId || !hasRoom(data.scopeId, stateKey, roomId)) return undefined;
 	try {
-		return { Class, instance: resolveState(Class, data.scopeId) };
+		return { Class, instance: resolveState(Class, roomId), wire: key, scopeId: roomId };
 	} catch {
 		return undefined;
 	}
@@ -181,13 +234,13 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 				for (const key of asked.slice(0, 64)) {
 					const found = instanceFor(ws.data, key);
 					if (!found) continue;
-					const topic = topicFor(found.Class, ws.data.scopeId);
+					const topic = topicFor(found.Class, found.scopeId);
 					// Publishing before subscribing, so a write that lands between
 					// the two is not lost between the snapshot and the stream.
-					if (liveServer) ensurePublishing(liveServer, found.Class, ws.data.scopeId);
+					if (liveServer) ensurePublishing(liveServer, found);
 					ws.subscribe(topic);
 					ws.data.topics.add(topic);
-					ws.send(JSON.stringify({ t: "sync", store: found.Class.stateKey, value: snapshotOf(found.instance) }));
+					ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
 				}
 				return;
 			}
@@ -199,7 +252,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 				// holds says which fields the UI should offer to edit; it is not
 				// a capability.
 				if (!applyWrite(found.instance, frame.key, frame.value)) {
-					log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.Class.stateKey}.${frame.key}</cyan>`);
+					log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.wire}.${frame.key}</cyan>`);
 				}
 				return;
 			}
@@ -211,7 +264,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 				try {
 					callAction(found.instance, frame.method, args);
 				} catch (error) {
-					log.warn(`[<yellow>live</yellow>] refused call ${found.Class.stateKey}.${frame.method}: ${(error as Error).message}`);
+					log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
 				}
 				return;
 			}

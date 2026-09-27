@@ -15,6 +15,7 @@
 
 import type { Context, Middleware } from "../context.ts";
 import type { NatsuConfig, SessionCookieConfig } from "../config.ts";
+import { endSession } from "../live.ts";
 import { log } from "../logger.ts";
 import { MemoryAdapter, type SessionAdapter, type SessionRecord } from "./adapter.ts";
 import { SqliteAdapter } from "./sqlite.ts";
@@ -227,6 +228,9 @@ export class SessionManager {
 
 	public async destroy(id: string): Promise<void> {
 		this.live.delete(id);
+		// Networkable state is keyed by session id, so a session that goes away
+		// takes its stores, its room grants and its socket fan-out with it.
+		endSession(id);
 		await this.adapter.destroy(id);
 	}
 
@@ -238,7 +242,9 @@ export class SessionManager {
 
 	public async sweep(now: number = Date.now() / 1000): Promise<number> {
 		for (const [id, session] of this.live) {
-			if (session.IsExpired(now)) this.live.delete(id);
+			if (!session.IsExpired(now)) continue;
+			this.live.delete(id);
+			endSession(id);
 		}
 		const removed = await this.adapter.sweep(now);
 		if (removed > 0) log.debug(`[<yellow>SESSION</yellow>] swept <cyan>${removed}</cyan> expired`);

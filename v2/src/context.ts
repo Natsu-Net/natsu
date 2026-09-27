@@ -11,7 +11,7 @@
 import type { Server } from "bun";
 import { Cache, defaultCache } from "./cache.ts";
 import type { Session, SessionManager } from "./session/session.ts";
-import { type StateClass, resolveState } from "./state.ts";
+import { type StateClass, grantRoom, resolveState, revokeRoom } from "./state.ts";
 
 /**
  * `Bun.serve`'s Server type is generic over the data attached to websockets.
@@ -288,9 +288,37 @@ export class Context {
 	 * Touching a session-scoped class creates the session if there is not one
 	 * already, because the state has to belong to somebody.
 	 */
-	public state<T extends object>(Class: StateClass<T>): T {
+	public state<T extends object>(Class: StateClass<T>, roomId?: string): T {
+		if (Class.scope === "room") {
+			if (!roomId) throw new Error(`natsu/state: ${Class.stateKey} is room-scoped — pass a room id`);
+			return resolveState(Class, roomId);
+		}
 		const scopeId = Class.scope === "session" ? this.session.id : "";
 		return resolveState(Class, scopeId);
+	}
+
+	/**
+	 * Let this visitor's sockets address a room, and hand back its state.
+	 *
+	 * A room id comes off the client — it is in the URL of the watch party you
+	 * were sent — so the socket refuses any room the session was not granted.
+	 * This is where a handler says "yes, this person belongs in that party",
+	 * having checked whatever it is that makes that true.
+	 *
+	 *   const party = ctx.joinRoom(Party, ctx.params.code);
+	 *   party.watching++;
+	 */
+	public joinRoom<T extends object>(Class: StateClass<T>, roomId: string): T {
+		if (Class.scope !== "room") throw new Error(`natsu/state: ${Class.stateKey} is not room-scoped`);
+		if (!roomId) throw new Error(`natsu/state: ${Class.stateKey} needs a room id`);
+		grantRoom(this.session.id, Class as unknown as StateClass, roomId);
+		return resolveState(Class, roomId);
+	}
+
+	/** Take the grant away again — leaving a party, or being removed from one. */
+	public leaveRoom(Class: StateClass, roomId: string): void {
+		if (!this.sessionLoaded) return;
+		revokeRoom(this.session.id, Class, roomId);
 	}
 
 	/** Build the outgoing `Response`. Called once, by the server. */

@@ -19,8 +19,8 @@ import { Session, SessionManager, sessionMiddleware } from "./src/session/sessio
 import { MemoryAdapter } from "./src/session/adapter.ts";
 import { SqliteAdapter } from "./src/session/sqlite.ts";
 import { StaticFiles, parseRange } from "./src/static.ts";
-import { Action, Networked, State, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch } from "./src/state.ts";
-import { SOCKET_PATH, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
+import { Action, Networked, State, callAction, dropScope, grantRoom, hasRoom, resolveState, resetState, revokeRoom, revokeSession, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor } from "./src/state.ts";
+import { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
 
 export { Application, compose, getApp, loadDirectory, resetApp, restart, start, stop };
 export { Router, All, Delete, Get, Head, Options, Patch, Post, Put };
@@ -32,8 +32,9 @@ export { CLog, colorize, log, setColorEnabled, setLogLevel, setLogSink, stripTag
 export { StaticFiles, parseRange };
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };
 export { Action, Networked, State };
-export { callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch };
-export { SOCKET_PATH, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive };
+export { callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor };
+export { grantRoom, hasRoom, revokeRoom, revokeSession };
+export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
 

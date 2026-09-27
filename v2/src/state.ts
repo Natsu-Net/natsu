@@ -39,6 +39,9 @@ import { type Patch, type Store, isWritable, onPatch, reactive, snapshot } from 
  */
 const GLOBAL_SCOPE = "";
 
+/** Set by `resolveState` for the length of one synchronous construction. */
+let constructingScope = "";
+
 const registry = {
 	/** Wire key -> class, so a socket frame can name a store. */
 	classes: new Map<string, StateClass>(),
@@ -65,11 +68,12 @@ export function stateKeys(): string[] {
  * shared or socketed.
  */
 export function resolveState<T extends object>(Class: StateClass<T>, scopeId: string): T {
-	if (Class.scope === "request") return new Class();
+	if (Class.scope === "request") return construct(Class, "");
 
 	const id = Class.scope === "global" ? GLOBAL_SCOPE : scopeId;
-	if (Class.scope === "session" && id === GLOBAL_SCOPE) {
-		throw new Error(`natsu/state: ${Class.stateKey} is session-scoped and needs a session`);
+	if (Class.scope !== "global" && id === GLOBAL_SCOPE) {
+		const needs = Class.scope === "session" ? "a session" : "a room id";
+		throw new Error(`natsu/state: ${Class.stateKey} is ${Class.scope}-scoped and needs ${needs}`);
 	}
 
 	let byScope = registry.instances.get(Class as unknown as StateClass);
@@ -80,10 +84,20 @@ export function resolveState<T extends object>(Class: StateClass<T>, scopeId: st
 
 	let instance = byScope.get(id) as T | undefined;
 	if (!instance) {
-		instance = new Class();
+		instance = construct(Class, id);
 		byScope.set(id, instance);
 	}
 	return instance;
+}
+
+function construct<T extends object>(Class: StateClass<T>, scopeId: string): T {
+	const previous = constructingScope;
+	constructingScope = scopeId;
+	try {
+		return new Class();
+	} finally {
+		constructingScope = previous;
+	}
 }
 
 /**
@@ -98,9 +112,60 @@ export function topicFor(Class: StateClass, scopeId: string): string {
 	return Class.scope === "global" ? `uwu:${Class.stateKey}` : `uwu:${Class.stateKey}:${scopeId}`;
 }
 
+/**
+ * The key a client holds this instance's store under.
+ *
+ * Only a room differs from the class key: its store is per room, so the room
+ * id rides on the key. A page rendering a room needs this to tell the runtime
+ * what to say `hello` about.
+ */
+export function wireKeyFor(Class: StateClass, scopeId: string): string {
+	return Class.scope === "room" ? `${Class.stateKey}:${scopeId}` : Class.stateKey;
+}
+
+// --- room grants -----------------------------------------------------------
+
+/**
+ * Which rooms a session may address.
+ *
+ * A room id comes from the client — it is in the URL of the watch party you
+ * were sent — so it cannot be trusted the way a session id can. The server
+ * grants access while it still has the request in hand and has decided the
+ * visitor belongs there; the socket then refuses any room not on the list.
+ * Without this, naming a room would be the same as joining it.
+ */
+const grants = new Map<string, Set<string>>();
+
+/** Let this session address `roomId` for `Class`. */
+export function grantRoom(sessionId: string, Class: StateClass, roomId: string): void {
+	if (!sessionId || !roomId) return;
+	let allowed = grants.get(sessionId);
+	if (!allowed) {
+		allowed = new Set();
+		grants.set(sessionId, allowed);
+	}
+	allowed.add(`${Class.stateKey}:${roomId}`);
+}
+
+/** Take it away again — leaving a party, or being removed from one. */
+export function revokeRoom(sessionId: string, Class: StateClass, roomId: string): void {
+	grants.get(sessionId)?.delete(`${Class.stateKey}:${roomId}`);
+}
+
+/** Whether this session was granted this room. */
+export function hasRoom(sessionId: string, stateKey: string, roomId: string): boolean {
+	return grants.get(sessionId)?.has(`${stateKey}:${roomId}`) === true;
+}
+
+/** Drop every grant a session holds. */
+export function revokeSession(sessionId: string): void {
+	grants.delete(sessionId);
+}
+
 /** Forget every instance. Only tests and a hot reload should need this. */
 export function resetState(): void {
 	registry.instances = new WeakMap();
+	grants.clear();
 }
 
 /** Forget one scope's instances — call when a session ends. */
@@ -120,8 +185,13 @@ export const STORE_REF = Symbol.for("natsu.state.store");
  *
  * `session` is the default because it is the safe one: a field marked
  * networkable by accident reaches one person's own tabs rather than everybody.
+ *
+ * `room` is for state shared by a named group rather than by one person or by
+ * everybody — a watch party, a game table, a document being edited together.
+ * Its id comes from the client, which is why a connection can only reach a
+ * room its session was granted: see `grantRoom`.
  */
-export type Scope = "session" | "global" | "request";
+export type Scope = "session" | "global" | "request" | "room";
 
 interface FieldMeta {
 	writable: boolean;
@@ -216,7 +286,14 @@ export function State(key: string, options: StateOptions = {}) {
 					if (field.writable) writable.push(name);
 				}
 
-				const store = reactive(seed, { key, writable });
+				// A room-scoped class is one store per room on the wire, so the
+				// key carries the room id. `constructingScope` is set by
+				// `resolveState` around this synchronous construction — the
+				// scope is not something the class body can know.
+				const wireKey = (this.constructor as unknown as StateClass).scope === "room" && constructingScope
+					? `${key}:${constructingScope}`
+					: key;
+				const store = reactive(seed, { key: wireKey, writable });
 				Object.defineProperty(this, STORE_REF, { value: store, enumerable: false });
 
 				for (const name of meta.fields.keys()) {

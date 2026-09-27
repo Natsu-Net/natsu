@@ -16,16 +16,21 @@ import {
 	applyWrite,
 	callAction,
 	dropScope,
+	grantRoom,
+	hasRoom,
 	resetState,
 	resolveState,
 	snapshotOf,
 	stateClass,
 	storeOf,
+	revokeRoom,
+	revokeSession,
 	topicFor,
 	watch,
+	wireKeyFor,
 	type StateClass,
 } from "../src/state.ts";
-import { flushPatches } from "uwu-template/reactive/store";
+import { flushPatches, storeKey } from "uwu-template/reactive/store";
 
 @State("counter", { scope: "global" })
 class Counter {
@@ -53,6 +58,12 @@ class Basket {
 	add() {
 		this.items++;
 	}
+}
+
+@State("party", { scope: "room" })
+class Party {
+	@Networked() playing = false;
+	@Networked({ writable: true }) at = 0;
 }
 
 @State("scratch", { scope: "request" })
@@ -215,5 +226,63 @@ describe("the registry", () => {
 
 	test("storeOf refuses an object that is not a @State class", () => {
 		expect(() => storeOf({})).toThrow(/not a @State class/);
+	});
+});
+
+describe("rooms", () => {
+	test("a room is one instance per room id", () => {
+		const a = resolveState(AsClass<Party>(Party), "room-a");
+		const b = resolveState(AsClass<Party>(Party), "room-b");
+		expect(a).not.toBe(b);
+		expect(resolveState(AsClass<Party>(Party), "room-a")).toBe(a);
+
+		a.at = 120;
+		expect(b.at).toBe(0);
+	});
+
+	test("a room store with no room id is an error, not a shared one", () => {
+		expect(() => resolveState(AsClass<Party>(Party), "")).toThrow(/needs a room id/);
+	});
+
+	test("the wire key carries the room id, so two rooms are two stores", () => {
+		// The client says hello about `party:room-a`; without the id on the key
+		// both rooms would be the same store in the browser.
+		expect(wireKeyFor(AsClass(Party), "room-a")).toBe("party:room-a");
+		expect(storeKey(storeOf(resolveState(AsClass<Party>(Party), "room-a")))).toBe("party:room-a");
+		expect(wireKeyFor(AsClass(Basket), "session-a")).toBe("basket");
+	});
+
+	test("two rooms never share a topic", () => {
+		expect(topicFor(AsClass(Party), "a")).toBe("uwu:party:a");
+		expect(topicFor(AsClass(Party), "a")).not.toBe(topicFor(AsClass(Party), "b"));
+	});
+
+	test("a room is not addressable until it is granted", () => {
+		// A room id arrives from the client, unlike a session id. Naming one is
+		// not joining it.
+		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
+		grantRoom("session-a", AsClass(Party), "room-a");
+		expect(hasRoom("session-a", "party", "room-a")).toBe(true);
+		expect(hasRoom("session-a", "party", "room-b")).toBe(false);
+		expect(hasRoom("session-b", "party", "room-a")).toBe(false);
+	});
+
+	test("a grant can be taken back", () => {
+		grantRoom("session-a", AsClass(Party), "room-a");
+		revokeRoom("session-a", AsClass(Party), "room-a");
+		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
+	});
+
+	test("ending a session drops every room it held", () => {
+		grantRoom("session-a", AsClass(Party), "room-a");
+		grantRoom("session-a", AsClass(Party), "room-b");
+		revokeSession("session-a");
+		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
+		expect(hasRoom("session-a", "party", "room-b")).toBe(false);
+	});
+
+	test("a grant for one class does not carry to another", () => {
+		grantRoom("session-a", AsClass(Party), "room-a");
+		expect(hasRoom("session-a", "table", "room-a")).toBe(false);
 	});
 });

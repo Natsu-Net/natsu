@@ -10,8 +10,10 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Application } from "../src/server.ts";
-import { resetLive } from "../src/live.ts";
-import { Action, Networked, State, resetState, resolveState, type StateClass } from "../src/state.ts";
+import { endSession, resetLive } from "../src/live.ts";
+import { Action, Networked, State, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
+import { Router } from "../src/router.ts";
+import { SessionManager } from "../src/session/session.ts";
 import { reset, startApp, type RunningApp } from "./helpers.ts";
 
 @State("room", { scope: "global" })
@@ -34,6 +36,16 @@ class Cart {
 	@Networked() items = 0;
 }
 
+@State("party", { scope: "room" })
+class Party {
+	@Networked() at = 0;
+
+	@Action()
+	seek(to: number) {
+		this.at = to;
+	}
+}
+
 const AsClass = <T extends object>(c: unknown) => c as StateClass<T>;
 
 let running: RunningApp | undefined;
@@ -51,13 +63,18 @@ afterEach(async () => {
 });
 
 /** Open a socket and collect frames until `want` of them have arrived. */
-function open(base: string): {
+function open(base: string, headers?: Record<string, string>): {
 	socket: WebSocket;
 	ready: Promise<void>;
 	frames: Array<Record<string, unknown>>;
 	next(want: number, timeout?: number): Promise<Array<Record<string, unknown>>>;
 } {
-	const socket = new WebSocket(`${base.replace("http", "ws")}/_uwu/socket`);
+	// Bun's WebSocket takes headers as a second argument; the DOM lib types
+	// that slot as a protocol list, hence the cast.
+	const socket = new WebSocket(
+		`${base.replace("http", "ws")}/_uwu/socket`,
+		(headers ? { headers } : undefined) as unknown as string[],
+	);
 	const frames: Array<Record<string, unknown>> = [];
 	socket.addEventListener("message", (event) => {
 		frames.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
@@ -170,7 +187,9 @@ describe("patches", () => {
 
 		// One patch frame, carrying the settled value — not three.
 		expect(client.frames.length).toBe(2);
-		expect((client.frames[1] as { patches: Array<{ value: unknown }> }).patches).toEqual([{ path: "online", value: 3 }]);
+		expect((client.frames[1] as { patches: Array<{ path: string; value: unknown }> }).patches).toEqual([
+			{ path: "online", value: 3 },
+		]);
 		client.socket.close();
 	});
 });
@@ -311,5 +330,137 @@ describe("living beside an app's own socket", () => {
 		await Bun.sleep(150);
 		expect(refused).toBe(true);
 		socket.close();
+	});
+});
+
+describe("rooms", () => {
+	/** Start an app with sessions and a route that joins a party. */
+	async function partyApp() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/join/:code", (ctx) => {
+			ctx.joinRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = "joined";
+		});
+		return await startApp(new Application({ sessions: manager }));
+	}
+
+	/** Join a room in a fresh session and return the cookie that proves it. */
+	async function join(base: string, code: string): Promise<string> {
+		const response = await fetch(`${base}/join/${code}`);
+		return (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+	}
+
+	test("a room you joined streams to you, under its own key", async () => {
+		running = await partyApp();
+		const cookie = await join(running.base, "room-a");
+
+		const client = open(running.base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-a"] }));
+		const frames = await client.next(1);
+
+		// The key carries the room, so the browser's own store matches.
+		expect(frames[0]).toEqual({ t: "sync", store: "party:room-a", value: { at: 0 } });
+
+		resolveState(AsClass<Party>(Party), "room-a").at = 42;
+		await client.next(2);
+		expect(client.frames[1]).toEqual({ t: "patch", store: "party:room-a", patches: [{ path: "at", value: 42 }] });
+		client.socket.close();
+	});
+
+	test("a room you were never granted is not addressable", async () => {
+		// The whole point of the grant: the room id is in a URL somebody can
+		// guess or be sent, so naming it must not be enough.
+		running = await partyApp();
+		const cookie = await join(running.base, "room-a");
+		resolveState(AsClass<Party>(Party), "room-b").at = 99;
+
+		const client = open(running.base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-b"] }));
+		client.socket.send(JSON.stringify({ t: "call", store: "party:room-b", method: "seek", args: [0] }));
+		await Bun.sleep(150);
+
+		expect(client.frames.length).toBe(0);
+		expect(resolveState(AsClass<Party>(Party), "room-b").at).toBe(99);
+		client.socket.close();
+	});
+
+	test("an anonymous connection cannot address any room", async () => {
+		running = await partyApp();
+		await join(running.base, "room-a");
+
+		const client = open(running.base);
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-a"] }));
+		await Bun.sleep(150);
+
+		expect(client.frames.length).toBe(0);
+		client.socket.close();
+	});
+
+	test("the bare class key names no room at all", async () => {
+		running = await partyApp();
+		const cookie = await join(running.base, "room-a");
+
+		const client = open(running.base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["party"] }));
+		await Bun.sleep(150);
+
+		expect(client.frames.length).toBe(0);
+		client.socket.close();
+	});
+
+	test("two rooms in flight do not reach each other", async () => {
+		running = await partyApp();
+		const a = open(running.base, { cookie: await join(running.base, "room-a") });
+		const b = open(running.base, { cookie: await join(running.base, "room-b") });
+		await Promise.all([a.ready, b.ready]);
+		a.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-a"] }));
+		b.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-b"] }));
+		await Promise.all([a.next(1), b.next(1)]);
+
+		a.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "seek", args: [300] }));
+		await a.next(2);
+		await Bun.sleep(80);
+
+		expect(resolveState(AsClass<Party>(Party), "room-a").at).toBe(300);
+		expect(resolveState(AsClass<Party>(Party), "room-b").at).toBe(0);
+		expect(b.frames.length).toBe(1);
+		a.socket.close();
+		b.socket.close();
+	});
+});
+
+describe("a session ending", () => {
+	test("takes its state, its rooms and its fan-out with it", async () => {
+		// Otherwise every visitor who ever connected leaves a store, a grant
+		// and a live subscription behind.
+		running = await startApp(new Application());
+		const cart = resolveState(AsClass<Cart>(Cart), "session-a");
+		cart.items = 3;
+		grantRoom("session-a", AsClass(Party), "room-a");
+
+		endSession("session-a");
+
+		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
+		expect(resolveState(AsClass<Cart>(Cart), "session-a").items).toBe(0);
+	});
+
+	test("destroying a session through the manager does the same", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/login", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.joinRoom(AsClass<Party>(Party), "room-a");
+			ctx.response.body = ctx.session.id;
+		});
+		running = await startApp(new Application({ sessions: manager }));
+
+		const id = await (await running.fetch("/login")).text();
+		expect(hasRoom(id, "party", "room-a")).toBe(true);
+
+		await manager.destroy(id);
+		expect(hasRoom(id, "party", "room-a")).toBe(false);
 	});
 });
