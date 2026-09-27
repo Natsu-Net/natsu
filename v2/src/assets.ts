@@ -20,13 +20,17 @@
  * Every chunk's name carries its hash, which is what makes a year-long
  * `immutable` cache safe: a changed file is a different URL.
  *
- *   const assets = new Assets({ outDir: "public/_a", scripts: {...}, styles: {...} });
+ *   const assets = new Assets({
+ *     outDir: "public/_a",
+ *     styles: { site: ["public/assets/css/site.css"] },
+ *     scripts: { site: "public/assets/js/site.js" },
+ *     rewrite: { "/assets/css/site.css": "site", "/assets/js/site.js": "site" },
+ *   });
  *   await assets.build();
  *   app.use(assets.middleware());
  *
- * and in a template, a link the pipeline will narrow for each page:
- *
- *   <link rel="stylesheet" data-chunk="site" href="/assets/css/site.css">
+ * Templates keep the paths they already have; `rewrite` says which of them
+ * the pipeline owns, and pages go out pointing at the chunks.
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -60,6 +64,17 @@ export interface AssetsOptions {
 	safelist?: Array<string | RegExp>;
 	/** Skip the per-page narrowing and serve the whole stylesheet. */
 	wholeStylesheets?: boolean;
+	/**
+	 * The paths as templates already write them, mapped to the entry that
+	 * replaces them.
+	 *
+	 *   rewrite: { "/assets/css/site.css": "site", "/assets/js/site.js": "site" }
+	 *
+	 * A page goes out with the hashed URL in place of the plain one, and for a
+	 * stylesheet with that page's own narrowed chunk. Stated here rather than
+	 * inferred, so nothing is rewritten by surprise.
+	 */
+	rewrite?: Record<string, string>;
 }
 
 export interface AssetReport {
@@ -107,18 +122,26 @@ export class Assets {
 	}
 
 	/**
-	 * Narrow every `data-chunk` link in a page to the rules that page can use.
+	 * Point a rendered page at its chunks.
 	 *
-	 * The page has to be rendered before this can run — what it needs is the
-	 * markup — so the link the template wrote is rewritten rather than chosen
-	 * up front.
+	 * A script becomes its hashed URL; a stylesheet becomes the slice of
+	 * itself that this page can use. It happens here, on the way out, because
+	 * narrowing needs the markup and the markup does not exist when the head
+	 * is written.
 	 */
-	public narrow(html: string): string {
-		if (this.options.wholeStylesheets) return html;
-		return html.replace(/<link\b[^>]*\bdata-chunk="([^"]+)"[^>]*>/g, (tag, name: string) => {
-			const url = this.pageStyle(name, html);
-			return url ? tag.replace(/\bhref="[^"]*"/, `href="${url}"`) : tag;
-		});
+	public rewrite(html: string): string {
+		let out = html;
+		for (const [from, name] of Object.entries(this.options.rewrite ?? {})) {
+			const url = this.sources.has(name) && !this.options.wholeStylesheets
+				? this.pageStyle(name, html)
+				: this.url(name);
+			if (!url || url === from) continue;
+			// Both quote styles, because a template author picks either and a
+			// path left un-rewritten is a 404 the page cannot recover from.
+			out = out.split(`"${from}"`).join(`"${url}"`);
+			out = out.split(`'${from}'`).join(`'${url}'`);
+		}
+		return out;
 	}
 
 	/**
@@ -146,7 +169,7 @@ export class Assets {
 	}
 
 	/**
-	 * Serve the chunks, and narrow the stylesheets of every page that goes out.
+	 * Serve the chunks, and point every page that goes out at them.
 	 *
 	 * One middleware rather than two, because they are one feature: a link
 	 * rewritten to a chunk that is not being served is a page with no styling.
@@ -170,8 +193,8 @@ export class Assets {
 
 			const body = ctx.response.body;
 			if (typeof body !== "string") return;
-			if (!body.includes("data-chunk=")) return;
-			ctx.response.body = this.narrow(body);
+			if (!body.includes("/assets/") && !body.includes("<link")) return;
+			ctx.response.body = this.rewrite(body);
 		};
 	}
 

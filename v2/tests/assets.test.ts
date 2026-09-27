@@ -53,11 +53,11 @@ function assets(extra: Record<string, unknown> = {}) {
 
 describe("chunking", () => {
 	test("a page gets the rules it can use and not the ones it cannot", async () => {
-		const pipeline = assets();
+		const pipeline = assets({ rewrite: { "/assets/css/site.css": "site" } });
 		await pipeline.build();
 		reset();
 		new Router().get("/page", (ctx) => {
-			ctx.response.body = '<html><head><link rel="stylesheet" data-chunk="site" href="/site.css"></head>' +
+			ctx.response.body = '<html><head><link rel="stylesheet" href="/assets/css/site.css"></head>' +
 				'<body><div class="card"><h3 class="card__title">x</h3></div></body></html>';
 		});
 		const app = new Application();
@@ -89,6 +89,32 @@ describe("chunking", () => {
 
 		expect(await read(bare, without)).not.toContain("is-open");
 		expect(await read(kept, with_)).toContain("is-open");
+	});
+});
+
+describe("rewriting", () => {
+	test("a script src becomes its hashed chunk, and an unlisted path is left alone", async () => {
+		writeFileSync(join(dir, "site.js"), 'export const hi = () => console.log("hi");\n');
+		reset();
+		const pipeline = new Assets({
+			outDir: out,
+			scripts: { site: join(dir, "site.js") },
+			rewrite: { "/assets/js/site.js": "site" },
+			minify: true,
+		});
+		await pipeline.build();
+		new Router().get("/page", (ctx) => {
+			ctx.response.body = '<html><body><script src="/assets/js/site.js"></script>' +
+				'<script src="/assets/js/other.js"></script></body></html>';
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const page = await (await running.fetch("/page")).text();
+		expect(page).toContain(`src="${pipeline.url("site")}"`);
+		// Nothing the caller did not name is touched.
+		expect(page).toContain('src="/assets/js/other.js"');
 	});
 });
 
