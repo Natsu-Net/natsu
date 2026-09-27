@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Application } from "../src/server.ts";
 import { endSession, resetLive } from "../src/live.ts";
-import { Action, Networked, State, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
+import { Action, Networked, State, caller, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
 import { Router } from "../src/router.ts";
 import { SessionManager } from "../src/session/session.ts";
 import { reset, startApp, type RunningApp } from "./helpers.ts";
@@ -39,10 +39,33 @@ class Cart {
 @State("party", { scope: "room" })
 class Party {
 	@Networked() at = 0;
+	@Networked() host = "";
+	@Networked() log: string[] = [];
 
 	@Action()
 	seek(to: number) {
 		this.at = to;
+	}
+
+	/** First one in takes the room; nobody else may take it off them. */
+	@Action()
+	claim() {
+		const who = caller()?.sessionId ?? "";
+		if (this.host && this.host !== who) return;
+		this.host = who;
+	}
+
+	/** Only the host may move everybody. */
+	@Action()
+	hostSeek(to: number) {
+		if (caller()?.sessionId !== this.host) return;
+		this.at = to;
+	}
+
+	@Action()
+	say(text: string) {
+		const user = caller()?.session?.Get("user");
+		this.log = [...this.log, `${String(user)}: ${text}`];
 	}
 }
 
@@ -338,17 +361,19 @@ describe("rooms", () => {
 	async function partyApp() {
 		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
 		new Router().get("/join/:code", (ctx) => {
+			ctx.session.Set("user", ctx.query.as ?? "someone");
 			ctx.joinRoom(AsClass<Party>(Party), ctx.params.code ?? "");
-			ctx.response.body = "joined";
+			ctx.response.body = ctx.session.id;
 		});
 		return await startApp(new Application({ sessions: manager }));
 	}
 
 	/** Join a room in a fresh session and return the cookie that proves it. */
-	async function join(base: string, code: string): Promise<string> {
-		const response = await fetch(`${base}/join/${code}`);
+	async function join(base: string, code: string, as = "someone"): Promise<string> {
+		const response = await fetch(`${base}/join/${code}?as=${as}`);
 		return (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
 	}
+
 
 	test("a room you joined streams to you, under its own key", async () => {
 		running = await partyApp();
@@ -360,7 +385,7 @@ describe("rooms", () => {
 		const frames = await client.next(1);
 
 		// The key carries the room, so the browser's own store matches.
-		expect(frames[0]).toEqual({ t: "sync", store: "party:room-a", value: { at: 0 } });
+		expect(frames[0]).toEqual({ t: "sync", store: "party:room-a", value: { at: 0, host: "", log: [] } });
 
 		resolveState(AsClass<Party>(Party), "room-a").at = 42;
 		await client.next(2);
@@ -462,5 +487,73 @@ describe("a session ending", () => {
 
 		await manager.destroy(id);
 		expect(hasRoom(id, "party", "room-a")).toBe(false);
+	});
+});
+
+describe("who is calling", () => {
+	async function partyApp() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/join/:code", (ctx) => {
+			ctx.session.Set("user", ctx.query.as ?? "someone");
+			ctx.joinRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = ctx.session.id;
+		});
+		return await startApp(new Application({ sessions: manager }));
+	}
+
+	async function joined(base: string, code: string, as: string) {
+		const response = await fetch(`${base}/join/${code}?as=${as}`);
+		const id = await response.text();
+		const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		const client = open(base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: [`party:${code}`] }));
+		await client.next(1);
+		return { id, client };
+	}
+
+	test("an action can tell one caller from another", async () => {
+		// Without this a shared store has no authority: any member could seek
+		// the room, because the action cannot see who asked.
+		running = await partyApp();
+		const alice = await joined(running.base, "room-a", "alice");
+		const bob = await joined(running.base, "room-a", "bob");
+
+		alice.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "claim", args: [] }));
+		await Bun.sleep(80);
+		expect(resolveState(AsClass<Party>(Party), "room-a").host).toBe(alice.id);
+
+		// Bob is in the room and may say so; he still may not take it over.
+		bob.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "claim", args: [] }));
+		bob.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "hostSeek", args: [600] }));
+		await Bun.sleep(80);
+
+		expect(resolveState(AsClass<Party>(Party), "room-a").host).toBe(alice.id);
+		expect(resolveState(AsClass<Party>(Party), "room-a").at).toBe(0);
+
+		alice.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "hostSeek", args: [600] }));
+		await Bun.sleep(80);
+		expect(resolveState(AsClass<Party>(Party), "room-a").at).toBe(600);
+
+		alice.client.socket.close();
+		bob.client.socket.close();
+	});
+
+	test("an action can read the caller's session", async () => {
+		running = await partyApp();
+		const alice = await joined(running.base, "room-a", "alice");
+		const bob = await joined(running.base, "room-a", "bob");
+
+		alice.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "say", args: ["hi"] }));
+		await Bun.sleep(60);
+		bob.client.socket.send(JSON.stringify({ t: "call", store: "party:room-a", method: "say", args: ["hello"] }));
+		await Bun.sleep(80);
+
+		// The name is the server's, from the session — never a field the
+		// client put in the frame.
+		expect(resolveState(AsClass<Party>(Party), "room-a").log).toEqual(["alice: hi", "bob: hello"]);
+
+		alice.client.socket.close();
+		bob.client.socket.close();
 	});
 });

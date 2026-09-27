@@ -43,6 +43,8 @@ export interface LiveServer {
 import type { NatsuSocketData } from "./context.ts";
 import { log } from "./logger.ts";
 import {
+	type Caller,
+	type CallerSession,
 	type Patch,
 	type StateClass,
 	applyWrite,
@@ -66,6 +68,8 @@ export interface LiveSocketData {
 	live: true;
 	/** Session id, or "" for a client with no session. */
 	scopeId: string;
+	/** The caller's session, so an @Action can tell who it is serving. */
+	session?: CallerSession;
 	/** Topics this connection is subscribed to, so close can undo them. */
 	topics: Set<string>;
 }
@@ -261,8 +265,11 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 				const found = instanceFor(ws.data, frame.store);
 				if (!found || typeof frame.method !== "string") return;
 				const args = Array.isArray(frame.args) ? frame.args : [];
+				// An action that cannot tell one caller from another cannot enforce
+				// anything — no host check, no per-person rate limit.
+				const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
 				try {
-					callAction(found.instance, frame.method, args);
+					callAction(found.instance, frame.method, args, who);
 				} catch (error) {
 					log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
 				}
@@ -297,9 +304,14 @@ function isLive(ws: ServerWebSocket<LiveSocketData>): boolean {
  * before calling this, because the session is what decides which state the
  * connection can see.
  */
-export function upgradeLive(request: Request, server: LiveServer, scopeId: string): Response | undefined {
+export function upgradeLive(
+	request: Request,
+	server: LiveServer,
+	scopeId: string,
+	session?: CallerSession,
+): Response | undefined {
 	const upgraded = server.upgrade(request, {
-		data: { live: true, scopeId, topics: new Set<string>() },
+		data: { live: true, scopeId, session, topics: new Set<string>() },
 	});
 	return upgraded ? undefined : new Response("expected a websocket", { status: 400 });
 }

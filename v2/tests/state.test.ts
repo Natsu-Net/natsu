@@ -15,6 +15,7 @@ import {
 	State,
 	applyWrite,
 	callAction,
+	caller,
 	dropScope,
 	grantRoom,
 	hasRoom,
@@ -284,5 +285,40 @@ describe("rooms", () => {
 	test("a grant for one class does not carry to another", () => {
 		grantRoom("session-a", AsClass(Party), "room-a");
 		expect(hasRoom("session-a", "table", "room-a")).toBe(false);
+	});
+});
+
+describe("the caller", () => {
+	test("is nobody outside an action, and is put back afterwards", () => {
+		// A leaked caller is worse than no caller: the next action would run
+		// with somebody else's identity.
+		expect(caller()).toBeUndefined();
+		const counter = resolveState(AsClass<Counter>(Counter), "");
+		callAction(counter, "bump", [1], { sessionId: "session-a" });
+		expect(caller()).toBeUndefined();
+	});
+
+	test("is put back even when the action throws", () => {
+		const counter = resolveState(AsClass<Counter>(Counter), "");
+		expect(() => callAction(counter, "nuke", [], { sessionId: "session-a" })).toThrow();
+		expect(caller()).toBeUndefined();
+	});
+
+	test("an action reads it while it runs", () => {
+		let seen: string | undefined;
+		@State("whoami", { scope: "global" })
+		class WhoAmI {
+			@Networked() last = "";
+
+			@Action()
+			mark() {
+				seen = caller()?.sessionId;
+				this.last = seen ?? "";
+			}
+		}
+		const it = resolveState(AsClass<WhoAmI>(WhoAmI), "");
+		callAction(it, "mark", [], { sessionId: "session-b" });
+		expect(seen).toBe("session-b");
+		expect(it.last).toBe("session-b");
 	});
 });

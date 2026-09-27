@@ -14,7 +14,7 @@ import { Context, type Handler, type Middleware, type NatsuServer, type NatsuSoc
 import { config as globalConfig, type NatsuConfig } from "./config.ts";
 import { CLog, formatLine, log, setLogLevel } from "./logger.ts";
 import { Router, type RouteEntry } from "./router.ts";
-import { SessionManager, sessionMiddleware } from "./session/session.ts";
+import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
 import { SOCKET_PATH, liveWebSocketHandler, setLiveServer, upgradeLive } from "./live.ts";
 
@@ -293,8 +293,8 @@ export class Application {
 					// The session decides which state this connection can see,
 					// so it is resolved here and nowhere else — a frame never
 					// names a scope.
-					const scopeId = await this.socketScope(request);
-					return upgradeLive(request, server, scopeId) ?? (undefined as unknown as Response);
+					const session = await this.socketScope(request);
+					return upgradeLive(request, server, session?.id ?? "", session) ?? (undefined as unknown as Response);
 				}
 				if (options.upgrade) {
 					const refused = options.upgrade(request, server);
@@ -322,16 +322,15 @@ export class Application {
 	 * socket gets no session rather than minting one, so a global store still
 	 * works and a session store simply has nothing to resolve against.
 	 */
-	private async socketScope(request: Request): Promise<string> {
-		if (!this.sessions) return "";
+	private async socketScope(request: Request): Promise<Session | undefined> {
+		if (!this.sessions) return undefined;
 		try {
 			const ctx = new Context(request);
 			const id = ctx.cookies.get(this.sessions.cookieName);
-			if (!id) return "";
-			const session = await this.sessions.get(id);
-			return session?.id ?? "";
+			if (!id) return undefined;
+			return await this.sessions.get(id);
 		} catch {
-			return "";
+			return undefined;
 		}
 	}
 

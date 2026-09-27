@@ -349,8 +349,54 @@ export function applyWrite(instance: object, path: string, value: unknown): bool
 	return true;
 }
 
+// --- who is calling ---------------------------------------------------------
+
+/**
+ * Just enough of a session for an action to know whose call this is.
+ *
+ * Structural so that `state.ts` does not have to import the session module,
+ * which imports this one.
+ */
+export interface CallerSession {
+	id: string;
+	Get(key: string): unknown;
+}
+
+/** The connection an @Action is running on behalf of. */
+export interface Caller {
+	/** Session id, or "" when the server called the action itself. */
+	sessionId: string;
+	/** The caller's session, when the connection had one. */
+	session?: CallerSession;
+	/** The room the call arrived on, for a room-scoped store. */
+	room?: string;
+}
+
+let currentCaller: Caller | undefined;
+
+/**
+ * Who is calling the @Action that is running right now.
+ *
+ * Shared state is only as safe as its actions, and an action that cannot tell
+ * one caller from another cannot enforce anything: no host check, no "this
+ * message is from you", no rate limit per person.
+ *
+ *   @Action()
+ *   seek(to: number) {
+ *     if (caller()?.session?.Get("user") !== this.host) return;
+ *     this.time = to;
+ *   }
+ *
+ * Read it synchronously, at the top of the action. It is set around the call
+ * and unset when the call returns, so an `await` inside an action loses it —
+ * take what you need first.
+ */
+export function caller(): Caller | undefined {
+	return currentCaller;
+}
+
 /** Invoke a client-requested action, refusing anything not marked `@Action`. */
-export function callAction(instance: object, method: string, args: unknown[]): unknown {
+export function callAction(instance: object, method: string, args: unknown[], who?: Caller): unknown {
 	const constructor = instance.constructor as unknown as StateClass;
 	if (!constructor.meta?.actions.has(method)) {
 		throw new Error(`natsu/state: "${method}" is not an @Action`);
@@ -359,7 +405,13 @@ export function callAction(instance: object, method: string, args: unknown[]): u
 	if (typeof fn !== "function") {
 		throw new Error(`natsu/state: "${method}" is not a method`);
 	}
-	return (fn as (...a: unknown[]) => unknown).call(instance, ...args);
+	const previous = currentCaller;
+	currentCaller = who;
+	try {
+		return (fn as (...a: unknown[]) => unknown).call(instance, ...args);
+	} finally {
+		currentCaller = previous;
+	}
 }
 
 export type { Patch };
