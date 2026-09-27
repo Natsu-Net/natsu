@@ -20,7 +20,7 @@ import { MemoryAdapter } from "./src/session/adapter.ts";
 import { SqliteAdapter } from "./src/session/sqlite.ts";
 import { StaticFiles, parseRange } from "./src/static.ts";
 import { Action, Networked, State, caller, callAction, dropScope, grantRoom, hasRoom, resolveState, resetState, revokeRoom, revokeSession, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor } from "./src/state.ts";
-import { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
+import { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
 
 export { Application, compose, getApp, loadDirectory, resetApp, restart, start, stop };
 export { Router, All, Delete, Get, Head, Options, Patch, Post, Put };
@@ -34,7 +34,7 @@ export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapte
 export { Action, Networked, State };
 export { caller, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor };
 export { grantRoom, hasRoom, revokeRoom, revokeSession };
-export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveServer, stopPublishing, upgradeLive };
+export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
 
@@ -59,7 +59,7 @@ export type {
 } from "./src/config.ts";
 export type { ControllerBinding, DecoratedRoute, HttpMethod } from "./src/metadata.ts";
 export type { Caller, CallerSession, Patch as StatePatch, Scope, StateClass, StateOptions } from "./src/state.ts";
-export type { LiveServer, LiveSocketData } from "./src/live.ts";
+export type { LiveHooks, LiveServer, LiveSocketData } from "./src/live.ts";
 export type { LogLevel } from "./src/logger.ts";
 
 declare global {

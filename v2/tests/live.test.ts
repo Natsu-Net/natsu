@@ -557,3 +557,49 @@ describe("who is calling", () => {
 		bob.client.socket.close();
 	});
 });
+
+describe("connection hooks", () => {
+	test("an app is told when a live socket opens and closes", async () => {
+		// Presence is the case: the socket is natsu's, so an app has no other
+		// way to know who is on the other end of one.
+		const seen: string[] = [];
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/login", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.response.body = ctx.session.id;
+		});
+		running = await startApp(new Application({ sessions: manager }), {
+			liveHooks: {
+				open: (who) => seen.push(`open:${String(who.session?.Get("user"))}`),
+				close: (who) => seen.push(`close:${String(who.session?.Get("user"))}`),
+			},
+		});
+
+		const response = await running.fetch("/login");
+		const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		const client = open(running.base, { cookie });
+		await client.ready;
+		await Bun.sleep(60);
+		client.socket.close();
+		await Bun.sleep(120);
+
+		expect(seen).toEqual(["open:aiko", "close:aiko"]);
+	});
+
+	test("a hook that throws does not take the connection down", async () => {
+		running = await startApp(new Application(), {
+			liveHooks: {
+				open() {
+					throw new Error("nope");
+				},
+			},
+		});
+		const client = open(running.base);
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+		const frames = await client.next(1);
+
+		expect(frames[0]?.t).toBe("sync");
+		client.socket.close();
+	});
+});

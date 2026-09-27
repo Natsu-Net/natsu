@@ -147,6 +147,7 @@ export function endSession(sessionId: string): void {
 export function resetLive(): void {
 	for (const stop of publishing.values()) stop();
 	publishing.clear();
+	hooks = {};
 }
 
 /** A store a connection is allowed to address, and where it lives. */
@@ -221,6 +222,11 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			// actually holds: a connection that subscribed to everything would
 			// receive patches for state its page never rendered.
 			ws.data.topics = new Set();
+			try {
+				hooks.open?.(callerOf(ws.data));
+			} catch (error) {
+				log.warn(`[<yellow>live</yellow>] open hook threw: ${(error as Error).message}`);
+			}
 		},
 
 		message(ws: ServerWebSocket<LiveSocketData>, raw: string | Buffer) {
@@ -284,12 +290,40 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 		close(ws: ServerWebSocket<LiveSocketData>, code: number, reason: string) {
 			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
 			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
+			try {
+				hooks.close?.(callerOf(ws.data));
+			} catch (error) {
+				log.warn(`[<yellow>live</yellow>] close hook threw: ${(error as Error).message}`);
+			}
 		},
 
 		drain(ws: ServerWebSocket<LiveSocketData>) {
 			if (!isLive(ws)) return next?.drain?.(ws as never);
 		},
 	};
+}
+
+/**
+ * What an app wants to know about live connections.
+ *
+ * Presence — who is online right now — is the common case, and it is not
+ * something an app can work out for itself: the socket is natsu's, so only
+ * natsu sees it open and close.
+ */
+export interface LiveHooks {
+	open?(who: Caller): void;
+	close?(who: Caller): void;
+}
+
+let hooks: LiveHooks = {};
+
+/** Register connection hooks. Pass `{}` to clear them. */
+export function setLiveHooks(next: LiveHooks): void {
+	hooks = next;
+}
+
+function callerOf(data: LiveSocketData): Caller {
+	return { sessionId: data.scopeId, session: data.session };
 }
 
 /** Is this one of natsu's live sockets, or an app's own? */

@@ -16,7 +16,7 @@ import { CLog, formatLine, log, setLogLevel } from "./logger.ts";
 import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
-import { SOCKET_PATH, liveWebSocketHandler, setLiveServer, upgradeLive } from "./live.ts";
+import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, setLiveHooks, setLiveServer, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
 
@@ -50,6 +50,13 @@ export interface StartOptions {
 	 * for an app that uses no `@State` classes and wants the path free.
 	 */
 	live?: boolean;
+	/**
+	 * Called when a live socket opens and closes.
+	 *
+	 * The socket is natsu's, so only natsu sees it come and go; an app that
+	 * wants a presence list has no other way to know.
+	 */
+	liveHooks?: LiveHooks;
 	/**
 	 * Called to upgrade a request the app's own handler wants. Return a
 	 * Response to refuse, or undefined once upgraded.
@@ -341,6 +348,7 @@ export class Application {
 		this.chain = compose([...this.builtins(), ...this.userMiddleware]);
 		this.serverRef = Bun.serve(this.serveOptions(options));
 		setLiveServer(this.serverRef);
+		if (options.liveHooks) setLiveHooks(options.liveHooks);
 
 		if (!options.quiet) {
 			CLog(`[<green>natsu</green>] listening on <cyan>${this.serverRef.url.href}</cyan>`);
