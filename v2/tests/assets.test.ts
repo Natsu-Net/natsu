@@ -118,6 +118,33 @@ describe("rewriting", () => {
 	});
 });
 
+describe("script formats", () => {
+	test("modules that share an import ship it once; a classic script is never split", async () => {
+		writeFileSync(join(dir, "lib.js"), "export const shared = () => 42;\n");
+		writeFileSync(join(dir, "a.js"), 'import { shared } from "./lib.js"; console.log(shared());\n');
+		writeFileSync(join(dir, "b.js"), 'import { shared } from "./lib.js"; console.log(shared() + 1);\n');
+		writeFileSync(join(dir, "old.js"), '(function () { window.legacy = true; })();\n');
+
+		const pipeline = new Assets({
+			outDir: out,
+			scripts: { a: join(dir, "a.js"), b: join(dir, "b.js") },
+			classicScripts: { old: join(dir, "old.js") },
+			minify: true,
+		});
+		const report = await pipeline.build();
+
+		// The shared module became its own chunk rather than being copied
+		// into both entry points.
+		expect(report.shared.length).toBeGreaterThan(0);
+
+		// A classic script is loaded by a bare <script src>, which cannot
+		// execute an import. Its bundle has to stand alone.
+		const legacy = await read(pipeline, pipeline.url("old"));
+		expect(legacy).not.toContain("import");
+		expect(legacy).toContain("legacy");
+	});
+});
+
 describe("deduplication", () => {
 	test("two pages that need the same rules share one chunk", async () => {
 		const pipeline = assets();
@@ -185,6 +212,24 @@ describe("minification", () => {
 		const report = await small.build();
 		expect(report.sizes.site!.to).toBeLessThan(report.sizes.site!.from);
 		expect(small.url("site")).not.toBe(large.url("site"));
+	});
+});
+
+describe("what is left alone", () => {
+	test("an API answer that mentions an asset path is not a page", async () => {
+		reset();
+		const pipeline = assets({ rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		new Router().get("/api/thing", (ctx) => {
+			ctx.response.headers.set("content-type", "application/json; charset=utf-8");
+			ctx.response.body = JSON.stringify({ stylesheet: "/assets/css/site.css" });
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const body = await (await running.fetch("/api/thing")).text();
+		expect(JSON.parse(body).stylesheet).toBe("/assets/css/site.css");
 	});
 });
 

@@ -50,8 +50,21 @@ export interface AssetsOptions {
 	 * worth more than the bytes.
 	 */
 	minify?: boolean;
-	/** Script entry points, by name: the name is what `url()` takes. */
+	/**
+	 * Module entry points, by name: the name is what `url()` takes.
+	 *
+	 * These are bundled together with code splitting, so a module two of them
+	 * import ships once as a chunk both of them pull in.
+	 */
 	scripts?: Record<string, string>;
+	/**
+	 * Entry points for plain `<script src>` tags, by name.
+	 *
+	 * A classic script is not a module, so it cannot be handed an `import`,
+	 * which is exactly what code splitting would give it. These are built one
+	 * at a time as self-contained bundles: minified and hashed, never split.
+	 */
+	classicScripts?: Record<string, string>;
 	/** Stylesheets, by name: the files are concatenated in order. */
 	styles?: Record<string, string[]>;
 	/**
@@ -108,6 +121,7 @@ export class Assets {
 		this.report = { urls: {}, sizes: {}, shared: [] };
 		await this.buildStyles();
 		await this.buildScripts();
+		await this.buildClassicScripts();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
 	}
@@ -193,7 +207,10 @@ export class Assets {
 
 			const body = ctx.response.body;
 			if (typeof body !== "string") return;
-			if (!body.includes("/assets/") && !body.includes("<link")) return;
+			// Documents only. An API answer is a string too, and one that
+			// happens to carry an asset path is not a page to rewrite.
+			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
+			if (type ? !type.includes("html") : !body.startsWith("<")) return;
 			ctx.response.body = this.rewrite(body);
 		};
 	}
@@ -255,6 +272,26 @@ export class Assets {
 			const name = byStem.get(stemOf(file)) ?? stemOf(file);
 			this.entries.set(name, url);
 			this.report.sizes[name] = { from: await sourceSize(this.options.scripts?.[name]), to: body.length };
+		}
+	}
+
+	private async buildClassicScripts(): Promise<void> {
+		for (const [name, file] of Object.entries(this.options.classicScripts ?? {})) {
+			const built = await Bun.build({
+				entrypoints: [file],
+				target: "browser",
+				format: "iife",
+				splitting: false,
+				minify: this.options.minify ?? false,
+			});
+			if (!built.success || !built.outputs[0]) {
+				for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
+				continue;
+			}
+			const body = await built.outputs[0].text();
+			const url = this.hold(`${name}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
+			this.entries.set(name, url);
+			this.report.sizes[name] = { from: await sourceSize(file), to: body.length };
 		}
 	}
 
