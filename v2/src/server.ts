@@ -281,6 +281,28 @@ export class Application {
 		return routes;
 	}
 
+	/**
+	 * Put the live socket in the route table, not only in `fetch`.
+	 *
+	 * Bun matches `routes` before it ever calls `fetch`, so an app with a
+	 * catch-all — which every app that renders its own 404 page has — was
+	 * answering the handshake itself with a 404. The socket has to be a route
+	 * to win, and an exact path beats a wildcard.
+	 */
+	private socketRoute(
+		live: boolean,
+		routes: Record<string, (request: BunRequest, server: NatsuServer) => Promise<Response>>,
+	): Record<string, (request: BunRequest, server: NatsuServer) => Promise<Response>> {
+		if (!live) return routes;
+		return {
+			...routes,
+			[SOCKET_PATH]: async (request: BunRequest, server: NatsuServer) => {
+				const session = await this.socketScope(request);
+				return upgradeLive(request, server, session?.id ?? "", session) ?? (undefined as unknown as Response);
+			},
+		};
+	}
+
 	private serveOptions(options: StartOptions): ServeOptions<NatsuSocketData> {
 		const live = options.live !== false;
 		const terminal = this.terminalFor(undefined);
@@ -290,7 +312,7 @@ export class Application {
 			hostname: options.hostname ?? this.config.General.listenOn,
 			development: options.development ?? this.config.General.development,
 			reusePort: options.reusePort ?? false,
-			routes: this.buildRoutes(),
+			routes: this.socketRoute(live, this.buildRoutes()),
 			websocket: options.websocket || live ? liveWebSocketHandler(options.websocket) : undefined,
 			fetch: async (request: Request, server: NatsuServer) => {
 				// The upgrade has to happen before the middleware chain: a

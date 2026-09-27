@@ -603,3 +603,26 @@ describe("connection hooks", () => {
 		client.socket.close();
 	});
 });
+
+describe("living beside an app's routes", () => {
+	test("an app's catch-all does not swallow the handshake", async () => {
+		// Bun matches `routes` before `fetch`, so a site that renders its own
+		// 404 page from a `/*` route was answering the handshake itself. The
+		// socket has to be a route of its own to win.
+		new Router().get("/*", (ctx) => {
+			ctx.response.status = 404;
+			ctx.response.body = "not found";
+		});
+		running = await startApp(new Application());
+
+		const refused = await running.fetch("/_uwu/socket");
+		expect(refused.status).toBe(400);
+
+		const client = open(running.base);
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+		const frames = await client.next(1);
+		expect(frames[0]?.t).toBe("sync");
+		client.socket.close();
+	});
+});
