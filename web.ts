@@ -6,6 +6,7 @@ import uwu from "./src/templates.ts";
 import { SessionMiddleware } from "./src/session/session.ts";
 import { CreateWatcherWorker } from "./src/watcher/watcher.ts";
 import { path } from "./src/global/_deps.ts";
+import { resolvePublicPath } from "./src/public-path.ts";
 
 import { ExtMapping } from "https://deno.land/x/common_mime_types@0.1.1/mod.ts";
 import { config } from "./src/global/config.ts";
@@ -24,6 +25,10 @@ function exists(path: string): boolean {
 		return false;
 	}
 }
+
+/** Absolute path of the directory static files are served from. */
+const publicRoot = `${Deno.cwd()}/public`;
+
 //const appOptions = hasFlash() ? { serverConstructor: FlashServer } : undefined;
 
 const app = new Application({ proxy: config.General.proxy });
@@ -58,18 +63,23 @@ async function loadServerstuff(dev = false): Promise<void> {
 	// serve public folder
 	// deno-lint-ignore no-explicit-any
 	app.use(async (ctx: any, next: any) => {
+		// Resolved once, up front, and used for every filesystem call below.
+		const filePath = resolvePublicPath(publicRoot, ctx.request.url.pathname);
 
-		if (exists(`${Deno.cwd()}/public/${ctx.request.url.pathname}`) && ctx.request.url.pathname !== "/") {
+		if (filePath && exists(filePath)) {
 			// check if file in cache
 			if (Config.Cache.enablePublicCache && ctx.cache.has(ctx.request.url.pathname)) {
 				if (Config.Cache.autoUpdatePublicCache) {
-					const path = `${Deno.cwd()}/public/${ctx.request.url.pathname}`.replace(/\/\.\.\//g, "/");
-
-					// check if file has changed
-					const stat = (await Deno.stat(path)) as Deno.FileInfo;
-					if (stat.size !== ctx.cache.getSize()) {
+					// check if file has changed. `getSize()` is the number of
+					// entries in the cache, not the size of this one, so the
+					// comparison was against an unrelated number; the cached
+					// bytes are what this has to be measured against.
+					const stat = (await Deno.stat(filePath)) as Deno.FileInfo;
+					const cached = ctx.cache.get(ctx.request.url.pathname);
+					const cachedSize = cached instanceof Uint8Array ? cached.byteLength : -1;
+					if (stat.size !== cachedSize) {
 						// update cache
-						ctx.cache.set(ctx.request.url.pathname, await Deno.readFile(path), Config.Cache.publicCacheTTL);
+						ctx.cache.set(ctx.request.url.pathname, await Deno.readFile(filePath), Config.Cache.publicCacheTTL);
 					}
 				}
 				if (Config.Cache.logPublicHit) CLog(`[<magenta>Cache HIT</magenta>] <cyan>${ctx.request.url.pathname}</cyan>`);
@@ -77,27 +87,23 @@ async function loadServerstuff(dev = false): Promise<void> {
 				const ext = path.extname(ctx.request.url.pathname);
 				const mime = ExtMapping[ext] ?? "application/octet-stream";
 				ctx.response.body = ctx.cache.get(ctx.request.url.pathname);
-				// set cache headers for 5h
+				// set cache headers for 5h. `max-age` is in seconds and
+				// `Expires` is a date, so the old `Date.now() + 18000` made the
+				// two headers disagree by a factor of a thousand — the response
+				// claimed to be stale eighteen seconds after it was sent.
 				ctx.response.headers.set("Cache-Control", "public, max-age=18000");
-				ctx.response.headers.set("Expires", new Date(Date.now() + 18000).toUTCString());
+				ctx.response.headers.set("Expires", new Date(Date.now() + 18000 * 1000).toUTCString());
 				ctx.response.headers.set("Content-Type", mime);
 			} else {
-				// make sure path does not get escaped with /../ or /..\ or /..\..\ etc
-				const l_path = `${Deno.cwd()}/public/${ctx.request.url.pathname}`.replace(/\/\.\.\//g, "/");
-				// check if file exists
-				if (exists(l_path)) {
-					// read file
-					const file = await Deno.readFile(l_path);
-					if (Config.Cache.enablePublicCache) {
-						ctx.cache.set(ctx.request.url.pathname, file, Config.Cache.publicCacheTTL);
-					}
-					const ext = path.extname(ctx.request.url.pathname);
-					const mime = ExtMapping[ext] ?? "application/octet-stream";
-					ctx.response.body = file;
-					ctx.response.headers.set("Content-Type", mime);
-				} else {
-					ctx.response.status = 404;
+				// read file
+				const file = await Deno.readFile(filePath);
+				if (Config.Cache.enablePublicCache) {
+					ctx.cache.set(ctx.request.url.pathname, file, Config.Cache.publicCacheTTL);
 				}
+				const ext = path.extname(ctx.request.url.pathname);
+				const mime = ExtMapping[ext] ?? "application/octet-stream";
+				ctx.response.body = file;
+				ctx.response.headers.set("Content-Type", mime);
 			}
 		} else {
 			try {

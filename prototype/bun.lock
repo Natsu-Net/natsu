@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "natsu-bun-prototype",
+      "dependencies": {
+        "uwu-template": "github:beingsuz/uwu-template#claude/project-thread-x2v3b1",
+      },
+    },
+  },
+  "packages": {
+    "uwu-template": ["uwu-template@github:beingsuz/uwu-template#8e485226e6d168f752cc8ca9768cdec645df10a2", {}, "beingsuz-uwu-template-8e485226e6d168f752cc8ca9768cdec645df10a2", "sha512-+l9eZ/x9MnbSp4uxp7LdvIbd3ihAkN0WE22e78/TQVw/9kYvKjGKnccQCi/MfKIR05/DHJZe2jK01VmlgvLaXQ=="],
+  }
+}

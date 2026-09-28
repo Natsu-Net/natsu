@@ -1,0 +1,11 @@
+{
+  "name": "natsu-bun-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run server.ts"
+  },
+  "dependencies": {
+    "uwu-template": "github:beingsuz/uwu-template#claude/project-thread-x2v3b1"
+  }
+}
