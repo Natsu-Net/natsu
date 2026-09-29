@@ -233,6 +233,18 @@ describe("what is left alone", () => {
 	});
 });
 
+describe("vendor files", () => {
+	test("a file is served byte for byte under a name that carries its hash", async () => {
+		const vendor = '/*! vendor */(function(){window.V=1})();\n';
+		writeFileSync(join(dir, "vendor.js"), vendor);
+		const pipeline = new Assets({ outDir: out, files: { lib: join(dir, "vendor.js") }, minify: true });
+		await pipeline.build();
+		const url = pipeline.url("lib");
+		expect(url).toMatch(/^\/_a\/lib\.[0-9a-f]{10}\.js$/);
+		expect(await read(pipeline, url)).toBe(vendor);
+	});
+});
+
 /** Read a chunk back out of the pipeline through its own middleware. */
 async function read(pipeline: Assets, url: string): Promise<string> {
 	reset();
