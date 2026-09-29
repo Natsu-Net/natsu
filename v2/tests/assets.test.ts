@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
@@ -242,6 +242,84 @@ describe("vendor files", () => {
 		const url = pipeline.url("lib");
 		expect(url).toMatch(/^\/_a\/lib\.[0-9a-f]{10}\.js$/);
 		expect(await read(pipeline, url)).toBe(vendor);
+	});
+});
+
+describe("renaming classes", () => {
+	test("markup and stylesheet get the same short names; what a script names keeps its own", async () => {
+		const views = join(dir, "views");
+		const js = join(dir, "js");
+		for (const d of [views, js]) mkdirSync(d);
+		writeFileSync(join(views, "page.uwu"), '<div class="card"><h3 class="card__title">{{t}}</h3><table class="admin-table"></table></div>');
+		writeFileSync(join(js, "menu.js"), 'el.classList.toggle("is-open");');
+		const pipeline = assets({ mangle: { scripts: [js], markup: [views] }, rewrite: { "/assets/css/site.css": "site" } });
+		const report = await pipeline.build();
+		expect(report.mangled?.renamed).toBeGreaterThan(0);
+
+		const page = pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><div class="card"><h3 class="card__title">x</h3></div>');
+		expect(page).not.toContain("card__title");
+		const short = /<h3 class="([^"]+)"/.exec(page)![1]!;
+		const css = await read(pipeline, /href="([^"]+)"/.exec(page)![1]!);
+		expect(css).toContain(`.${short}{`);
+		expect(css).not.toContain("card__title");
+
+		// Nor is a class a page's own <style> names.
+		writeFileSync(join(views, "inline.uwu"), '<style>.card__title{color:red}</style>');
+		const styled = assets({ mangle: { scripts: [js], markup: [views] } });
+		await styled.build();
+		expect(styled.rewrite('<h3 class="card__title">x</h3>')).toContain('class="card__title"');
+
+		// The script toggles it by name, so it cannot be renamed.
+		const menu = pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><nav class="is-open"></nav>');
+		expect(menu).toContain('class="is-open"');
+	});
+});
+
+describe("lazy styles", () => {
+	test("what only a script can reach is linked later, by a loader right after the first sheet", async () => {
+		const pipeline = assets({ safelist: ["is-open", "admin-table"], lazyStyles: { eager: [/^is-/] }, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const page = pipeline.rewrite('<head><link rel="stylesheet" href="/assets/css/site.css"></head><body><div class="card"></div></body>');
+
+		const eager = /href="([^"]+)"/.exec(page)![1]!;
+		const loader = /<link[^>]+><script>([^<]+)<\/script>/.exec(page)?.[1] ?? "";
+		const later = /"(\/_a\/site-later\.[^"]+)"/.exec(loader)?.[1];
+		expect(later).toBeTruthy();
+		expect(loader).toContain(".admin-table");
+
+		const first = await read(pipeline, eager);
+		expect(first).toContain(".card");
+		expect(first).toContain(".is-open");
+		expect(first).not.toContain("admin-table");
+		expect(await read(pipeline, later!)).toContain(".admin-table");
+	});
+
+	test("the loader follows the stylesheet link, not a preload of the same file", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const page = pipeline.rewrite(
+			'<link rel="preload" href="/assets/css/site.css" as="style"><link rel="stylesheet" href="/assets/css/site.css"><div class="card"></div>',
+		);
+		expect(page).toMatch(/<link rel="preload"[^>]+><link rel="stylesheet"[^>]+><script>/);
+	});
+
+	test("what a script draws on load goes in the first sheet, on the pages that have it", async () => {
+		const pipeline = assets({
+			safelist: ["admin-table"],
+			lazyStyles: { whenPresent: { card: ["admin-table"] } },
+			rewrite: { "/assets/css/site.css": "site" },
+		});
+		await pipeline.build();
+		const withCard = pipeline.pageStyle("site", '<div class="card"></div>');
+		const without = pipeline.pageStyle("site", "<p>nothing</p>");
+		expect(await read(pipeline, withCard)).toContain("admin-table");
+		expect(await read(pipeline, without)).not.toContain("admin-table");
+	});
+
+	test("a page with nothing to defer gets no loader", async () => {
+		const pipeline = assets({ lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		expect(pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><div class="card"></div>')).not.toContain("<script>");
 	});
 });
 
