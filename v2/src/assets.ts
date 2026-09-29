@@ -36,7 +36,7 @@
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
-import { planClassNames, renameCSSClasses, renameHTMLClasses } from "uwu-template/assets/mangle";
+import { cssClasses, planClassNames, renameCSSClasses, renameHTMLClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
@@ -108,6 +108,14 @@ export interface AssetsOptions {
 		 * act on — focus, measure — before a lazy stylesheet could arrive.
 		 */
 		eager?: Array<string | RegExp>;
+		/**
+		 * Safelisted names kept in the page's own chunk only on pages whose
+		 * markup carries the class named by the key: for what a script draws
+		 * as soon as the page loads, like a player's controls on the one page
+		 * that has a player. Deferring those would draw them unstyled for a
+		 * moment, and keeping them everywhere would load them everywhere.
+		 */
+		whenPresent?: Record<string, Array<string | RegExp>>;
 	};
 	/** Skip the per-page narrowing and serve the whole stylesheet. */
 	wholeStylesheets?: boolean;
@@ -206,8 +214,13 @@ export class Assets {
 			if (lazy) {
 				// Right after its own <link>, so the lazy half is inserted there
 				// too and keeps its place ahead of any later stylesheet.
-				const at = out.indexOf(url);
-				const close = at === -1 ? -1 : out.indexOf(">", at);
+				// The stylesheet <link>, not a preload of the same file.
+				let close = -1;
+				for (let at = out.indexOf(url); at !== -1 && close === -1; at = out.indexOf(url, at + 1)) {
+					const end = out.indexOf(">", at);
+					const tag = out.slice(out.lastIndexOf("<", at), end + 1);
+					if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
+				}
 				if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
 			}
 		}
@@ -239,7 +252,11 @@ export class Assets {
 			return url;
 		}
 
-		const eager = typeof this.options.lazyStyles === "object" ? this.options.lazyStyles.eager ?? [] : [];
+		const lazyStyles = typeof this.options.lazyStyles === "object" ? this.options.lazyStyles : {};
+		const eager = [...(lazyStyles.eager ?? [])];
+		for (const [marker, names] of Object.entries(lazyStyles.whenPresent ?? {})) {
+			if (profile.classes.has(this.classes.get(marker) ?? marker)) eager.push(...names);
+		}
 		const split = splitCSS(source, profile, { safelist: this.safelist, eager: this.translate(eager) });
 		const body = minify(split.eager);
 		const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
@@ -328,7 +345,14 @@ export class Assets {
 			}
 		}
 
-		const plan = planClassNames({ css, scripts, markup, keep: mangle.keep });
+		// A page's own <style> is not rewritten either, so what it styles
+		// keeps its name.
+		const keep = [...(mangle.keep ?? [])];
+		for (const page of markup) {
+			for (const m of page.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) keep.push(...cssClasses(m[1] ?? "").keys());
+		}
+
+		const plan = planClassNames({ css, scripts, markup, keep });
 		this.classes = plan.map;
 		this.report.mangled = { renamed: plan.map.size, pinned: plan.pinned.size };
 		this.safelist = this.translate(this.options.safelist ?? []);

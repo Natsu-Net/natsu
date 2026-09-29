@@ -263,6 +263,12 @@ describe("renaming classes", () => {
 		expect(css).toContain(`.${short}{`);
 		expect(css).not.toContain("card__title");
 
+		// Nor is a class a page's own <style> names.
+		writeFileSync(join(views, "inline.uwu"), '<style>.card__title{color:red}</style>');
+		const styled = assets({ mangle: { scripts: [js], markup: [views] } });
+		await styled.build();
+		expect(styled.rewrite('<h3 class="card__title">x</h3>')).toContain('class="card__title"');
+
 		// The script toggles it by name, so it cannot be renamed.
 		const menu = pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><nav class="is-open"></nav>');
 		expect(menu).toContain('class="is-open"');
@@ -286,6 +292,28 @@ describe("lazy styles", () => {
 		expect(first).toContain(".is-open");
 		expect(first).not.toContain("admin-table");
 		expect(await read(pipeline, later!)).toContain(".admin-table");
+	});
+
+	test("the loader follows the stylesheet link, not a preload of the same file", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const page = pipeline.rewrite(
+			'<link rel="preload" href="/assets/css/site.css" as="style"><link rel="stylesheet" href="/assets/css/site.css"><div class="card"></div>',
+		);
+		expect(page).toMatch(/<link rel="preload"[^>]+><link rel="stylesheet"[^>]+><script>/);
+	});
+
+	test("what a script draws on load goes in the first sheet, on the pages that have it", async () => {
+		const pipeline = assets({
+			safelist: ["admin-table"],
+			lazyStyles: { whenPresent: { card: ["admin-table"] } },
+			rewrite: { "/assets/css/site.css": "site" },
+		});
+		await pipeline.build();
+		const withCard = pipeline.pageStyle("site", '<div class="card"></div>');
+		const without = pipeline.pageStyle("site", "<p>nothing</p>");
+		expect(await read(pipeline, withCard)).toContain("admin-table");
+		expect(await read(pipeline, without)).not.toContain("admin-table");
 	});
 
 	test("a page with nothing to defer gets no loader", async () => {
