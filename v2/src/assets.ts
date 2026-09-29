@@ -197,34 +197,46 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
-		// Classes first: the stylesheet chunk is cut to the markup as it will
-		// actually arrive.
 		const page = this.classes.size > 0 ? renameHTMLClasses(html, this.classes) : html;
-		let out = page;
-		for (const [from, name] of Object.entries(this.options.rewrite ?? {})) {
-			const url = this.sources.has(name) && !this.options.wholeStylesheets
-				? this.pageStyle(name, page)
-				: this.url(name);
-			if (!url || url === from) continue;
-			// Both quote styles, because a template author picks either and a
-			// path left un-rewritten is a 404 the page cannot recover from.
-			out = out.split(`"${from}"`).join(`"${url}"`);
-			out = out.split(`'${from}'`).join(`'${url}'`);
-			const lazy = this.lazy.get(url);
-			if (lazy) {
-				// Right after its own <link>, so the lazy half is inserted there
-				// too and keeps its place ahead of any later stylesheet.
-				// The stylesheet <link>, not a preload of the same file.
-				let close = -1;
-				for (let at = out.indexOf(url); at !== -1 && close === -1; at = out.indexOf(url, at + 1)) {
-					const end = out.indexOf(">", at);
-					const tag = out.slice(out.lastIndexOf("<", at), end + 1);
-					if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
-				}
-				if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
+		const pattern = this.rewritePattern();
+		if (!pattern) return page;
+		const resolved = new Map<string, string>();
+		const resolve = (from: string): string => {
+			let url = resolved.get(from);
+			if (url === undefined) {
+				const name = this.options.rewrite?.[from] ?? "";
+				url = this.sources.has(name) && !this.options.wholeStylesheets ? this.pageStyle(name, page) : this.url(name);
+				resolved.set(from, url);
 			}
+			return url;
+		};
+		let out = page.replace(pattern, (match, quote: string, from: string) => {
+			const url = resolve(from);
+			return url && url !== from ? `${quote}${url}${quote}` : match;
+		});
+		for (const url of resolved.values()) {
+			const lazy = url ? this.lazy.get(url) : undefined;
+			if (!lazy) continue;
+			let close = -1;
+			for (let at = out.indexOf(url); at !== -1 && close === -1; at = out.indexOf(url, at + 1)) {
+				const end = out.indexOf(">", at);
+				const tag = out.slice(out.lastIndexOf("<", at), end + 1);
+				if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
+			}
+			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
 		}
 		return out;
+	}
+
+	private pattern: RegExp | null | undefined;
+
+	private rewritePattern(): RegExp | null {
+		if (this.pattern !== undefined) return this.pattern;
+		const froms = Object.keys(this.options.rewrite ?? {}).sort((a, b) => b.length - a.length);
+		this.pattern = froms.length === 0
+			? null
+			: new RegExp(`(["'])(${froms.map((from) => from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\1`, "g");
+		return this.pattern;
 	}
 
 	/**
