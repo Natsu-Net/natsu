@@ -35,8 +35,8 @@
 
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
-import { cssClasses, planClassNames, renameCSSClasses, renameHTMLClasses } from "uwu-template/assets/mangle";
+import { type DocumentProfile, profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
+import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
@@ -197,7 +197,7 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
-		const page = this.classes.size > 0 ? renameHTMLClasses(html, this.classes) : html;
+		const { html: page, profile } = renameAndProfile(html, this.classes);
 		const pattern = this.rewritePattern();
 		if (!pattern) return page;
 		const resolved = new Map<string, string>();
@@ -205,7 +205,7 @@ export class Assets {
 			let url = resolved.get(from);
 			if (url === undefined) {
 				const name = this.options.rewrite?.[from] ?? "";
-				url = this.sources.has(name) && !this.options.wholeStylesheets ? this.pageStyle(name, page) : this.url(name);
+				url = this.sources.has(name) && !this.options.wholeStylesheets ? this.pageStyle(name, page, profile) : this.url(name);
 				resolved.set(from, url);
 			}
 			return url;
@@ -243,11 +243,11 @@ export class Assets {
 	 * The chunk of `name` that covers this page, built the first time a page
 	 * of this shape is seen.
 	 */
-	public pageStyle(name: string, html: string): string {
+	public pageStyle(name: string, html: string, profiled?: DocumentProfile): string {
 		const source = this.sources.get(name);
 		if (source === undefined) return this.url(name);
 
-		const profile = profileDocument(html);
+		const profile = profiled ?? profileDocument(html);
 		// The key is the page's shape, not its content: two pages listing
 		// different anime have the same classes and share a chunk.
 		const shape = hash(
