@@ -65,6 +65,12 @@ export interface AssetsOptions {
 	 * at a time as self-contained bundles: minified and hashed, never split.
 	 */
 	classicScripts?: Record<string, string>;
+	/**
+	 * Files served exactly as they are, by name, under a URL that carries
+	 * their hash: vendor code that is already minified, where rebuilding it
+	 * would risk the code and save nothing, but a year-long cache still pays.
+	 */
+	files?: Record<string, string>;
 	/** Stylesheets, by name: the files are concatenated in order. */
 	styles?: Record<string, string[]>;
 	/**
@@ -122,6 +128,7 @@ export class Assets {
 		await this.buildStyles();
 		await this.buildScripts();
 		await this.buildClassicScripts();
+		await this.buildFiles();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
 	}
@@ -292,6 +299,23 @@ export class Assets {
 			const url = this.hold(`${name}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
 			this.entries.set(name, url);
 			this.report.sizes[name] = { from: await sourceSize(file), to: body.length };
+		}
+	}
+
+	private async buildFiles(): Promise<void> {
+		for (const [name, file] of Object.entries(this.options.files ?? {})) {
+			let body: string;
+			try {
+				body = await readFile(file, "utf8");
+			} catch {
+				log.warn(`[<yellow>assets</yellow>] missing file <cyan>${file}</cyan>`);
+				continue;
+			}
+			const ext = file.slice(file.lastIndexOf("."));
+			const type = ext === ".css" ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8";
+			const url = this.hold(`${name}.${hash(body)}${ext}`, body, type);
+			this.entries.set(name, url);
+			this.report.sizes[name] = { from: body.length, to: body.length };
 		}
 	}
 
