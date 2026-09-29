@@ -33,9 +33,10 @@
  * the pipeline owns, and pages go out pointing at the chunks.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { profileDocument, shakeCSS } from "uwu-template/assets";
+import { profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
+import { planClassNames, renameCSSClasses, renameHTMLClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
@@ -81,6 +82,33 @@ export interface AssetsOptions {
 	 * the rule that styles it is dropped as unreachable.
 	 */
 	safelist?: Array<string | RegExp>;
+	/**
+	 * Rename classes to short names in the stylesheets and in every page that
+	 * goes out. `scripts` and `markup` are files or directories: every class
+	 * a script names, builds from a fragment, or reads from an attribute
+	 * keeps its name, because scripts are not rewritten. An entry starting
+	 * with `!` leaves that path out. See
+	 * `uwu-template/assets/mangle` for the rules.
+	 */
+	mangle?: {
+		scripts: string[];
+		markup: string[];
+		keep?: Array<string | RegExp>;
+	};
+	/**
+	 * Load only what the page's markup can match up front. The rules that
+	 * only the safelist keeps — an open menu, a dialog, a toast — go in a
+	 * second chunk that a few hundred bytes of inline script links the first
+	 * time the visitor interacts or one of those classes appears.
+	 */
+	lazyStyles?: boolean | {
+		/**
+		 * Safelisted names whose rules stay in the page's own chunk: state a
+		 * script toggles on an element already there (`/^is-/`), which it may
+		 * act on — focus, measure — before a lazy stylesheet could arrive.
+		 */
+		eager?: Array<string | RegExp>;
+	};
 	/** Skip the per-page narrowing and serve the whole stylesheet. */
 	wholeStylesheets?: boolean;
 	/**
@@ -103,6 +131,8 @@ export interface AssetReport {
 	sizes: Record<string, { from: number; to: number }>;
 	/** Shared script chunks `Bun.build` split out. */
 	shared: string[];
+	/** Classes renamed, and classes that had to keep their names. */
+	mangled?: { renamed: number; pinned: number };
 }
 
 export class Assets {
@@ -115,7 +145,13 @@ export class Assets {
 	private readonly sources = new Map<string, string>();
 	/** Page profile hash -> the URL of the chunk that covers it. */
 	private readonly pages = new Map<string, string>();
+	/** Eager chunk URL -> its lazy half and what should load it. */
+	private readonly lazy = new Map<string, { url: string; triggers: string[] }>();
 	private report: AssetReport = { urls: {}, sizes: {}, shared: [] };
+	/** Original class -> short name, when mangling. */
+	private classes = new Map<string, string>();
+	/** The safelist, with every renamed class it names added by its new name. */
+	private safelist: Array<string | RegExp> = [];
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -125,6 +161,8 @@ export class Assets {
 	public async build(): Promise<AssetReport> {
 		await mkdir(this.options.outDir, { recursive: true });
 		this.report = { urls: {}, sizes: {}, shared: [] };
+		this.safelist = [...(this.options.safelist ?? [])];
+		await this.planClasses();
 		await this.buildStyles();
 		await this.buildScripts();
 		await this.buildClassicScripts();
@@ -151,16 +189,27 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
-		let out = html;
+		// Classes first: the stylesheet chunk is cut to the markup as it will
+		// actually arrive.
+		const page = this.classes.size > 0 ? renameHTMLClasses(html, this.classes) : html;
+		let out = page;
 		for (const [from, name] of Object.entries(this.options.rewrite ?? {})) {
 			const url = this.sources.has(name) && !this.options.wholeStylesheets
-				? this.pageStyle(name, html)
+				? this.pageStyle(name, page)
 				: this.url(name);
 			if (!url || url === from) continue;
 			// Both quote styles, because a template author picks either and a
 			// path left un-rewritten is a 404 the page cannot recover from.
 			out = out.split(`"${from}"`).join(`"${url}"`);
 			out = out.split(`'${from}'`).join(`'${url}'`);
+			const lazy = this.lazy.get(url);
+			if (lazy) {
+				// Right after its own <link>, so the lazy half is inserted there
+				// too and keeps its place ahead of any later stylesheet.
+				const at = out.indexOf(url);
+				const close = at === -1 ? -1 : out.indexOf(">", at);
+				if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
+			}
 		}
 		return out;
 	}
@@ -182,9 +231,22 @@ export class Assets {
 		const known = this.pages.get(shape);
 		if (known) return known;
 
-		const shaken = shakeCSS(source, profile, { safelist: this.options.safelist });
-		const body = this.options.minify ? minifyCSS(shaken.css).css : shaken.css;
+		const minify = (css: string) => (this.options.minify ? minifyCSS(css).css : css);
+		if (!this.options.lazyStyles) {
+			const body = minify(shakeCSS(source, profile, { safelist: this.safelist }).css);
+			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
+			this.pages.set(shape, url);
+			return url;
+		}
+
+		const eager = typeof this.options.lazyStyles === "object" ? this.options.lazyStyles.eager ?? [] : [];
+		const split = splitCSS(source, profile, { safelist: this.safelist, eager: this.translate(eager) });
+		const body = minify(split.eager);
 		const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
+		if (split.lazy) {
+			const later = minify(split.lazy);
+			this.lazy.set(url, { url: this.hold(`${name}-later.${hash(later)}.css`, later, "text/css; charset=utf-8"), triggers: split.triggers });
+		}
 		this.pages.set(shape, url);
 		return url;
 	}
@@ -234,14 +296,55 @@ export class Assets {
 					log.warn(`[<yellow>assets</yellow>] missing stylesheet <cyan>${file}</cyan>`);
 				}
 			}
-			const source = parts.join("\n");
+			const joined = parts.join("\n");
+			const source = this.classes.size > 0 ? renameCSSClasses(joined, this.classes) : joined;
 			this.sources.set(name, source);
 
 			const body = this.options.minify ? minifyCSS(source).css : source;
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
 			this.entries.set(name, url);
-			this.report.sizes[name] = { from: source.length, to: body.length };
+			this.report.sizes[name] = { from: joined.length, to: body.length };
 		}
+	}
+
+	/** Decide which classes can be renamed, and to what. */
+	private async planClasses(): Promise<void> {
+		this.classes = new Map();
+		const mangle = this.options.mangle;
+		if (!mangle) return;
+
+		const css: string[] = [];
+		for (const files of Object.values(this.options.styles ?? {})) {
+			for (const file of files) css.push(await readFile(file, "utf8").catch(() => ""));
+		}
+		const scripts = await readAll(mangle.scripts);
+		const markup = await readAll(mangle.markup);
+		// A page's own <script> is a script, whatever file it sits in.
+		for (const page of markup) {
+			for (const m of page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+				if (!/type\s*=\s*["']?(text\/(template|x-template|html)|application\/(ld\+)?json)/i.test(m[1] ?? "")) {
+					scripts.push(m[2] ?? "");
+				}
+			}
+		}
+
+		const plan = planClassNames({ css, scripts, markup, keep: mangle.keep });
+		this.classes = plan.map;
+		this.report.mangled = { renamed: plan.map.size, pinned: plan.pinned.size };
+		this.safelist = this.translate(this.options.safelist ?? []);
+	}
+
+	/**
+	 * A safelist names classes by their source names. The ones that were
+	 * renamed are added by their new names, exactly.
+	 */
+	private translate(list: Array<string | RegExp>): Array<string | RegExp> {
+		const out = [...list];
+		for (const [from, to] of this.classes) {
+			const kept = list.some((entry) => typeof entry === "string" ? from === entry || from.includes(entry) : entry.test(from));
+			if (kept) out.push(new RegExp(`^${to}$`));
+		}
+		return out;
 	}
 
 	private async buildScripts(): Promise<void> {
@@ -328,6 +431,40 @@ export class Assets {
 		});
 		return `${this.options.publicPath}/${file}`;
 	}
+}
+
+/**
+ * The inline script that links a page's lazy stylesheet: on the first
+ * pointer, key, focus or scroll event — ahead of the click that opens a
+ * menu, so the menu never draws unstyled — or as soon as an element
+ * carrying one of `triggers` appears, whichever is first. It sits right
+ * after the eager <link> and puts the lazy one after that, so the cascade
+ * keeps the order the stylesheets were written in.
+ */
+function lazyLoader(url: string, triggers: string[]): string {
+	const selector = JSON.stringify(triggers.join(","));
+	return `<script>(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=${selector},c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=${JSON.stringify(url)};a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>`;
+}
+
+/**
+ * Every file under the given files and directories, as text. An entry that
+ * starts with `!` leaves that path out.
+ */
+async function readAll(paths: string[]): Promise<string[]> {
+	const out: string[] = [];
+	const skip = paths.filter((p) => p.startsWith("!")).map((p) => p.slice(1).replace(/\/$/, ""));
+	const visit = async (path: string): Promise<void> => {
+		if (skip.some((s) => path === s || path.startsWith(`${s}/`))) return;
+		const info = await stat(path).catch(() => undefined);
+		if (!info) return;
+		if (info.isDirectory()) {
+			for (const entry of await readdir(path)) await visit(join(path, entry));
+			return;
+		}
+		if (/\.(m?js|ts|uwu|html?)$/.test(path)) out.push(await readFile(path, "utf8"));
+	};
+	for (const path of paths) if (!path.startsWith("!")) await visit(path);
+	return out;
 }
 
 /** `site.js` and `site.a1b2c3d4.js` both -> `site` */
