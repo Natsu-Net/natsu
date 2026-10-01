@@ -77,6 +77,22 @@ describe("chunking", () => {
 		expect(css).not.toContain("admin-table");
 	});
 
+	test("pages that differ only in what no rule names share one chunk, cut once", async () => {
+		const pipeline = assets();
+		await pipeline.build();
+		const shapes = () => (pipeline as unknown as { pages: Map<string, unknown> }).pages.size;
+		const before = shapes();
+		const one = pipeline.pageStyle("site", '<div class="card" id="review-1"><b class="extra-1">a</b></div>');
+		const two = pipeline.pageStyle("site", '<section class="card" id="review-2"><i class="extra-2">b</i></section>');
+		expect(two).toBe(one);
+		expect(shapes()).toBe(before + 1);
+		// A class a rule names is a different page.
+		const admin = pipeline.pageStyle("site", '<div class="card admin-table">c</div>');
+		expect(admin).not.toBe(one);
+		expect(await read(pipeline, admin)).toContain("admin-table");
+		expect(await read(pipeline, one)).not.toContain("admin-table");
+	});
+
 	test("a class only a script adds survives if it is safelisted", async () => {
 		// A page's markup shows what the server rendered. `is-open` arrives on
 		// click, so without a safelist the rule that styles it is dropped and
