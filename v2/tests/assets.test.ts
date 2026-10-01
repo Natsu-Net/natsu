@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
+import { compress } from "../src/compress.ts";
 import { Application } from "../src/server.ts";
 import { Router } from "../src/router.ts";
 import { reset, startApp, type RunningApp } from "./helpers.ts";
@@ -202,14 +203,16 @@ describe("the URL carries the hash", () => {
 	});
 });
 
+/** The chunk files a pipeline holds in memory. */
+const heldFiles = (pipeline: Assets) => (pipeline as unknown as { files: Map<string, unknown> }).files;
+
 describe("after a restart", () => {
 	test("a chunk the last process built is served from disk, still immutable", async () => {
 		reset();
 		const first = assets();
 		await first.build();
 		const url = first.pageStyle("site", '<body><div class="card">x</div></body>');
-		// hold() writes in the background; let it land.
-		await Bun.sleep(50);
+		await first.settled();
 
 		const second = assets();
 		await second.build();
@@ -223,6 +226,33 @@ describe("after a restart", () => {
 		const body = await response.text();
 		expect(body).toContain(".card");
 		expect(body).not.toContain("admin-table");
+	});
+
+	test("a chunk cut short on disk is never served as that chunk", async () => {
+		reset();
+		const first = assets();
+		await first.build();
+		const url = first.pageStyle("site", '<body><div class="card">x</div></body>');
+		await first.settled();
+		const file = join(out, url.slice("/_a/".length));
+		writeFileSync(file, ".card{bor");
+
+		const second = assets();
+		await second.build();
+		const app = new Application();
+		app.use(second.middleware());
+		running = await startApp(app);
+
+		const response = await running.fetch(url);
+		expect(response.headers.get("cache-control")).toBe("public, max-age=300");
+		expect(await response.text()).toContain("admin-table");
+		// Built again here, the real chunk is served and put back on disk.
+		expect(second.pageStyle("site", '<body><div class="card">x</div></body>')).toBe(url);
+		await second.settled();
+		const again = await running.fetch(url);
+		expect(again.headers.get("cache-control")).toContain("immutable");
+		expect(await again.text()).not.toBe(".card{bor");
+		expect(await Bun.file(file).text()).not.toBe(".card{bor");
 	});
 
 	test("a chunk nobody has gets the whole stylesheet for a while, so the page stays styled", async () => {
@@ -245,6 +275,19 @@ describe("after a restart", () => {
 		// A name that no stylesheet was cut from is still a miss.
 		expect((await running.fetch("/_a/other.0123456789.css")).status).toBe(404);
 	});
+
+	test("with renamed classes there is no stand-in: another build named them differently", async () => {
+		reset();
+		const views = join(dir, "views");
+		mkdirSync(views);
+		writeFileSync(join(views, "page.html"), '<div class="card"></div>');
+		const pipeline = assets({ mangle: { scripts: [], markup: [views] } });
+		await pipeline.build();
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+		expect((await running.fetch("/_a/site.0123456789.css")).status).toBe(404);
+	});
 });
 
 describe("compression", () => {
@@ -255,37 +298,93 @@ describe("compression", () => {
 		const app = new Application();
 		app.use(pipeline.middleware());
 		running = await startApp(app);
-		await Bun.sleep(50);
+		await pipeline.settled();
 
 		const response = await running.fetch(pipeline.url("site"), { headers: { "accept-encoding": "br" }, decompress: false } as RequestInit);
 		expect(response.headers.get("content-encoding")).toBe("br");
-		expect(response.headers.get("vary")).toContain("Accept-Encoding");
+		expect(response.headers.get("vary")).toBe("Accept-Encoding");
 		const plain = await running.fetch(pipeline.url("site"), { headers: { "accept-encoding": "identity" } });
 		expect(plain.headers.get("content-encoding")).toBeNull();
 		expect(await plain.text()).toContain(".card");
 	});
+
+	test("a chunk asked for before its copies are ready waits for them", async () => {
+		reset();
+		const pipeline = assets();
+		await pipeline.build();
+		const app = new Application();
+		app.use(compress());
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const url = pipeline.pageStyle("site", '<body><div class="card"><h3 class="card__title">x</h3></div></body>');
+		const response = await running.fetch(url, { headers: { "accept-encoding": "br" }, decompress: false } as RequestInit);
+		expect(response.headers.get("content-encoding")).toBe("br");
+		// compress() saw an encoded body and left it, so Vary is said once.
+		expect(response.headers.get("vary")).toBe("Accept-Encoding");
+	});
 });
 
 describe("page shapes", () => {
-	test("past the limit the oldest shape is forgotten, and its chunk still served", async () => {
+	test("past the limit the oldest shape leaves memory, and is served from disk", async () => {
 		reset();
 		const pipeline = assets({ maxPageShapes: 1 });
 		await pipeline.build();
 		const a = pipeline.pageStyle("site", '<body><div class="card">x</div></body>');
-		await Bun.sleep(50);
 		const b = pipeline.pageStyle("site", '<body><table class="admin-table"><th>x</th></table></body>');
 		expect(a).not.toBe(b);
+		expect(heldFiles(pipeline).has(a.slice("/_a/".length))).toBe(false);
+		await pipeline.settled();
 		const app = new Application();
 		app.use(pipeline.middleware());
 		running = await startApp(app);
 		const response = await running.fetch(a);
 		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toContain("immutable");
 		expect(await response.text()).toContain(".card");
 		// The forgotten shape builds the same chunk again.
 		expect(pipeline.pageStyle("site", '<body><div class="card">x</div></body>')).toBe(a);
 	});
 
-	test("a page that links no stylesheet to narrow is not profiled", async () => {
+	test("chunks read back from disk count against the same limit", async () => {
+		reset();
+		const first = assets();
+		await first.build();
+		const urls = ["card", "card__title", "admin-table", "is-open"].map((name) =>
+			first.pageStyle("site", `<body><div class="${name}">x</div></body>`)
+		);
+		await first.settled();
+
+		const second = assets({ maxPageShapes: 2 });
+		await second.build();
+		const app = new Application();
+		app.use(second.middleware());
+		running = await startApp(app);
+		const before = heldFiles(second).size;
+		for (const url of urls) expect((await running.fetch(url)).status).toBe(200);
+		expect(heldFiles(second).size).toBe(before + 2);
+	});
+
+	test("a lazy half two shapes share stays while either is remembered", async () => {
+		reset();
+		const pipeline = assets({
+			maxPageShapes: 1,
+			safelist: ["admin-table"],
+			lazyStyles: { whenPresent: { card: ["is-open"] } },
+			rewrite: { "/assets/css/site.css": "site" },
+		});
+		await pipeline.build();
+		const page = (html: string) => pipeline.rewrite(`<link rel="stylesheet" href="/assets/css/site.css">${html}`);
+		const first = page('<div class="card"></div>');
+		const second = page('<div class="card__title"></div>');
+		const laterOf = (html: string) => /"(\/_a\/site-later\.[^"]+)"/.exec(html)?.[1] ?? "";
+		expect(laterOf(first)).toBe(laterOf(second));
+		expect(laterOf(second)).not.toBe("");
+		// The first shape is forgotten; the lazy half the second still links stays.
+		expect(heldFiles(pipeline).has(laterOf(second).slice("/_a/".length))).toBe(true);
+	});
+
+	test("with wholeStylesheets a page links the whole sheet", async () => {
 		const pipeline = assets({ wholeStylesheets: true, rewrite: { "/site.css": "site" } });
 		await pipeline.build();
 		const html = '<html><head><link rel="stylesheet" href="/site.css"></head><body class="card"></body></html>';

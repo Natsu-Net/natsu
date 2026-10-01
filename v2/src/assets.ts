@@ -33,14 +33,14 @@
  * the pipeline owns, and pages go out pointing at the chunks.
  */
 
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { brotliCompress, constants, gzip } from "node:zlib";
 import { type DocumentProfile, profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
-import { negotiate } from "./compress.ts";
+import { addVary, negotiate } from "./compress.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
 
@@ -159,13 +159,23 @@ export class Assets {
 	/** Chunk file name -> contents, so the middleware can serve from memory. */
 	private readonly files = new Map<string, { body: string; type: string }>();
 	/** Chunk file name -> its brotli and gzip bytes, once compressed off the request path. */
-	private readonly encoded = new Map<string, { br?: Uint8Array; gzip?: Uint8Array }>();
+	private readonly encoded = new Map<string, Encoded>();
+	/** Chunk file name -> its compression while still running. */
+	private readonly encoding = new Map<string, Promise<Encoded | undefined>>();
+	/** Writes to `outDir` still running. */
+	private readonly writes = new Set<Promise<void>>();
+	/** Chunk file name -> how many remembered shapes link it. */
+	private readonly refs = new Map<string, number>();
 	/** Files that are entries (the whole stylesheet, scripts): never forgotten. */
 	private readonly pinned = new Set<string>();
 	/** Stylesheet name -> its full source, for per-page narrowing. */
 	private readonly sources = new Map<string, string>();
-	/** Page profile hash -> the URL of the chunk that covers it. */
-	private readonly pages = new Map<string, string>();
+	/**
+	 * Page profile hash -> the URL of the chunk that covers it and every
+	 * file that shape holds in memory, oldest first. A chunk read back from
+	 * disk is in here too, under `disk:<file>`, so it is forgotten the same way.
+	 */
+	private readonly pages = new Map<string, { url: string; files: string[] }>();
 	/** Eager chunk URL -> its lazy half and what should load it. */
 	private readonly lazy = new Map<string, { url: string; triggers: string[] }>();
 	private report: AssetReport = { urls: {}, sizes: {}, shared: [] };
@@ -285,7 +295,7 @@ export class Assets {
 			// Most recently used last, so the oldest shape is the one forgotten.
 			this.pages.delete(shape);
 			this.pages.set(shape, known);
-			return known;
+			return known.url;
 		}
 
 		// A slice of an already minified sheet is minified; shaking it is a
@@ -294,7 +304,7 @@ export class Assets {
 		if (!this.options.lazyStyles) {
 			const body = minify(shakeCSS(source, profile, { safelist: this.safelist }).css);
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
-			this.remember(shape, url);
+			this.remember(shape, url, [basename(url)]);
 			return url;
 		}
 
@@ -306,33 +316,46 @@ export class Assets {
 		const split = splitCSS(source, profile, { safelist: this.safelist, eager: this.translate(eager) });
 		const body = minify(split.eager);
 		const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
+		const files = [basename(url)];
 		if (split.lazy) {
 			const later = minify(split.lazy);
-			this.lazy.set(url, { url: this.hold(`${name}-later.${hash(later)}.css`, later, "text/css; charset=utf-8"), triggers: split.triggers });
+			const laterUrl = this.hold(`${name}-later.${hash(later)}.css`, later, "text/css; charset=utf-8");
+			this.lazy.set(url, { url: laterUrl, triggers: split.triggers });
+			files.push(basename(laterUrl));
 		}
-		this.remember(shape, url);
+		this.remember(shape, url, files);
 		return url;
 	}
 
-	/** Keep a page shape's chunk, forgetting the oldest past `maxPageShapes`. */
-	private remember(shape: string, url: string): void {
-		this.pages.set(shape, url);
-		const limit = this.options.maxPageShapes ?? 1000;
+	/**
+	 * Keep a page shape's chunk, forgetting the oldest shapes past
+	 * `maxPageShapes`. A file leaves memory once no remembered shape links
+	 * it; it stays on disk, where a page that still links it finds it. The
+	 * limit is never below the number of stylesheets, so the shapes of the
+	 * page being rewritten are never the ones forgotten.
+	 */
+	private remember(shape: string, url: string, files: string[]): void {
+		this.pages.set(shape, { url, files });
+		for (const file of files) this.refs.set(file, (this.refs.get(file) ?? 0) + 1);
+		const limit = Math.max(this.options.maxPageShapes ?? 1000, this.sources.size, 1);
 		while (this.pages.size > limit) {
 			const oldest = this.pages.entries().next().value;
 			if (!oldest) break;
-			const [key, chunk] = oldest;
+			const [key, page] = oldest;
 			this.pages.delete(key);
-			// Another shape may share the chunk; it stays on disk either way.
-			if ([...this.pages.values()].includes(chunk)) continue;
-			const file = basename(chunk);
-			const lazy = this.lazy.get(chunk);
-			this.lazy.delete(chunk);
-			for (const name of lazy ? [file, basename(lazy.url)] : [file]) {
-				if (this.pinned.has(name)) continue;
-				this.files.delete(name);
-				this.encoded.delete(name);
+			for (const file of page.files) {
+				const left = (this.refs.get(file) ?? 1) - 1;
+				if (left > 0) {
+					this.refs.set(file, left);
+					continue;
+				}
+				this.refs.delete(file);
+				if (this.pinned.has(file)) continue;
+				this.files.delete(file);
+				this.encoded.delete(file);
+				this.encoding.delete(file);
 			}
+			if (!this.refs.has(basename(page.url))) this.lazy.delete(page.url);
 		}
 	}
 
@@ -363,9 +386,12 @@ export class Assets {
 				// can be as long as the spec allows.
 				ctx.response.headers.set("cache-control", "public, max-age=31536000, immutable");
 				// Both answers vary, so a cache never hands brotli to a client that asked for none.
-				ctx.response.headers.append("vary", "Accept-Encoding");
+				addVary(ctx.response.headers, "Accept-Encoding");
 				const encoding = negotiate(ctx.request.headers.get("accept-encoding"));
-				const bytes = encoding ? this.encoded.get(file)?.[encoding] : undefined;
+				// A chunk asked for while its copies are still being made waits
+				// for them: off this thread, rather than compressed again on it.
+				const copies = encoding ? (this.encoded.get(file) ?? (await this.encoding.get(file))) : undefined;
+				const bytes = encoding ? copies?.[encoding] : undefined;
 				if (encoding && bytes) {
 					ctx.response.headers.set("content-encoding", encoding);
 					ctx.response.body = bytes as Uint8Array<ArrayBuffer>;
@@ -541,20 +567,56 @@ export class Assets {
 	/**
 	 * Keep a chunk in memory and write it out, and return its URL. The
 	 * brotli and gzip copies are made on libuv's thread pool, so the request
-	 * that built a chunk never waits for its compression; until they are
-	 * ready the chunk goes out as it is, to be compressed further out.
+	 * that built a chunk never waits for its compression.
 	 */
 	private hold(file: string, body: string, type: string): string {
-		if (this.files.has(file)) return `${this.options.publicPath}/${file}`;
-		this.files.set(file, { body, type });
-		void writeFile(join(this.options.outDir, file), body).catch(() => {
-			// On disk is how a restarted process or another one serves a chunk
-			// it did not build; this process serves from memory either way.
-		});
-		void precompress(body).then((copies) => {
-			if (this.files.has(file)) this.encoded.set(file, copies);
-		}, () => {});
+		if (!this.files.has(file)) {
+			this.keep(file, body, type);
+			this.write(file, body);
+		}
 		return `${this.options.publicPath}/${file}`;
+	}
+
+	/** Keep a chunk in memory and start its compressed copies. */
+	private keep(file: string, body: string, type: string): void {
+		this.files.set(file, { body, type });
+		const copies = precompress(body).then(
+			(made) => {
+				if (this.encoding.get(file) !== copies) return undefined;
+				this.encoding.delete(file);
+				this.encoded.set(file, made);
+				return made;
+			},
+			() => {
+				if (this.encoding.get(file) === copies) this.encoding.delete(file);
+				return undefined;
+			},
+		);
+		this.encoding.set(file, copies);
+	}
+
+	/**
+	 * Write a chunk to `outDir` under a temporary name, then rename it into
+	 * place: another process, or this one after a crash, sees the whole file
+	 * or none of it. On disk is how a restarted process or another one serves
+	 * a chunk it did not build; this process serves from memory either way.
+	 */
+	private write(file: string, body: string): void {
+		const target = join(this.options.outDir, file);
+		const temporary = `${target}.${process.pid}.${(++writeCount).toString(36)}.tmp`;
+		const done = writeFile(temporary, body)
+			.then(() => rename(temporary, target))
+			.catch(() => unlink(temporary).catch(() => {}));
+		this.writes.add(done);
+		void done.finally(() => this.writes.delete(done));
+	}
+
+	/**
+	 * Resolves once every chunk built so far is on disk and compressed. For
+	 * tests, and for a server that wants to shut down cleanly.
+	 */
+	public async settled(): Promise<void> {
+		await Promise.all([...this.writes, ...this.encoding.values()]);
 	}
 
 	/** An entry's file stays in memory for good: pages link it by name. */
@@ -576,8 +638,15 @@ export class Assets {
 		} catch {
 			return undefined;
 		}
-		// Hashed names: what is on disk under this name is this chunk.
-		this.hold(file, body, type);
+		// A name this pipeline gave carries the hash of its contents: a file
+		// that does not match it (cut short by a crash before writes were
+		// atomic) is not that chunk, and must never go out as immutable.
+		const named = /\.([0-9a-f]{10})\.(?:css|m?js)$/.exec(file)?.[1];
+		if (named !== undefined && hash(body) !== named) return undefined;
+		if (!this.files.has(file)) {
+			this.keep(file, body, type);
+			this.remember(`disk:${file}`, `${this.options.publicPath}/${file}`, [file]);
+		}
 		return this.files.get(file);
 	}
 
@@ -588,7 +657,9 @@ export class Assets {
 	 * outlived the process that rendered it stays styled.
 	 */
 	private standIn(file: string): { body: string; type: string } | undefined {
-		if (!file.endsWith(".css")) return undefined;
+		// Renamed classes differ from one build to the next, so a page from
+		// another build would get another build's names: no stand-in then.
+		if (!file.endsWith(".css") || this.classes.size > 0) return undefined;
 		const stem = stemOf(file);
 		const later = stem.endsWith("-later");
 		const name = later ? stem.slice(0, -"-later".length) : stem;
@@ -649,6 +720,11 @@ async function sourceSize(file: string | undefined): Promise<number> {
 
 const brotli = promisify(brotliCompress);
 const gzipAsync = promisify(gzip);
+
+type Encoded = { br?: Uint8Array; gzip?: Uint8Array };
+
+/** Tells apart this process's temporary files. */
+let writeCount = 0;
 
 /** A chunk's brotli (top quality) and gzip copies, made on the thread pool. */
 async function precompress(body: string): Promise<{ br: Uint8Array; gzip: Uint8Array }> {
