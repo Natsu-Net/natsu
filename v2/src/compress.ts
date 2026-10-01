@@ -148,13 +148,22 @@ export function compress(options: CompressOptions = {}): Middleware {
 function send(ctx: Context, bytes: Uint8Array, encoding: Encoding, type: string): void {
 	const headers = ctx.response.headers;
 	headers.set("content-encoding", encoding);
-	headers.append("vary", "Accept-Encoding");
+	addVary(headers, "Accept-Encoding");
 	// A compressed body is not the file on disk, so byte ranges into it
 	// would be ranges into the wrong thing.
 	headers.delete("accept-ranges");
 	headers.delete("content-length");
 	if (!headers.has("content-type")) headers.set("content-type", type);
 	ctx.response.body = bytes as Uint8Array<ArrayBuffer>;
+}
+
+/** Add `name` to the response's `Vary` unless it is there already. */
+export function addVary(headers: Headers, name: string): void {
+	const current = headers.get("vary");
+	if (current === null) return headers.set("vary", name);
+	const lower = name.toLowerCase();
+	if (current.split(",").some((part) => part.trim().toLowerCase() === lower || part.trim() === "*")) return;
+	headers.set("vary", `${current}, ${name}`);
 }
 
 /** The type `toResponse()` would give a body that names none. */
