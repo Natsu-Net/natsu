@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
 import { compress } from "../src/compress.ts";
+import { PageCache } from "../src/page-cache.ts";
 import { Application } from "../src/server.ts";
 import { Router } from "../src/router.ts";
 import { reset, startApp, type RunningApp } from "./helpers.ts";
@@ -116,6 +117,44 @@ describe("rewriting", () => {
 		expect(page).toContain(`src="${pipeline.url("site")}"`);
 		// Nothing the caller did not name is touched.
 		expect(page).toContain('src="/assets/js/other.js"');
+	});
+});
+
+describe("pages kept rewritten", () => {
+	test("a page a PageCache kept rewritten goes out as it is, every time", async () => {
+		const pipeline = assets({ rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const rewrite = pipeline.rewrite.bind(pipeline);
+		let rewrites = 0;
+		pipeline.rewrite = (html: string) => {
+			rewrites++;
+			return rewrite(html);
+		};
+		const pages = new PageCache({ prepare: (html) => pipeline.rewrite(html) });
+		reset();
+		new Router().get("/page", async (ctx) => {
+			const nonce = crypto.randomUUID();
+			const page = await pages.serve("/page", [nonce], async ([mark]) => ({
+				body: `<html><head><link rel="stylesheet" href="/assets/css/site.css"><script nonce="${mark}"></script></head>` +
+					'<body><div class="card">x</div></body></html>',
+				status: 200,
+			}));
+			if (page?.prepared) pipeline.markRewritten(ctx);
+			ctx.response.body = page?.body ?? "";
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const first = await (await running.fetch("/page")).text();
+		const second = await (await running.fetch("/page")).text();
+		expect(rewrites).toBe(1);
+		for (const page of [first, second]) {
+			expect(page).toContain(`href="/_a/site.`);
+			expect(page).not.toContain("natsu-secret-");
+		}
+		expect(first.replace(/nonce="[^"]+"/, "")).toBe(second.replace(/nonce="[^"]+"/, ""));
+		expect(first).not.toBe(second);
 	});
 });
 

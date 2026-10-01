@@ -187,6 +187,8 @@ export class Assets {
 	private sourcesMinified = false;
 	/** The safelist, with every renamed class it names added by its new name. */
 	private safelist: Array<string | RegExp> = [];
+	/** Answers whose page went through `rewrite` already (see markRewritten). */
+	private readonly rewritten = new WeakSet<Context>();
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -264,6 +266,15 @@ export class Assets {
 			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
 		}
 		return out;
+	}
+
+	/**
+	 * This answer's page went through `rewrite` already (a page kept rewritten,
+	 * see PageCache's `prepare`), so the middleware sends it as it is: a second
+	 * pass costs as much as the first, and renames what it already renamed.
+	 */
+	public markRewritten(ctx: Context): void {
+		this.rewritten.add(ctx);
 	}
 
 	private pattern: RegExp | null | undefined;
@@ -417,7 +428,7 @@ export class Assets {
 			await next();
 
 			const body = ctx.response.body;
-			if (typeof body !== "string") return;
+			if (typeof body !== "string" || this.rewritten.has(ctx)) return;
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
 			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;

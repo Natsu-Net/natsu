@@ -153,6 +153,25 @@ describe("PageCache", () => {
 		expect(cache.size).toBe(0);
 	});
 
+	test("prepare runs once on each page kept, and never on one that is not", async () => {
+		let prepared = 0;
+		const cache = new PageCache({
+			prepare: (body) => {
+				prepared++;
+				return body.replace("page", "PAGE");
+			},
+		});
+		const page = renderer();
+		const first = await cache.serve("/p", [NONCE_A, CSRF_A], page.draw);
+		const second = await cache.serve("/p", [NONCE_B, CSRF_B], page.draw);
+		expect(prepared).toBe(1);
+		expect(first?.prepared).toBe(true);
+		expect(second?.body).toBe(`<script nonce="${NONCE_B}"></script><input value="${CSRF_B}">PAGE 1`);
+		const careless = await cache.serve("/q", [NONCE_A, CSRF_A], async () => ({ body: CSRF_A, status: 200 }));
+		expect(careless).toEqual({ body: CSRF_A, status: 200 });
+		expect(prepared).toBe(1);
+	});
+
 	test("a page's own headers go out with it, a copy each time", async () => {
 		const cache = new PageCache();
 		const headers = { "content-type": "text/html" };

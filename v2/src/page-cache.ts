@@ -31,6 +31,13 @@ export interface PageCacheOptions {
 	stale?: number;
 	/** Most characters of pages kept; the least recently used go first (default 32 million). */
 	maxChars?: number;
+	/**
+	 * Work done once on each page as it is kept rather than on every answer,
+	 * such as `(html) => assets.rewrite(html)`. Answers built from it say so
+	 * (`prepared`), so the step that would repeat it can skip them
+	 * (`assets.markRewritten(ctx)`).
+	 */
+	prepare?: (body: string) => string;
 }
 
 /** A page as `render` draws it, and as `serve` answers it. */
@@ -39,6 +46,8 @@ export interface CachedPage {
 	status: number;
 	/** Headers that go out with the page, the same for every visitor. */
 	headers?: Record<string, string>;
+	/** Set on an answer whose page went through `prepare`. */
+	prepared?: boolean;
 }
 
 /**
@@ -68,6 +77,7 @@ export class PageCache {
 	private readonly fresh: number;
 	private readonly stale: number;
 	private readonly maxChars: number;
+	private readonly prepare: ((body: string) => string) | undefined;
 	/** Per process and never sent, so no page can carry a mark it was not given. */
 	private readonly mark = `natsu-secret-${crypto.randomUUID()}-`;
 	private readonly marks: string[] = [];
@@ -79,6 +89,7 @@ export class PageCache {
 		this.fresh = (options.fresh ?? 10) * 1000;
 		this.stale = (options.stale ?? 30) * 1000;
 		this.maxChars = options.maxChars ?? 32_000_000;
+		this.prepare = options.prepare;
 	}
 
 	/** Pages kept now. */
@@ -152,12 +163,18 @@ export class PageCache {
 				}
 				// The render put a real secret in the page: this visitor's alone.
 				if (secrets.some((secret) => page.body.includes(secret))) return this.fill(page, secrets);
+				const body = this.prepare ? this.prepare(page.body) : page.body;
 				const now = Date.now();
 				entry = {
-					page: { ...page, ...(page.headers ? { headers: { ...page.headers } } : {}) },
+					page: {
+						...page,
+						body,
+						...(page.headers ? { headers: { ...page.headers } } : {}),
+						...(this.prepare ? { prepared: true } : {}),
+					},
 					fresh: now + this.fresh,
 					until: now + this.fresh + this.stale,
-					chars: page.body.length + key.length,
+					chars: body.length + key.length,
 				};
 				this.keep(key, entry);
 				return this.fill(entry.page, secrets);
