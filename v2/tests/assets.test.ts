@@ -346,6 +346,20 @@ describe("page shapes", () => {
 		expect(pipeline.pageStyle("site", '<body><div class="card">x</div></body>')).toBe(a);
 	});
 
+	test("a file from disk whose name carries no hash of ours is not cached for long", async () => {
+		reset();
+		mkdirSync(out, { recursive: true });
+		writeFileSync(join(out, "module.7ethw6b4.js"), "export const a = 1;");
+		const pipeline = assets();
+		await pipeline.build();
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+		const response = await running.fetch("/_a/module.7ethw6b4.js");
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("public, max-age=300");
+	});
+
 	test("chunks read back from disk count against the same limit", async () => {
 		reset();
 		const first = assets();

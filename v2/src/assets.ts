@@ -166,6 +166,8 @@ export class Assets {
 	private readonly writes = new Set<Promise<void>>();
 	/** Chunk file name -> how many remembered shapes link it. */
 	private readonly refs = new Map<string, number>();
+	/** Files read back from disk whose names carry no hash of ours to check them against. */
+	private readonly unverified = new Set<string>();
 	/** Files that are entries (the whole stylesheet, scripts): never forgotten. */
 	private readonly pinned = new Set<string>();
 	/** Stylesheet name -> its full source, for per-page narrowing. */
@@ -354,6 +356,7 @@ export class Assets {
 				this.files.delete(file);
 				this.encoded.delete(file);
 				this.encoding.delete(file);
+				this.unverified.delete(file);
 			}
 			if (!this.refs.has(basename(page.url))) this.lazy.delete(page.url);
 		}
@@ -381,10 +384,20 @@ export class Assets {
 					ctx.response.body = stand.body;
 					return;
 				}
+				// A chunk read back from disk keeps its place while pages ask for it.
+				const fromDisk = this.pages.get(`disk:${file}`);
+				if (fromDisk) {
+					this.pages.delete(`disk:${file}`);
+					this.pages.set(`disk:${file}`, fromDisk);
+				}
 				ctx.response.headers.set("content-type", held.type);
 				// The name carries the hash, so a change is a new URL and this
-				// can be as long as the spec allows.
-				ctx.response.headers.set("cache-control", "public, max-age=31536000, immutable");
+				// can be as long as the spec allows. A file from disk that could
+				// not be checked against its name gets a few minutes instead.
+				ctx.response.headers.set(
+					"cache-control",
+					this.unverified.has(file) ? "public, max-age=300" : "public, max-age=31536000, immutable",
+				);
 				// Both answers vary, so a cache never hands brotli to a client that asked for none.
 				addVary(ctx.response.headers, "Accept-Encoding");
 				const encoding = negotiate(ctx.request.headers.get("accept-encoding"));
@@ -645,6 +658,7 @@ export class Assets {
 		if (named !== undefined && hash(body) !== named) return undefined;
 		if (!this.files.has(file)) {
 			this.keep(file, body, type);
+			if (named === undefined) this.unverified.add(file);
 			this.remember(`disk:${file}`, `${this.options.publicPath}/${file}`, [file]);
 		}
 		return this.files.get(file);
