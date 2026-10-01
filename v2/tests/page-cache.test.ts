@@ -141,6 +141,59 @@ describe("PageCache", () => {
 		expect(cache.size).toBe(0);
 	});
 
+	test("a key whose page may not be kept is drawn by each visitor for a fresh span, without waiting", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 10, stale: 30 });
+		let renders = 0;
+		const missing = async () => {
+			renders++;
+			return null;
+		};
+		expect(await cache.serve("/gone", [], missing)).toBeNull();
+		// The next visitors draw their own at once: no render through the cache.
+		expect(await cache.serve("/gone", [], missing)).toBeNull();
+		expect(renders).toBe(1);
+		const perView = async (): Promise<CachedPage> => {
+			renders++;
+			return { body: "ad", status: 200, keep: false };
+		};
+		expect((await cache.serve("/ads", [], perView))?.body).toBe("ad");
+		expect(await cache.serve("/ads", [], perView)).toBeNull();
+		expect(renders).toBe(2);
+		// After the fresh span the key is tried again, and kept if it may be now.
+		setSystemTime(new Date("2026-10-01T00:00:11Z"));
+		const page = renderer();
+		await cache.serve("/gone", [NONCE_A, CSRF_A], page.draw);
+		await cache.serve("/gone", [NONCE_B, CSRF_B], page.draw);
+		expect(page.renders()).toBe(1);
+		// delete() forgets a refusal too.
+		await cache.serve("/ads", [], perView);
+		cache.delete("/ads");
+		expect((await cache.serve("/ads", [NONCE_A, CSRF_A], page.draw))?.body).toContain("page 2");
+	});
+
+	test("keys remembered as not to be kept are bounded", async () => {
+		const cache = new PageCache();
+		for (let i = 0; i < 10_050; i++) await cache.serve(`/gone/${i}`, [], async () => null);
+		expect((cache as unknown as { refused: Map<string, number> }).refused.size).toBe(10_000);
+	});
+
+	test("a refresh that carries a visitor's secret drops the older copy", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 10, stale: 30 });
+		let version = "old";
+		const draw: PageRender = async ([nonce]) => ({ body: `${version} ${nonce} uuid-0199aaaa`, status: 200 });
+		await cache.serve("/p", [NONCE_A], draw);
+		version = "edited";
+		setSystemTime(new Date("2026-10-01T00:00:15Z"));
+		// A visitor whose secret is page text starts the refresh: their answer is the
+		// old copy, the refresh is theirs alone, and the old copy goes with it.
+		expect((await cache.serve("/p", ["uuid-0199aaaa"], draw))?.body).toStartWith("old");
+		await Bun.sleep(0);
+		expect(cache.size).toBe(0);
+		expect((await cache.serve("/p", [NONCE_B], draw))?.body).toBe(`edited ${NONCE_B} uuid-0199aaaa`);
+	});
+
 	test("pages nobody asks for again are let go of once past their stale time", async () => {
 		setSystemTime(new Date("2026-10-01T00:00:00Z"));
 		const cache = new PageCache({ fresh: 1, stale: 1 });

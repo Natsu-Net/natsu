@@ -87,6 +87,9 @@ const MAX_KEY = 2048;
  */
 const SECRET = /^[\w.~+/=-]*$/;
 
+/** Most keys remembered as not to be kept (a page that is missing, or differs per view). */
+const MAX_REFUSED = 10_000;
+
 /** A render under way; `void` once the key was forgotten while it ran. */
 interface Run {
 	done: Promise<Entry | null>;
@@ -97,6 +100,13 @@ export class PageCache {
 	private readonly entries = new Map<string, Entry>();
 	/** Renders under way, and the page each one drew for whoever waits on it. */
 	private readonly pending = new Map<string, Run>();
+	/**
+	 * Keys whose last render said not to keep the page, and until when (ms).
+	 * Until then they are not drawn through here at all: a visitor draws their
+	 * own page at once instead of waiting on someone else's render that will
+	 * not be shared either (a missing page, a page with an ad picked per view).
+	 */
+	private readonly refused = new Map<string, number>();
 	private readonly fresh: number;
 	private readonly stale: number;
 	private readonly maxChars: number;
@@ -126,13 +136,19 @@ export class PageCache {
 	 * The page for `key`, filled with this request's `secrets`: kept, or drawn
 	 * by `render` (see PageRender) and kept. Null when nothing came of it: the
 	 * key is too long to keep, a secret holds more than letters, digits and
-	 * `_.~+/=-`, `render` said no, or another request's render was the one
-	 * that said no, kept nothing or failed. The caller then draws the page
+	 * `_.~+/=-`, `render` said no (or `keep: false`) for this key less than
+	 * `fresh` seconds ago, or another request's render was the one that said
+	 * no, kept nothing or failed. The caller then draws the page
 	 * itself, with its real secrets; a render that throws throws here.
 	 */
 	public async serve(key: string, secrets: readonly string[], render: PageRender): Promise<CachedPage | null> {
 		if (key.length > MAX_KEY || !secrets.every((secret) => SECRET.test(secret))) return null;
 		const now = Date.now();
+		const refusedUntil = this.refused.get(key);
+		if (refusedUntil !== undefined) {
+			if (now < refusedUntil) return null;
+			this.refused.delete(key);
+		}
 		const kept = this.entries.get(key);
 		if (kept && now < kept.until) {
 			// Most recently used last, so the oldest page is the one dropped.
@@ -171,6 +187,7 @@ export class PageCache {
 	 */
 	public delete(key: string): void {
 		this.forget(key);
+		this.refused.delete(key);
 		const running = this.pending.get(key);
 		if (running) {
 			running.void = true;
@@ -182,6 +199,7 @@ export class PageCache {
 	public clear(): void {
 		this.entries.clear();
 		this.chars = 0;
+		this.refused.clear();
 		for (const running of this.pending.values()) running.void = true;
 		this.pending.clear();
 	}
@@ -198,12 +216,20 @@ export class PageCache {
 				this.counts.rendered++;
 				if (!page || page.keep === false) {
 					// What was kept is no longer what this key draws (it is gone, or
-					// different for each visitor or view now): stop serving it.
-					if (!run.void) this.forget(key);
+					// different for each visitor or view now): stop serving it, and
+					// for a fresh span let each visitor draw their own.
+					if (!run.void) {
+						this.forget(key);
+						this.refuse(key, Date.now());
+					}
 					return page ? this.fill(page, secrets) : null;
 				}
-				// The render put a real secret in the page: this visitor's alone.
-				if (secrets.some((secret) => secret !== "" && page.body.includes(secret))) return this.fill(page, secrets);
+				// The render put a real secret in the page: this visitor's alone. The
+				// copy kept before is older than this render, so it goes too.
+				if (secrets.some((secret) => secret !== "" && page.body.includes(secret))) {
+					if (!run.void) this.forget(key);
+					return this.fill(page, secrets);
+				}
 				const body = this.prepare ? this.prepare(page.body) : page.body;
 				const now = Date.now();
 				entry = {
@@ -248,6 +274,16 @@ export class PageCache {
 			const oldest = this.entries.keys().next();
 			if (oldest.done) break;
 			this.forget(oldest.value);
+		}
+	}
+
+	private refuse(key: string, now: number): void {
+		this.refused.delete(key);
+		this.refused.set(key, now + this.fresh);
+		while (this.refused.size > MAX_REFUSED) {
+			const oldest = this.refused.keys().next();
+			if (oldest.done) break;
+			this.refused.delete(oldest.value);
 		}
 	}
 
