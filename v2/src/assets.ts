@@ -37,7 +37,7 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { brotliCompress, constants, gzip } from "node:zlib";
-import { type DocumentProfile, profileDocument, shakeCSS, splitCSS } from "uwu-template/assets";
+import { type DocumentProfile, profileDocument, selectorNames, shakeCSS, splitCSS } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import { addVary, negotiate } from "./compress.ts";
@@ -185,8 +185,12 @@ export class Assets {
 	private classes = new Map<string, string>();
 	/** Whether `sources` hold minified CSS, so a page's slice needs no second pass. */
 	private sourcesMinified = false;
+	/** Stylesheet -> the classes and ids its rules test a page for: all a chunk depends on. */
+	private readonly names = new Map<string, { classes: Set<string>; ids: Set<string> }>();
 	/** The safelist, with every renamed class it names added by its new name. */
 	private safelist: Array<string | RegExp> = [];
+	/** Answers whose page went through `rewrite` already (see markRewritten). */
+	private readonly rewritten = new WeakSet<Context>();
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -266,6 +270,15 @@ export class Assets {
 		return out;
 	}
 
+	/**
+	 * This answer's page went through `rewrite` already (a page kept rewritten,
+	 * see PageCache's `prepare`), so the middleware sends it as it is: a second
+	 * pass costs as much as the first, and renames what it already renamed.
+	 */
+	public markRewritten(ctx: Context): void {
+		this.rewritten.add(ctx);
+	}
+
 	private pattern: RegExp | null | undefined;
 
 	private rewritePattern(): RegExp | null {
@@ -287,10 +300,19 @@ export class Assets {
 
 		const profile = profiled ?? profileDocument(html);
 		// The key is the page's shape, not its content: two pages listing
-		// different anime have the same classes and share a chunk.
+		// different anime have the same classes and share a chunk. Only the
+		// classes and ids the sheet's rules name count (tags never do), so a
+		// page's own `id="review-81"` does not make it a shape of its own.
 		// Bun.hash, not sha256: the key never leaves this process.
+		const names = this.names.get(name);
+		const named = (found: Set<string>, known: Set<string> | undefined): string => {
+			const list: string[] = [];
+			for (const item of found) if (!known || known.has(item)) list.push(item);
+			// A space, which no class or id can hold: `a,b` and `a`+`b` stay apart.
+			return list.sort().join(" ");
+		};
 		const shape = Bun.hash(
-			`${name}\n${[...profile.tags].sort().join(",")}\n${[...profile.classes].sort().join(",")}\n${[...profile.ids].sort().join(",")}`,
+			`${name}\n${named(profile.classes, names?.classes)}\n${named(profile.ids, names?.ids)}`,
 		).toString(36);
 		const known = this.pages.get(shape);
 		if (known) {
@@ -417,7 +439,7 @@ export class Assets {
 			await next();
 
 			const body = ctx.response.body;
-			if (typeof body !== "string") return;
+			if (typeof body !== "string" || this.rewritten.has(ctx)) return;
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
 			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
@@ -444,6 +466,7 @@ export class Assets {
 			const body = this.options.minify ? minifyCSS(source).css : source;
 			// Pages are cut from the minified sheet, so no slice is minified again.
 			this.sources.set(name, body);
+			this.names.set(name, this.namesOf(body));
 			this.sourcesMinified = Boolean(this.options.minify);
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
 			this.pin(url);
@@ -484,6 +507,19 @@ export class Assets {
 		this.classes = plan.map;
 		this.report.mangled = { renamed: plan.map.size, pinned: plan.pinned.size };
 		this.safelist = this.translate(this.options.safelist ?? []);
+	}
+
+	/**
+	 * What of a page the chunks of this sheet depend on: the classes and ids
+	 * its rules name, and the classes that pull a lazy rule in early.
+	 */
+	private namesOf(css: string): { classes: Set<string>; ids: Set<string> } {
+		const names = selectorNames(css);
+		const lazyStyles = typeof this.options.lazyStyles === "object" ? this.options.lazyStyles : {};
+		for (const marker of Object.keys(lazyStyles.whenPresent ?? {})) {
+			names.classes.add(this.classes.get(marker) ?? marker);
+		}
+		return names;
 	}
 
 	/**

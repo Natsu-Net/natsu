@@ -21,6 +21,7 @@ import { SqliteAdapter } from "./src/session/sqlite.ts";
 import { StaticFiles, parseRange } from "./src/static.ts";
 import { Assets } from "./src/assets.ts";
 import { compress, negotiate } from "./src/compress.ts";
+import { PageCache } from "./src/page-cache.ts";
 import { Action, Networked, State, caller, callAction, dropScope, grantRoom, hasRoom, resolveState, resetState, revokeRoom, revokeSession, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor } from "./src/state.ts";
 import { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive } from "./src/live.ts";
 
@@ -34,6 +35,7 @@ export { CLog, colorize, log, setColorEnabled, setLogLevel, setLogSink, stripTag
 export { StaticFiles, parseRange };
 export { Assets };
 export { compress, negotiate };
+export { PageCache };
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };
 export { Action, Networked, State };
 export { caller, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor };
@@ -49,6 +51,7 @@ export type { ControllerFactory, ControllerNamespaceApi, ControllerOptions } fro
 export type { RejectReason, StaticOptions } from "./src/static.ts";
 export type { AssetReport, AssetsOptions } from "./src/assets.ts";
 export type { CompressOptions } from "./src/compress.ts";
+export type { CachedPage, PageCacheOptions, PageRender } from "./src/page-cache.ts";
 export type { SessionAdapter, SessionRecord, MaybePromise } from "./src/session/adapter.ts";
 export type { SessionHook, SessionManagerOptions } from "./src/session/session.ts";
 export type {

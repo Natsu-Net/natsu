@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
 import { compress } from "../src/compress.ts";
+import { PageCache } from "../src/page-cache.ts";
 import { Application } from "../src/server.ts";
 import { Router } from "../src/router.ts";
 import { reset, startApp, type RunningApp } from "./helpers.ts";
@@ -76,6 +77,32 @@ describe("chunking", () => {
 		expect(css).not.toContain("admin-table");
 	});
 
+	test("pages that differ only in what no rule names share one chunk, cut once", async () => {
+		const pipeline = assets();
+		await pipeline.build();
+		const shapes = () => (pipeline as unknown as { pages: Map<string, unknown> }).pages.size;
+		const before = shapes();
+		const one = pipeline.pageStyle("site", '<div class="card" id="review-1"><b class="extra-1">a</b></div>');
+		const two = pipeline.pageStyle("site", '<section class="card" id="review-2"><i class="extra-2">b</i></section>');
+		expect(two).toBe(one);
+		expect(shapes()).toBe(before + 1);
+		// A class a rule names is a different page.
+		const admin = pipeline.pageStyle("site", '<div class="card admin-table">c</div>');
+		expect(admin).not.toBe(one);
+		expect(await read(pipeline, admin)).toContain("admin-table");
+		expect(await read(pipeline, one)).not.toContain("admin-table");
+	});
+
+	test("one class with a comma in its name is not the two classes either side of it", async () => {
+		writeFileSync(join(dir, "site.css"), String.raw`.a\,b{color:red}.a{color:green}.b{color:blue}`);
+		const pipeline = assets();
+		await pipeline.build();
+		const one = pipeline.pageStyle("site", '<p class="a,b">x</p>');
+		const two = pipeline.pageStyle("site", '<p class="a b">x</p>');
+		expect(two).not.toBe(one);
+		expect(await read(pipeline, two)).toContain("green");
+	});
+
 	test("a class only a script adds survives if it is safelisted", async () => {
 		// A page's markup shows what the server rendered. `is-open` arrives on
 		// click, so without a safelist the rule that styles it is dropped and
@@ -116,6 +143,44 @@ describe("rewriting", () => {
 		expect(page).toContain(`src="${pipeline.url("site")}"`);
 		// Nothing the caller did not name is touched.
 		expect(page).toContain('src="/assets/js/other.js"');
+	});
+});
+
+describe("pages kept rewritten", () => {
+	test("a page a PageCache kept rewritten goes out as it is, every time", async () => {
+		const pipeline = assets({ rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const rewrite = pipeline.rewrite.bind(pipeline);
+		let rewrites = 0;
+		pipeline.rewrite = (html: string) => {
+			rewrites++;
+			return rewrite(html);
+		};
+		const pages = new PageCache({ prepare: (html) => pipeline.rewrite(html) });
+		reset();
+		new Router().get("/page", async (ctx) => {
+			const nonce = crypto.randomUUID();
+			const page = await pages.serve("/page", [nonce], async ([mark]) => ({
+				body: `<html><head><link rel="stylesheet" href="/assets/css/site.css"><script nonce="${mark}"></script></head>` +
+					'<body><div class="card">x</div></body></html>',
+				status: 200,
+			}));
+			if (page?.prepared) pipeline.markRewritten(ctx);
+			ctx.response.body = page?.body ?? "";
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const first = await (await running.fetch("/page")).text();
+		const second = await (await running.fetch("/page")).text();
+		expect(rewrites).toBe(1);
+		for (const page of [first, second]) {
+			expect(page).toContain(`href="/_a/site.`);
+			expect(page).not.toContain("natsu-secret-");
+		}
+		expect(first.replace(/nonce="[^"]+"/, "")).toBe(second.replace(/nonce="[^"]+"/, ""));
+		expect(first).not.toBe(second);
 	});
 });
 
