@@ -202,6 +202,97 @@ describe("the URL carries the hash", () => {
 	});
 });
 
+describe("after a restart", () => {
+	test("a chunk the last process built is served from disk, still immutable", async () => {
+		reset();
+		const first = assets();
+		await first.build();
+		const url = first.pageStyle("site", '<body><div class="card">x</div></body>');
+		// hold() writes in the background; let it land.
+		await Bun.sleep(50);
+
+		const second = assets();
+		await second.build();
+		const app = new Application();
+		app.use(second.middleware());
+		running = await startApp(app);
+
+		const response = await running.fetch(url);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toContain("immutable");
+		const body = await response.text();
+		expect(body).toContain(".card");
+		expect(body).not.toContain("admin-table");
+	});
+
+	test("a chunk nobody has gets the whole stylesheet for a while, so the page stays styled", async () => {
+		reset();
+		const pipeline = assets();
+		await pipeline.build();
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+
+		const stand = await running.fetch("/_a/site.0123456789.css");
+		expect(stand.status).toBe(200);
+		expect(stand.headers.get("cache-control")).toBe("public, max-age=300");
+		const body = await stand.text();
+		expect(body).toContain(".card");
+		expect(body).toContain("admin-table");
+		const later = await running.fetch("/_a/site-later.0123456789.css");
+		expect(later.status).toBe(200);
+		expect(await later.text()).toBe("");
+		// A name that no stylesheet was cut from is still a miss.
+		expect((await running.fetch("/_a/other.0123456789.css")).status).toBe(404);
+	});
+});
+
+describe("compression", () => {
+	test("a chunk goes out as brotli made off the request path", async () => {
+		reset();
+		const pipeline = assets();
+		await pipeline.build();
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+		await Bun.sleep(50);
+
+		const response = await running.fetch(pipeline.url("site"), { headers: { "accept-encoding": "br" }, decompress: false } as RequestInit);
+		expect(response.headers.get("content-encoding")).toBe("br");
+		expect(response.headers.get("vary")).toContain("Accept-Encoding");
+		const plain = await running.fetch(pipeline.url("site"), { headers: { "accept-encoding": "identity" } });
+		expect(plain.headers.get("content-encoding")).toBeNull();
+		expect(await plain.text()).toContain(".card");
+	});
+});
+
+describe("page shapes", () => {
+	test("past the limit the oldest shape is forgotten, and its chunk still served", async () => {
+		reset();
+		const pipeline = assets({ maxPageShapes: 1 });
+		await pipeline.build();
+		const a = pipeline.pageStyle("site", '<body><div class="card">x</div></body>');
+		await Bun.sleep(50);
+		const b = pipeline.pageStyle("site", '<body><table class="admin-table"><th>x</th></table></body>');
+		expect(a).not.toBe(b);
+		const app = new Application();
+		app.use(pipeline.middleware());
+		running = await startApp(app);
+		const response = await running.fetch(a);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toContain(".card");
+		// The forgotten shape builds the same chunk again.
+		expect(pipeline.pageStyle("site", '<body><div class="card">x</div></body>')).toBe(a);
+	});
+
+	test("a page that links no stylesheet to narrow is not profiled", async () => {
+		const pipeline = assets({ wholeStylesheets: true, rewrite: { "/site.css": "site" } });
+		await pipeline.build();
+		const html = '<html><head><link rel="stylesheet" href="/site.css"></head><body class="card"></body></html>';
+		expect(pipeline.rewrite(html)).toContain(pipeline.url("site"));
+	});
+});
+
 describe("minification", () => {
 	test("is on when asked and off when not", async () => {
 		const small = assets({ minify: true });
