@@ -93,6 +93,16 @@ describe("chunking", () => {
 		expect(await read(pipeline, one)).not.toContain("admin-table");
 	});
 
+	test("one class with a comma in its name is not the two classes either side of it", async () => {
+		writeFileSync(join(dir, "site.css"), String.raw`.a\,b{color:red}.a{color:green}.b{color:blue}`);
+		const pipeline = assets();
+		await pipeline.build();
+		const one = pipeline.pageStyle("site", '<p class="a,b">x</p>');
+		const two = pipeline.pageStyle("site", '<p class="a b">x</p>');
+		expect(two).not.toBe(one);
+		expect(await read(pipeline, two)).toContain("green");
+	});
+
 	test("a class only a script adds survives if it is safelisted", async () => {
 		// A page's markup shows what the server rendered. `is-open` arrives on
 		// click, so without a safelist the rule that styles it is dropped and

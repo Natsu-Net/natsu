@@ -308,7 +308,8 @@ export class Assets {
 		const named = (found: Set<string>, known: Set<string> | undefined): string => {
 			const list: string[] = [];
 			for (const item of found) if (!known || known.has(item)) list.push(item);
-			return list.sort().join(",");
+			// A space, which no class or id can hold: `a,b` and `a`+`b` stay apart.
+			return list.sort().join(" ");
 		};
 		const shape = Bun.hash(
 			`${name}\n${named(profile.classes, names?.classes)}\n${named(profile.ids, names?.ids)}`,
@@ -509,10 +510,6 @@ export class Assets {
 	}
 
 	/**
-	 * A safelist names classes by their source names. The ones that were
-	 * renamed are added by their new names, exactly.
-	 */
-	/**
 	 * What of a page the chunks of this sheet depend on: the classes and ids
 	 * its rules name, and the classes that pull a lazy rule in early.
 	 */
@@ -525,6 +522,10 @@ export class Assets {
 		return names;
 	}
 
+	/**
+	 * A safelist names classes by their source names. The ones that were
+	 * renamed are added by their new names, exactly.
+	 */
 	private translate(list: Array<string | RegExp>): Array<string | RegExp> {
 		const out = [...list];
 		for (const [from, to] of this.classes) {

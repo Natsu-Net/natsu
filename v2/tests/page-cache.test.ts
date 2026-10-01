@@ -73,15 +73,83 @@ describe("PageCache", () => {
 
 	test("a visitor who picks page text as their secret cannot change the page for anyone else", async () => {
 		const cache = new PageCache();
-		const page = renderer("Fast and stable server plugin");
-		const chosen = "Fast and stable server plugin";
+		const page = renderer("Fast-stable-plugin");
+		const chosen = "Fast-stable-plugin";
 		const theirs = await cache.serve("/p", [NONCE_A, chosen], page.draw);
 		expect(theirs?.body).toContain(chosen);
 		expect(cache.size).toBe(0);
 		const next = await cache.serve("/p", [NONCE_B, CSRF_B], page.draw);
-		expect(next?.body).toBe(`<script nonce="${NONCE_B}"></script><input value="${CSRF_B}">Fast and stable server plugin 2`);
+		expect(next?.body).toBe(`<script nonce="${NONCE_B}"></script><input value="${CSRF_B}">Fast-stable-plugin 2`);
 		const again = await cache.serve("/p", [NONCE_A, CSRF_A], page.draw);
-		expect(again?.body).toBe(`<script nonce="${NONCE_A}"></script><input value="${CSRF_A}">Fast and stable server plugin 2`);
+		expect(again?.body).toBe(`<script nonce="${NONCE_A}"></script><input value="${CSRF_A}">Fast-stable-plugin 2`);
+	});
+
+	test("a secret that HTML could read as markup, a quote or a pattern is not filled in at all", async () => {
+		const cache = new PageCache();
+		const page = renderer();
+		for (const secret of [`"><img src=x onerror=alert(1)>`, "$&", "a b", "it's"]) {
+			expect(await cache.serve("/p", [NONCE_A, secret], page.draw)).toBeNull();
+		}
+		expect(page.renders()).toBe(0);
+		// Hex, base64 and base64url are filled as they are.
+		const fine = "aZ09+/=_-.~";
+		expect((await cache.serve("/p", [NONCE_A, fine], page.draw))?.body).toContain(`value="${fine}"`);
+	});
+
+	test("a page forgotten while it is drawn answers who asked before, and is not kept", async () => {
+		for (const forget of [(cache: PageCache) => cache.delete("/p"), (cache: PageCache) => cache.clear()]) {
+			const cache = new PageCache({ fresh: 60 });
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const before = async (): Promise<CachedPage> => {
+				await gate;
+				return { body: "listed", status: 200 };
+			};
+			const first = cache.serve("/p", [], before);
+			const joined = cache.serve("/p", [], before);
+			// A takedown: the app forgets the page while the render above still runs.
+			forget(cache);
+			const after = cache.serve("/p", [], async () => ({ body: "gone", status: 200 }));
+			release();
+			expect((await first)?.body).toBe("listed");
+			expect((await joined)?.body).toBe("listed");
+			expect((await after)?.body).toBe("gone");
+			expect((await cache.serve("/p", [], before))?.body).toBe("gone");
+		}
+	});
+
+	test("a page that must not be kept is answered, its old copy goes, and waiters draw their own", async () => {
+		const cache = new PageCache({ fresh: 0, stale: 30 });
+		await cache.serve("/p", [NONCE_A, CSRF_A], renderer().draw);
+		expect(cache.size).toBe(1);
+		let views = 0;
+		const perView = async ([nonce]: readonly string[]): Promise<CachedPage> => {
+			views++;
+			await Bun.sleep(1);
+			return { body: `<script nonce="${nonce}"></script>ad ${views}`, status: 200, keep: false };
+		};
+		const [own, waiter] = await Promise.all([
+			cache.serve("/q", [NONCE_A, CSRF_A], perView),
+			cache.serve("/q", [NONCE_B, CSRF_B], perView),
+		]);
+		expect(own).toEqual({ body: `<script nonce="${NONCE_A}"></script>ad 1`, status: 200 });
+		expect(waiter).toBeNull();
+		await cache.serve("/p", [NONCE_A, CSRF_A], perView);
+		await Bun.sleep(5);
+		expect(cache.size).toBe(0);
+	});
+
+	test("pages nobody asks for again are let go of once past their stale time", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 1, stale: 1 });
+		await cache.serve("/a", [], renderer().draw);
+		await cache.serve("/b", [], renderer().draw);
+		expect(cache.size).toBe(2);
+		setSystemTime(new Date("2026-10-01T00:00:03Z"));
+		await cache.serve("/c", [], renderer().draw);
+		expect(cache.size).toBe(1);
 	});
 
 	test("an old page is served once more while it is drawn again, then never past its stale time", async () => {

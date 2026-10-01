@@ -21,6 +21,8 @@
  * depends on: its path and query, and anything else the app knows changes it.
  */
 
+import { log } from "./logger.ts";
+
 export interface PageCacheOptions {
 	/** Seconds a kept page is served as it is (default 10). */
 	fresh?: number;
@@ -29,7 +31,10 @@ export interface PageCacheOptions {
 	 * it again (default 30). 0 waits for the new render instead.
 	 */
 	stale?: number;
-	/** Most characters of pages kept; the least recently used go first (default 32 million). */
+	/**
+	 * Most characters (UTF-16 code units) of pages kept; the least recently
+	 * used go first (default 32 million).
+	 */
 	maxChars?: number;
 	/**
 	 * Work done once on each page as it is kept rather than on every answer,
@@ -48,6 +53,12 @@ export interface CachedPage {
 	headers?: Record<string, string>;
 	/** Set on an answer whose page went through `prepare`. */
 	prepared?: boolean;
+	/**
+	 * False on a page that may be answered but must not be kept: one that
+	 * differs on every view (an ad picked for this view, a count that must
+	 * see each one). Whoever was waiting on it draws their own.
+	 */
+	keep?: boolean;
 }
 
 /**
@@ -70,10 +81,22 @@ interface Entry {
 /** Keys longer than this (a made-up query string) are rendered every time. */
 const MAX_KEY = 2048;
 
+/**
+ * What a secret may hold: it is written into the page as it is, so nothing
+ * that HTML would read as markup or a quote (hex, base64 and base64url fit).
+ */
+const SECRET = /^[\w.~+/=-]*$/;
+
+/** A render under way; `void` once the key was forgotten while it ran. */
+interface Run {
+	done: Promise<Entry | null>;
+	void: boolean;
+}
+
 export class PageCache {
 	private readonly entries = new Map<string, Entry>();
-	/** Renders under way, and the page each one kept for whoever waits on it. */
-	private readonly pending = new Map<string, Promise<Entry | null>>();
+	/** Renders under way, and the page each one drew for whoever waits on it. */
+	private readonly pending = new Map<string, Run>();
 	private readonly fresh: number;
 	private readonly stale: number;
 	private readonly maxChars: number;
@@ -82,6 +105,8 @@ export class PageCache {
 	private readonly mark = `natsu-secret-${crypto.randomUUID()}-`;
 	private readonly marks: string[] = [];
 	private chars = 0;
+	/** When pages past their stale time were last let go of (ms). */
+	private swept = Date.now();
 	/** Answers kept pages gave, fresh and stale, and renders. */
 	public readonly counts = { fresh: 0, stale: 0, rendered: 0 };
 
@@ -100,12 +125,13 @@ export class PageCache {
 	/**
 	 * The page for `key`, filled with this request's `secrets`: kept, or drawn
 	 * by `render` (see PageRender) and kept. Null when nothing came of it: the
-	 * key is too long to keep, `render` said no, or another request's render
-	 * was the one that said no or failed. The caller then draws the page
+	 * key is too long to keep, a secret holds more than letters, digits and
+	 * `_.~+/=-`, `render` said no, or another request's render was the one
+	 * that said no, kept nothing or failed. The caller then draws the page
 	 * itself, with its real secrets; a render that throws throws here.
 	 */
 	public async serve(key: string, secrets: readonly string[], render: PageRender): Promise<CachedPage | null> {
-		if (key.length > MAX_KEY) return null;
+		if (key.length > MAX_KEY || !secrets.every((secret) => SECRET.test(secret))) return null;
 		const now = Date.now();
 		const kept = this.entries.get(key);
 		if (kept && now < kept.until) {
@@ -116,53 +142,68 @@ export class PageCache {
 				this.counts.fresh++;
 			} else {
 				this.counts.stale++;
-				if (!this.pending.has(key)) void this.draw(key, secrets, render).catch(() => null);
+				// Until a new render succeeds, the page stays served for the rest of
+				// its stale time (an API that is down shows the last good page).
+				if (!this.pending.has(key)) {
+					void this.draw(key, secrets, render).catch((error) => {
+						log.warn(`[<yellow>page-cache</yellow>] refreshing ${key} failed: ${(error as Error).message}`);
+					});
+				}
 			}
 			return this.fill(kept.page, secrets);
 		}
 
 		// Past its stale time a page is not served; its memory goes with it.
-		if (kept) this.delete(key);
+		if (kept) this.forget(key);
 		const running = this.pending.get(key);
 		if (running) {
 			// Someone else is drawing it: their page, our secrets.
-			const entry = await running;
+			const entry = await running.done;
 			return entry ? this.fill(entry.page, secrets) : null;
 		}
 		return this.draw(key, secrets, render);
 	}
 
-	/** Forget one page, so the next request draws it again. */
+	/**
+	 * Forget one page, so the next request draws it again. A render of it
+	 * already under way read what was there before, so it is not kept either:
+	 * it answers the requests that came before this call and no other.
+	 */
 	public delete(key: string): void {
-		const entry = this.entries.get(key);
-		if (!entry) return;
-		this.entries.delete(key);
-		this.chars -= entry.chars;
+		this.forget(key);
+		const running = this.pending.get(key);
+		if (running) {
+			running.void = true;
+			this.pending.delete(key);
+		}
 	}
 
-	/** Forget every page. */
+	/** Forget every page, and every render under way, as `delete` does. */
 	public clear(): void {
 		this.entries.clear();
 		this.chars = 0;
+		for (const running of this.pending.values()) running.void = true;
+		this.pending.clear();
 	}
 
 	/** Draws the page for this request, keeps it if it may be kept, and tells whoever waits. */
 	private draw(key: string, secrets: readonly string[], render: PageRender): Promise<CachedPage | null> {
 		let share: (entry: Entry | null) => void = () => {};
-		this.pending.set(key, new Promise((resolve) => { share = resolve; }));
+		const run: Run = { done: new Promise((resolve) => { share = resolve; }), void: false };
+		this.pending.set(key, run);
 		let entry: Entry | null = null;
 		return (async (): Promise<CachedPage | null> => {
 			try {
 				const page = await render(this.marksFor(secrets.length));
 				this.counts.rendered++;
-				if (!page) {
+				if (!page || page.keep === false) {
 					// What was kept is no longer what this key draws (it is gone, or
-					// for one visitor now): stop serving it.
-					this.delete(key);
-					return null;
+					// different for each visitor or view now): stop serving it.
+					if (!run.void) this.forget(key);
+					return page ? this.fill(page, secrets) : null;
 				}
 				// The render put a real secret in the page: this visitor's alone.
-				if (secrets.some((secret) => page.body.includes(secret))) return this.fill(page, secrets);
+				if (secrets.some((secret) => secret !== "" && page.body.includes(secret))) return this.fill(page, secrets);
 				const body = this.prepare ? this.prepare(page.body) : page.body;
 				const now = Date.now();
 				entry = {
@@ -176,10 +217,11 @@ export class PageCache {
 					until: now + this.fresh + this.stale,
 					chars: body.length + key.length,
 				};
-				this.keep(key, entry);
+				// Forgotten while it ran: answer whoever asked before that, keep nothing.
+				if (!run.void) this.keep(key, entry, now);
 				return this.fill(entry.page, secrets);
 			} finally {
-				this.pending.delete(key);
+				if (this.pending.get(key) === run) this.pending.delete(key);
 				share(entry);
 			}
 		})();
@@ -190,8 +232,14 @@ export class PageCache {
 		return this.marks.slice(0, count);
 	}
 
-	private keep(key: string, entry: Entry): void {
-		this.delete(key);
+	private keep(key: string, entry: Entry, now: number): void {
+		this.forget(key);
+		// Pages nobody asked for again stay until something pushes them out;
+		// once per stale span, let go of those past their stale time.
+		if (now - this.swept > this.fresh + this.stale) {
+			this.swept = now;
+			for (const [kept, old] of this.entries) if (old.until <= now) this.forget(kept);
+		}
 		// A page larger than the whole budget is served, never kept.
 		if (entry.chars > this.maxChars) return;
 		this.entries.set(key, entry);
@@ -199,13 +247,23 @@ export class PageCache {
 		while (this.chars > this.maxChars) {
 			const oldest = this.entries.keys().next();
 			if (oldest.done) break;
-			this.delete(oldest.value);
+			this.forget(oldest.value);
 		}
+	}
+
+	/** Drops a kept page and its memory; renders under way carry on. */
+	private forget(key: string): void {
+		const entry = this.entries.get(key);
+		if (!entry) return;
+		this.entries.delete(key);
+		this.chars -= entry.chars;
 	}
 
 	private fill(page: CachedPage, secrets: readonly string[]): CachedPage {
 		let body = page.body;
-		for (const [index, secret] of secrets.entries()) body = body.replaceAll(`${this.mark}${index}.`, secret);
-		return { ...page, body, ...(page.headers ? { headers: { ...page.headers } } : {}) };
+		// split/join, not replaceAll: a `$&` in a secret is text, not a pattern.
+		for (const [index, secret] of secrets.entries()) body = body.split(`${this.mark}${index}.`).join(secret);
+		const { keep: _keep, ...answer } = page;
+		return { ...answer, body, ...(page.headers ? { headers: { ...page.headers } } : {}) };
 	}
 }
