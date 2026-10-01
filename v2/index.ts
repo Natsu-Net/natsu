@@ -51,7 +51,7 @@ export type { ControllerFactory, ControllerNamespaceApi, ControllerOptions } fro
 export type { RejectReason, StaticOptions } from "./src/static.ts";
 export type { AssetReport, AssetsOptions } from "./src/assets.ts";
 export type { CompressOptions } from "./src/compress.ts";
-export type { CachedPage, PageCacheOptions } from "./src/page-cache.ts";
+export type { CachedPage, PageCacheOptions, PageRender } from "./src/page-cache.ts";
 export type { SessionAdapter, SessionRecord, MaybePromise } from "./src/session/adapter.ts";
 export type { SessionHook, SessionManagerOptions } from "./src/session/session.ts";
 export type {
