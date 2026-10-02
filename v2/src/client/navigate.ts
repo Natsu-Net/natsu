@@ -425,168 +425,180 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			if (DEV) why(r.headers.get("natsu-reload") ?? "not a part", u.href);
 			return full(u, h);
 		}
-		const f = new URL(r.url || u);
-		f.hash = u.hash;
-		const doc = new DOMParser().parseFromString(text, "text/html");
-		// Read with scripting off, their content is markup: a <noscript><style> would apply.
-		for (const e of doc.querySelectorAll("noscript")) e.remove();
-		// A nonce in the part's head is the real one, and Natsu-Nonce lists the
-		// ones the server vouched for. Those read "" (as a live element shows its
-		// hidden nonce, so the merge sees an unchanged one as unchanged) and get
-		// the boot nonce if they go in; any other nonce goes.
-		const vouched = (r.headers.get("natsu-nonce") || "").split(" ");
-		const trusted = new Set<Element>();
-		for (const e of doc.head.querySelectorAll("[nonce]")) {
-			const v = e.getAttribute("nonce");
-			if (v && vouched.includes(v)) e.setAttribute("nonce", ""), trusted.add(e);
-			else e.removeAttribute("nonce");
-		}
-		// The page's scripts come from Natsu-Scripts, never from markup: each
-		// entry is one tag's attributes, its src made absolute against the part.
-		const scripts = (r.headers.get("natsu-scripts") || "")
-			.split(" ")
-			.map((e) => new URLSearchParams(e))
-			.filter((p) => p.has("src"))
-			.map((p) => [new URL(p.get("src")!, f).href, p] as const);
-		const now = regions(D);
-		const next = regions(doc);
-		if (ids(now) != ids(next)) {
-			if (DEV) why("regions differ:", ids(now), "->", ids(next));
-			return full(u, h);
-		}
+		// Anything that throws before the swap (DOMParser under Trusted Types, a
+		// header it cannot read) is a real load, never a click that did nothing.
+		let begun: unknown;
+		try {
+			const f = new URL(r.url || u);
+			f.hash = u.hash;
+			const doc = new DOMParser().parseFromString(text, "text/html");
+			// Read with scripting off, their content is markup: a <noscript><style> would apply.
+			for (const e of doc.querySelectorAll("noscript")) e.remove();
+			// A nonce in the part's head is the real one, and Natsu-Nonce lists the
+			// ones the server vouched for. Those read "" (as a live element shows its
+			// hidden nonce, so the merge sees an unchanged one as unchanged) and get
+			// the boot nonce if they go in; any other nonce goes.
+			const vouched = (r.headers.get("natsu-nonce") || "").split(" ");
+			const trusted = new Set<Element>();
+			for (const e of doc.head.querySelectorAll("[nonce]")) {
+				const v = e.getAttribute("nonce");
+				if (v && vouched.includes(v)) e.setAttribute("nonce", ""), trusted.add(e);
+				else e.removeAttribute("nonce");
+			}
+			// The page's scripts come from Natsu-Scripts, never from markup: each
+			// entry is one tag's attributes, its src made absolute against the part.
+			const scripts = (r.headers.get("natsu-scripts") || "")
+				.split(" ")
+				.map((e) => new URLSearchParams(e))
+				.filter((p) => p.has("src"))
+				.map((p) => [new URL(p.get("src")!, f).href, p] as const);
+			const now = regions(D);
+			const next = regions(doc);
+			// DOMParser leaves a declarative shadow root an inert <template>; a real load attaches it.
+			const shadow = doc.querySelector(REGION + " template[shadowrootmode]");
+			if (ids(now) != ids(next) || shadow) {
+				if (DEV) why(...(shadow ? ["a declarative shadow root in a region:", shadow] : ["regions differ:", ids(now), "->", ids(next)]));
+				return full(u, h);
+			}
 
-		// Where the page is, read now: once the new sheets are in, reading it
-		// costs a style pass over the whole page. Every scroll after keeps it.
-		ys.set(cur, scrollY);
-		// Stylesheets go in ahead of the current ones, which keep the page on
-		// screen styled as it is, and must load before anything moves.
-		const want = sheets(doc);
-		const old = sheets(D).filter((l) => owned.has(l));
-		const adds: HTMLLinkElement[] = [];
-		for (const l of want)
-			if (!old.some((o) => href(o) == href(l)))
-				for (const x of [href(l), l.getAttribute(LATER)])
-					if (x) {
-						const c = D.importNode(l);
-						c.setAttribute("href", x);
-						if (trusted.has(l)) c.nonce = NONCE;
-						adds.push(c);
+			// Where the page is, read now: once the new sheets are in, reading it
+			// costs a style pass over the whole page. Every scroll after keeps it.
+			ys.set(cur, scrollY);
+			// Stylesheets go in ahead of the current ones, which keep the page on
+			// screen styled as it is, and must load before anything moves.
+			const want = sheets(doc);
+			const old = sheets(D).filter((l) => owned.has(l));
+			const adds: HTMLLinkElement[] = [];
+			for (const l of want)
+				if (!old.some((o) => href(o) == href(l)))
+					for (const x of [href(l), l.getAttribute(LATER)])
+						if (x) {
+							const c = D.importNode(l);
+							c.setAttribute("href", x);
+							if (trusted.has(l)) c.nonce = NONCE;
+							adds.push(c);
+						}
+			let fine: unknown = 1;
+			if (adds[0])
+				fine = await new Promise((y) => {
+					let left = adds.length;
+					// Four seconds without every load counts as a failure too (undefined).
+					setTimeout(y, 4e3);
+					const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || y(1));
+					// The handlers go on before the links go in: a cached sheet may load at once.
+					for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => y(0));
+					old[0] ? old[0].before(...adds) : D.head.append(...adds);
+					// A sheet the memory cache held is parsed as it goes in, but its load
+					// event can wait for the next frame: rules that can be read (never
+					// while loading, nor across origins) are a loaded sheet, a frame early.
+					for (const l of adds)
+						try {
+							if (l.sheet!.cssRules) done(l);
+						} catch {}
+				});
+			if (n != seq || !fine) {
+				for (const l of adds) l.remove();
+				if (DEV && n == seq) why("a stylesheet did not load", u.href);
+				return n == seq ? full(u, h) : undefined;
+			}
+			/** Sheets that stay, by the href the server wrote: the new page's and their lazy halves. */
+			const keep = want.flatMap((l) => [href(l), l.getAttribute(LATER)]);
+
+			const swap = () => {
+				begun = 1;
+				fire("before-swap", D, { url: f.href });
+				const y = ys.get(cur);
+				if (h == "none") {
+					// An entry reached by back/forward keeps its id; one with no state
+					// (a hash link's, or one a script wrote) is given one.
+					const s = st();
+					if (s) cur = s.id;
+					else {
+						cur = ++id;
+						put();
 					}
-		let fine: unknown = 1;
-		if (adds[0])
-			fine = await new Promise((y) => {
-				let left = adds.length;
-				// Four seconds without every load counts as a failure too (undefined).
-				setTimeout(y, 4e3);
-				const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || y(1));
-				// The handlers go on before the links go in: a cached sheet may load at once.
-				for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => y(0));
-				old[0] ? old[0].before(...adds) : D.head.append(...adds);
-				// A sheet the memory cache held is parsed as it goes in, but its load
-				// event can wait for the next frame: rules that can be read (never
-				// while loading, nor across origins) are a loaded sheet, a frame early.
-				for (const l of adds)
-					try {
-						if (l.sheet!.cssRules) done(l);
-					} catch {}
-			});
-		if (n != seq || !fine) {
-			for (const l of adds) l.remove();
-			if (DEV && n == seq) why("a stylesheet did not load", u.href);
-			return n == seq ? full(u, h) : undefined;
-		}
-		/** Sheets that stay, by the href the server wrote: the new page's and their lazy halves. */
-		const keep = want.flatMap((l) => [href(l), l.getAttribute(LATER)]);
-
-		const swap = () => {
-			fire("before-swap", D, { url: f.href });
-			const y = ys.get(cur);
-			if (h == "none") {
-				// An entry reached by back/forward keeps its id; one with no state
-				// (a hash link's, or one a script wrote) is given one.
-				const s = st();
-				if (s) cur = s.id;
+				} else if (h == "replace") put(undefined, f.href);
 				else {
-					cur = ++id;
-					put();
+					put(y);
+					HI.pushState({ natsu: { id: (cur = ++id) } }, "", f.href);
 				}
-			} else if (h == "replace") put(undefined, f.href);
-			else {
-				put(y);
-				HI.pushState({ natsu: { id: (cur = ++id) } }, "", f.href);
-			}
-			rendered = here();
-			// The head: what is in both stays, what went away goes, what is new comes in.
-			const incoming = new Map<string, Element>();
-			for (const e of doc.head.children) if (e.localName != "script" && !e.matches(SHEET)) incoming.set(e.outerHTML, e);
-			for (const e of owned) {
-				if (e.matches(SHEET) ? keep.includes(href(e)) : incoming.delete(e.outerHTML)) continue;
-				// A lazy half that the page's own loader linked goes with its sheet.
-				const later = e.getAttribute(LATER);
-				if (later) D.head.querySelector(`link[href="${later}"]`)?.remove();
-				e.remove();
-				owned.delete(e);
-			}
-			for (const e of [...adds, ...incoming.values()]) {
-				owned.add(e);
-				// The CSP takes only the boot nonce, and only on what the server vouched for.
-				if (trusted.has(e)) (e as HTMLElement).nonce = NONCE;
-			}
-			D.head.append(...incoming.values());
-			now.forEach((el, i) => {
-				unmount(el);
-				el.replaceWith(next[i]!);
-			});
-			const s = o.scroll;
-			if (s != "keep") {
-				let t: Element | null = null;
-				try {
-					t = D.getElementById(decodeURIComponent(f.hash.slice(1)));
-				} catch {}
-				// A y (back/forward), else the hash target, else the top.
-				if (t && s == null) t.scrollIntoView();
-				else scrollTo(0, +s! || 0);
-				const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);
-				const auto = pick("[autofocus]");
-				const el = auto || pick("h1") || (next[0] as HTMLElement);
-				if (!auto && !el.hasAttribute("tabindex")) el.tabIndex = -1;
-				el.focus({ preventScroll: true });
-				status!.textContent = D.title;
-			}
-		};
-		if (
-			H.hasAttribute("data-natsu-transition") &&
-			D.startViewTransition &&
-			D.visibilityState == "visible" &&
-			!matchMedia("(prefers-reduced-motion: reduce)").matches
-		)
-			await D.startViewTransition(swap).updateCallbackDone;
-		else swap();
-		clearTimeout(timer);
-		H.removeAttribute(LOADING);
+				rendered = here();
+				// The head: what is in both stays, what went away goes, what is new comes in.
+				const incoming = new Map<string, Element>();
+				for (const e of doc.head.children) if (e.localName != "script" && !e.matches(SHEET)) incoming.set(e.outerHTML, e);
+				for (const e of owned) {
+					if (e.matches(SHEET) ? keep.includes(href(e)) : incoming.delete(e.outerHTML)) continue;
+					// A lazy half that the page's own loader linked goes with its sheet.
+					const later = e.getAttribute(LATER);
+					if (later) D.head.querySelector(`link[href="${later}"]`)?.remove();
+					e.remove();
+					owned.delete(e);
+				}
+				for (const e of [...adds, ...incoming.values()]) {
+					owned.add(e);
+					// The CSP takes only the boot nonce, and only on what the server vouched for.
+					if (trusted.has(e)) (e as HTMLElement).nonce = NONCE;
+				}
+				D.head.append(...incoming.values());
+				now.forEach((el, i) => {
+					unmount(el);
+					el.replaceWith(next[i]!);
+				});
+				const s = o.scroll;
+				if (s != "keep") {
+					let t: Element | null = null;
+					try {
+						t = D.getElementById(decodeURIComponent(f.hash.slice(1)));
+					} catch {}
+					// A y (back/forward), else the hash target, else the top.
+					if (t && s == null) t.scrollIntoView();
+					else scrollTo(0, +s! || 0);
+					const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);
+					const auto = pick("[autofocus]");
+					const el = auto || pick("h1") || (next[0] as HTMLElement);
+					if (!auto && !el.hasAttribute("tabindex")) el.tabIndex = -1;
+					el.focus({ preventScroll: true });
+					status!.textContent = D.title;
+				}
+			};
+			if (
+				H.hasAttribute("data-natsu-transition") &&
+				D.startViewTransition &&
+				D.visibilityState == "visible" &&
+				!matchMedia("(prefers-reduced-motion: reduce)").matches
+			)
+				await D.startViewTransition(swap).updateCallbackDone;
+			else swap();
+			clearTimeout(timer);
+			H.removeAttribute(LOADING);
 
-		// Mounts allowed here, then the scripts this document has not run, in order.
-		list = new Set(scripts.map((s) => s[0]));
-		for (const el of next) mountIn(el);
-		await Promise.all(
-			scripts.map(
-				([src, p]) =>
-					loaded.has(src) ||
-					new Promise((y) => {
-						const c = D.createElement("script");
-						p.forEach((v, k) => k != "nonce" && c.setAttribute(k, v));
-						c.async = false;
-						// One the server vouched for gets the boot nonce; any other is left
-						// to the page's CSP, exactly as on a full load.
-						if (p.has("nonce")) c.nonce = NONCE;
-						loaded.add(src);
-						if (!p.has("data-natsu-once")) listed.push(src);
-						c.onload = c.onerror = y;
-						D.body.append(c);
-					}),
-			),
-		);
-		for (const el of next) fire("load", el);
+			// Mounts allowed here, then the scripts this document has not run, in order.
+			list = new Set(scripts.map((s) => s[0]));
+			for (const el of next) mountIn(el);
+			await Promise.all(
+				scripts.map(
+					([src, p]) =>
+						loaded.has(src) ||
+						new Promise((y) => {
+							const c = D.createElement("script");
+							p.forEach((v, k) => k != "nonce" && c.setAttribute(k, v));
+							c.async = false;
+							// One the server vouched for gets the boot nonce; any other is left
+							// to the page's CSP, exactly as on a full load.
+							if (p.has("nonce")) c.nonce = NONCE;
+							loaded.add(src);
+							if (!p.has("data-natsu-once")) listed.push(src);
+							c.onload = c.onerror = y;
+							D.body.append(c);
+						}),
+				),
+			);
+			for (const el of next) fire("load", el);
+		} catch (e) {
+			if (begun) throw e;
+			if (DEV) why("the part could not be read:", e);
+			full(u, h);
+		}
 	};
 
 	api.visit = visit;
