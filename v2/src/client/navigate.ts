@@ -38,17 +38,32 @@
  * later swap for an element page code took out of the document. Elements in
  * the shell are mounted once.
  *
- * **Which scripts allow a swap.** Every script this document ran counts:
- * inline, module, `defer` or `async`, in the head or the body, and the ones
- * a swap appends. It is swap-safe once it has called `mount`, at any time
- * (the script is `document.currentScript`, or for a module or a call made
- * later the one the stack names). Any other makes every later visit a real
- * load, so an unconverted page behaves exactly as before and no listener
- * ever stacks. Left out: this runtime, a tag with `data-natsu-once`, data
- * blocks and `nomodule`, and a classic head script that blocks the parser.
- * A head script runs once per document, as the shell does, and its mounts
- * apply on every page, whatever the page lists. A script that calls `mount`
- * must run after this one: `defer`, as Assets emits them.
+ * **Which scripts allow a swap.** Every script this document runs counts:
+ * inline, module, `defer` or `async`, in the head or the body, the ones a
+ * swap appends, and one a loader adds at any time (the document's scripts
+ * are read again as each visit starts). It is swap-safe once it has called
+ * `mount`, at any time (the script is `document.currentScript`, or for a
+ * module or a call made later the one the stack names). Any other makes
+ * every later visit a real load, so an unconverted page behaves exactly as
+ * before and no listener ever stacks; and one a swap created that has not
+ * called `mount` once it has run gets its page loaded for real, since it may
+ * be waiting for a `DOMContentLoaded` that never comes again. Left out: this
+ * runtime, a tag with `data-natsu-once`, data blocks, `nomodule` and any
+ * other type the browser does not run, and a classic head script that
+ * blocks the parser. A head script runs once per document, as the shell
+ * does, and its mounts apply on every page, whatever the page lists. A
+ * script that calls `mount` must run after this one: `defer`, as Assets
+ * emits them.
+ *
+ * **Which clicks.** A plain left click on a link to this site, and the
+ * submit of a GET form. Left to the browser: a click with a modifier (on a
+ * submit button too: it opens a tab or a window), a target other than
+ * `_self` (the element's own, else `<base target>`), `download`, a file
+ * (an extension other than `.html`), a link inside an editor
+ * (`contenteditable`), `data-natsu-reload`, and a form whose
+ * `accept-charset` is not UTF-8. A link to the page shown with a hash is
+ * the browser's own jump. While a Back or Forward to another page is on
+ * its way, a link or form is read against the page still on screen.
  *
  * **The wire format.** The request is a GET carrying
  * `Natsu-Nav: <doc>.<shell>` (and `Natsu-Prefetch: 1` for a hover). The
@@ -68,7 +83,9 @@
  *    most), any other is a real load;
  *  - `204` with `Natsu-Reload: <reason>`: load this page for real. For
  *    `route` (not navigable) and `response` (no page there) the path is a
- *    real load, never prefetched, for the rest of this document;
+ *    real load, never prefetched, for the rest of this document, as it is
+ *    for an answer with no `natsu-` header at all (another server behind
+ *    the same proxy);
  *  - `204` with `Natsu-Prefetch: skip`: a hover was refused (a click still
  *    swaps).
  *
@@ -106,20 +123,27 @@
  *     nodes a third party added and `<html>` attributes are never touched;
  *     a new element the server vouched for gets the boot nonce, so a page's
  *     own inline `<style>` applies under a nonce `style-src`),
- *     the old stylesheets out, each region unmounted and replaced, scroll,
- *     focus (kept with `scroll: "keep"`), and the title read out through a
- *     `role=status` element.
+ *     the old stylesheets out, each region unmounted and replaced, scroll
+ *     (a jump, as every scroll the runtime makes, whatever `scroll-behavior`
+ *     says), focus (kept with `scroll: "keep"`), and the title read out
+ *     through a `role=status` element.
  *  5. The mounts already registered run on the new regions. The listed
  *     scripts this document has not run are created from their entries,
  *     with the boot nonce where the entry says so (which `'strict-dynamic'`
  *     does not need, and a bare nonce policy does) and `async = false`, so
- *     they run in order and their `mount` calls bind as they run; once they
- *     have loaded, `natsu:load` fires.
+ *     they run in order and their `mount` calls bind as they run (one the
+ *     browser never runs, `nomodule` or another type, is not waited for).
+ *     Once they have run, a created script that has not called `mount`
+ *     means a real load of this page; else `natsu:load` fires, unless
+ *     another visit or a Back overtook this one meanwhile.
  *
  * **Scroll** is kept per history entry, keyed by the entry the page on
  * screen belongs to, never by whatever `history.state` says at the moment:
  * a scroll during a back/forward fetch still belongs to the page being left.
- * It is saved on the entry at `pagehide` too, so a reload comes back to it.
+ * It is written into the entry too, once a scroll settles (200 ms) and at
+ * `beforeunload` and `pagehide`, so a reload, or a return after the
+ * document is gone, comes back to it; never into an entry that a Back or
+ * Forward on its way has put in the address bar.
  * Each page shown is numbered, and every entry made from it carries the
  * number: the browser's own entry for a hash link gets it at its popstate.
  * A popstate to an entry with the number on screen is a scroll (to where the
@@ -131,8 +155,9 @@
  * with `Natsu-Prefetch: 1`, two at a time at most, and none on Save-Data or
  * 2G, or when `<meta name="natsu" data-prefetch="off">` says the server
  * refuses them. A click within ten seconds uses the answer: a part, or a
- * redirect or reload, acted on as it is. A skip is remembered as no answer
- * for those ten seconds, so hovers stop asking and the click fetches.
+ * redirect or reload, acted on as it is. Any other (a skip, a 404 part) is
+ * remembered as no answer for those ten seconds, so hovers stop asking and
+ * the click fetches.
  *
  * **The API**, `natsu` (types in `client/types.ts`):
  *
@@ -153,9 +178,8 @@
  *    `<html data-natsu-transition>`. `html[data-natsu-loading]` is set
  *    when a visit takes longer than 300 ms, and cleared by any real load.
  *
- * With no key, no region, or a browser without `DOMParser` or `pushState`,
- * the runtime stays inert: `mount` still works and `visit` is
- * `location.assign`.
+ * With no key or no region the runtime stays inert: `mount` still works and
+ * `visit` is `location.assign`.
  *
  * Built as a classic script. `define: { NATSU_DEV: "true" }` gives the
  * development build, which says in the console why each visit became a
@@ -180,7 +204,8 @@ const H = D.documentElement;
 const L = location;
 const HI = history;
 const me = D.currentScript as HTMLScriptElement | null;
-const NONCE = me?.nonce ?? "";
+/** The boot nonce, for what goes in under the page's CSP (none: a runtime with no tag of its own). */
+const NONCE = me?.nonce as string;
 const META = D.querySelector<HTMLMetaElement>('meta[name="natsu"]');
 const KEY = META?.content;
 const OFF = /^(false|off)$/;
@@ -189,6 +214,10 @@ const LOADING = "data-natsu-loading";
 const SHEET = "link[rel=stylesheet]";
 const LATER = "data-natsu-later";
 const PASSIVE = { passive: true };
+const QUIET = { preventScroll: true };
+/** Every scroll the runtime makes jumps, as the browser's own restore does, whatever `scroll-behavior` says. */
+const INSTANT = { behavior: "instant" } as const;
+const go = (top: number) => scrollTo({ top, ...INSTANT });
 
 const regs: Reg[] = [];
 /** Live mounts: the element, and what stops it (abort the signal, run the cleanup). */
@@ -196,7 +225,7 @@ let live: [Element, () => void][] = [];
 /** Scripts that called `mount`: each element, and its src. */
 const aware = new Set<unknown>();
 /** Srcs whose mounts may run on the page shown. Unset at boot: all of them. */
-let list: Set<string> | undefined;
+let list: string[] | undefined;
 let ready = false;
 
 const on = (type: string, fn: (e: never) => unknown, options?: AddEventListenerOptions) =>
@@ -212,7 +241,7 @@ const flag = (el: Element, name: string) => {
 
 const mountIn = (root: Element, only?: Reg) => {
 	for (const r of only ? [only] : regs)
-		if (!r[2] || !list || list.has(r[2]))
+		if (!r[2] || !list || list.includes(r[2]))
 			for (const el of [root, ...root.querySelectorAll(r[0])] as Mounted[]) {
 				const done = (el.natsu ||= new Set());
 				if (!el.matches(r[0]) || done.has(r)) continue;
@@ -246,7 +275,7 @@ const island = async (el: Element, signal?: AbortSignal) => {
 	// Only this site, and only an answer from a route that says it is an
 	// island: markup that slipped into a page must not pull in another
 	// origin's HTML, nor a whole page of this one.
-	const u = new URL(el.getAttribute("data-natsu-island")!, L.href);
+	const u = new URL((el as HTMLElement).dataset.natsuIsland!, L.href);
 	if (u.origin != L.origin) return;
 	const r = await fetch(u, { signal, headers: { "Natsu-Island": "1" } });
 	const html =
@@ -270,14 +299,12 @@ regs.push(["[data-natsu-island]", (el, signal) => island(el, signal).catch(() =>
 
 const api: NatsuClient = {
 	mount(selector, fn) {
-		let s = D.currentScript as HTMLScriptElement | null;
-		if (!s) {
-			// A module script, or a call made later (an event, after an await):
-			// the stack names the script's URL, in every engine.
-			const stack = new Error().stack!;
-			s = [...D.scripts].find((e) => e != me && e.src && stack.includes(e.src + ":"))!;
-		}
-		if (s) aware.add(s).add(s.src || s);
+		// A module script, or a call made later (an event, after an await):
+		// the stack names the script's URL, in every engine.
+		const s = (D.currentScript || [...D.scripts].find((e) => e != me && e.src && new Error().stack!.includes(e.src + ":"))) as
+			| HTMLScriptElement
+			| undefined;
+		if (s) aware.add(s.src || s);
 		// A script in <head> runs once per document, as the shell does: its mounts go everywhere.
 		const r: Reg = [selector, fn as Reg[1], s && s.parentNode != D.head ? s.src : ""];
 		regs.push(r);
@@ -290,74 +317,77 @@ const api: NatsuClient = {
 };
 if (!first) window.natsu = api;
 
-/** Every script this document ran or started. */
-const loaded = new Set([...D.scripts].map((s) => s.src));
+/** The src of every script this document ran or started. */
+const loaded = new Set<string>();
 /** The ones that must have called `mount` by the time a visit starts, for a swap to be safe. */
-const listed: HTMLScriptElement[] = [];
+const listed = new Set<HTMLScriptElement>();
 let status: HTMLElement | undefined;
 /**
  * What the browser runs: no type, a JavaScript one (each has "script" in
- * it), or a module; not JSON nor any other data block. A rarer type with
- * "script" in it counts too, which costs speed, never correctness.
+ * it), or a module; not JSON nor any other data block, nor a type a consent
+ * manager turns on later, and never a `nomodule` one. A rarer type with
+ * "script" in it (`text/typescript`) is taken for one.
  */
-const JS = /script|^(module)?$/i;
+const runs = (s: HTMLScriptElement) => /script|^(module)?$/i.test(s.type.trim()) && !s.noModule;
+/**
+ * Every script that runs counts, inline and module ones too, but for the
+ * runtime, a data-natsu-once tag, and a classic head script that blocks the
+ * parser: it ran before the body existed, so it is shell.
+ */
+const counts = (s: HTMLScriptElement) =>
+	s != me &&
+	runs(s) &&
+	!s.hasAttribute("data-natsu-once") &&
+	!(s.parentNode == D.head && !/module/i.test(s.type) && !(s.src && (s.defer || s.async)));
+/** A script that has not called `mount` (yet). */
+const blind = (s: HTMLScriptElement) => !aware.has(s.src || s);
+/**
+ * Whether a script that counts has not called `mount`, noting the
+ * document's scripts first: before every visit, for one a loader added since.
+ */
+const unbound = () => {
+	for (const s of D.scripts) loaded.add(s.src), counts(s) && listed.add(s);
+	return [...listed].some(blind);
+};
 
 const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
 
 const boot = () => {
-	if (ready) return;
-	ready = true;
-	// Every script that ran here counts, inline and module ones too, but for
-	// the runtime, a data-natsu-once tag, and a classic head script that
-	// blocks the parser: it ran before the body existed, so it is shell.
-	for (const s of D.scripts) {
-		const t = s.type.trim();
-		if (
-			s != me &&
-			JS.test(t) &&
-			!s.noModule &&
-			!s.hasAttribute("data-natsu-once") &&
-			!(s.parentNode == D.head && !/^module$/i.test(t) && !(s.src && (s.defer || s.async)))
-		)
-			listed.push(s);
+	if (!ready) {
+		ready = true;
+		status && D.body.append(status);
+		mountIn(D.body);
+		// Noted now too: a script page code takes out before the first visit still ran.
+		unbound();
+		// One natsu:load per page shown, this one included: a page-view hook counts each once.
+		fire("load", { url: L.href, regions: regions(D) });
 	}
-	if (status) D.body.append(status);
-	mountIn(D.body);
-	// One natsu:load per page shown, this one included: a page-view hook counts each once.
-	fire("load", { url: L.href, regions: regions(D) });
 };
-if (!first) {
-	if (D.readyState == "complete") boot();
-	else {
-		D.addEventListener("DOMContentLoaded", boot);
-		on("load", boot);
-	}
-}
 
-if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
+if (!first && KEY && regions(D)[0]) {
 	status = D.createElement("p");
 	status.setAttribute("role", "status");
 	status.style.cssText = "position:fixed;clip-path:inset(50%)";
-	if (ready) D.body.append(status);
 
 	/** Head elements the server sent: the only ones a merge may remove. */
-	const owned = new Set([...D.head.children].filter((e) => e.localName != "script"));
-	const unsafe = () => {
-		const bad = listed.filter((s) => !aware.has(s) && !aware.has(s.src));
-		// The page said this document is never to be swapped again (an ad shown, say).
-		const off = flag(H, "reload");
-		if (DEV && (!ready || off || bad[0]))
-			why(
-				...(!ready
-					? ["before DOMContentLoaded"]
-					: off
-						? ["<html data-natsu-reload>"]
-						: [bad, "never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)"]),
-			);
-		return !ready || off || bad[0];
-	};
+	const owned = new Set([...D.head.children].filter((e) => !e.matches("script")));
+	// Off when the page said this document is never to be swapped again (an ad shown, say).
+	const unsafe = DEV
+		? () => {
+				const off = flag(H, "reload");
+				const bad = unbound() && [...listed].filter(blind);
+				if (!ready || off || bad)
+					why(
+						...(!ready
+							? ["before DOMContentLoaded"]
+							: off
+								? ["<html data-natsu-reload>"]
+								: [bad, "never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)"]),
+					);
+				return !ready || off || !!bad;
+			}
+		: () => !ready || flag(H, "reload") || unbound();
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
-	const here = () => L.pathname + L.search;
 	/** The element a URL's hash names. */
 	const anchor = (u: URL | Location) => {
 		try {
@@ -368,7 +398,7 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	// --- history --------------------------------------------------------
 	/** Ours in an entry's state: its id, the page it shows, its scroll when left. */
 	const st = (): { id: number; p?: number; y?: number } | undefined => HI.state?.natsu;
-	let id = Date.now();
+	let id = +new Date();
 	/** The history entry on screen: a swap or a same-page popstate changes it. */
 	let cur = st()?.id ?? ++id;
 	/**
@@ -377,44 +407,63 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	 * popstate between two of them is a scroll, whatever the URL says.
 	 */
 	let page = ++id;
-	/** Its path and query, for an entry with no state of ours. */
-	let rendered = here();
+	/** Its URL without the hash: for an entry with no state of ours, and to resolve links while `away`. */
+	let rendered = bare(L);
 	/** The entry a same-page hash link is leaving, until its popstate: the jump's scroll is not its own. */
-	let frozen: number | undefined;
+	let frozen = 0;
+	/**
+	 * A Back or Forward to another page is on its way: the entry in the
+	 * address bar is not the one on screen, so nothing is written into it,
+	 * and a link or form on screen is read against the page it belongs to.
+	 */
+	let away: unknown;
 	const ys = new Map<number, number>();
 	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: cur, p: page, y } }, "", url);
+	/** The scroll of the page on screen, into its entry: a reload, or a return after the document is gone, comes back to it. */
+	const save = () => away || cur == frozen || put(scrollY);
 	// The browser restores scroll, on a reload too, until a swap makes the
 	// entries manual. A reload keeps that, and leaves the scroll to us: now,
 	// and again at load (images, fonts) unless the visitor scrolled meanwhile.
 	const y0 = st()?.y;
 	put(y0);
 	if (y0 && HI.scrollRestoration == "manual") {
-		scrollTo(0, y0);
+		go(y0);
 		const at = scrollY;
-		on("load", () => scrollY == at && scrollTo(0, y0));
+		on("load", () => scrollY == at && go(y0));
 	}
-	on("scroll", () => cur != frozen && ys.set(cur, scrollY), PASSIVE);
-	on("pagehide", () => {
-		if ((st()?.id ?? cur) == cur) put(scrollY);
-		cache.clear();
-	});
+	let saving: ReturnType<typeof setTimeout>;
+	on(
+		"scroll",
+		() => {
+			cur == frozen || ys.set(cur, scrollY);
+			// Into the entry too, once the scroll settles: Back or Forward leaves
+			// it with no event of its own, and the document may be gone before
+			// the visitor returns. A hover's prefetch waits no more.
+			forget();
+			clearTimeout(saving);
+			saving = setTimeout(save, 200);
+		},
+		PASSIVE,
+	);
+	// A replaceState in pagehide is lost on a reload; one in beforeunload is kept.
+	on("beforeunload", save);
+	on("pagehide", () => (save(), cache.clear()));
 	// Back from the back/forward cache after a visit became a real load: no
 	// longer loading, and a loading timer frozen with the page must not fire.
 	on("pageshow", (e: PageTransitionEvent) => e.persisted && idle());
 	on("popstate", () => {
 		const s = st();
 		const y = s && (ys.get(s.id) ?? s.y);
-		const same = s ? s.p == page : frozen != null || here() == rendered;
+		const same = s ? s.p == page : frozen || bare(L) == rendered;
 		// Whatever was on its way is over: this entry is what shows now.
 		++seq;
 		idle();
-		frozen = undefined;
-		if (!same) return visit(L.href, { history: "none", scroll: y });
+		frozen = 0;
+		if ((away = !same)) return visit(L.href, { history: "none", scroll: y });
 		// The same page (a hash link's entry, or one made from this page): the
 		// scroll the entry had, else its hash target, else where it is.
-		if (s) cur = s.id;
-		else (cur = ++id), put();
-		y != null ? scrollTo(0, y) : anchor(L)?.scrollIntoView();
+		s ? (cur = s.id) : ((cur = ++id), put());
+		y != null ? go(y) : anchor(L)?.scrollIntoView(INSTANT);
 	});
 
 	// --- which clicks and forms -----------------------------------------
@@ -422,26 +471,37 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 		u.origin == L.origin &&
 		!flag(el, "reload") &&
 		!/\.(?!html?$)\w+$/i.test(u.pathname);
+	/** A target other than this tab: the element's own, else `<base target>`. */
+	const other = (t?: string | null) => (t ||= D.querySelector("base")?.target) && t != "_self";
 	const link = (e: Event, click?: 1) => {
 		const a = (e.target as Element).closest?.("a[href]");
-		if (!(a instanceof HTMLAnchorElement) || (a.target && a.target != "_self") || a.hasAttribute("download")) return;
-		const u = new URL(a.href);
+		// A link in an editor is not followed: a click there places the caret.
+		if (!(a instanceof HTMLAnchorElement) || a.isContentEditable || other(a.target) || a.hasAttribute("download")) return;
+		// Read against the page it belongs to, while `away`.
+		const u = new URL(a.getAttribute("href")!, away ? rendered : D.baseURI);
 		// The same page with a hash is the browser's own jump to an anchor, and
 		// the scroll it makes belongs to the entry it pushes: the one left keeps
 		// where it is now.
-		if (bare(u) == bare(L) && u.href.includes("#")) {
+		if (!away && bare(u) == bare(L) && u.href.includes("#")) {
 			if (click) ys.set((frozen = cur), scrollY);
 			return;
 		}
-		return ok(a, u) ? a : undefined;
+		return ok(a, u) && ([a, u] as const);
 	};
+	/**
+	 * Where the last click with a modifier landed (null after a plain one): a
+	 * submit from that button opens where the browser says (a new tab, a
+	 * window). Kept per element, so a link opened in a new tab holds back no
+	 * later submit.
+	 */
+	let mod: unknown;
 	// On window, bubbling: after every listener on the document, so one that
 	// called preventDefault always wins.
 	on("click", (e: MouseEvent) => {
-		const a = !e.defaultPrevented && !e.button && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && link(e, 1);
+		const a = !(e.defaultPrevented || e.button || (mod = ((e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && e.target) || null)) && link(e, 1);
 		if (a) {
 			e.preventDefault();
-			visit(a.href);
+			visit(a[1]);
 		}
 	});
 	on("submit", (e: SubmitEvent) => {
@@ -449,12 +509,20 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 		const form = e.target as HTMLFormElement;
 		const by = e.submitter;
 		const attr = (n: string) => by?.getAttribute("form" + n) ?? form.getAttribute(n);
-		const target = attr("target");
-		if (e.defaultPrevented || (attr("method") || "get").toLowerCase() != "get" || (target && target != "_self")) return;
-		const u = new URL(attr("action") || "", D.baseURI);
+		// A query in another encoding than UTF-8 is the browser's to write.
+		if (
+			e.defaultPrevented ||
+			by?.contains(mod as Node) ||
+			/post|dialog/i.test(attr("method")!) ||
+			other(attr("target")) ||
+			/[^utf8-]/i.test(attr("accept-charset") || "")
+		)
+			return;
+		const u = new URL(attr("action") || "", away ? rendered : D.baseURI);
 		if (!ok(form, u) || (by && !ok(by, u))) return;
-		// A file goes as its name, as the browser sends it in a query.
-		u.search = new URLSearchParams([...new FormData(form, by)].map(([k, v]) => [k, (v as File).name ?? v])).toString();
+		// A file goes as its name, and a line break as CRLF, as the browser sends them in a query.
+		u.search =
+			"" + new URLSearchParams([...new FormData(form, by)].map(([k, v]) => [k, (v as File).name ?? (v as string).replace(/\r?\n/g, "\r\n")]));
 		e.preventDefault();
 		visit(u);
 	});
@@ -462,20 +530,26 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	// --- prefetch -------------------------------------------------------
 	const cache = new Map<string, { t: number; p: Promise<Answer | undefined> }>();
 	let flying = 0;
-	/** Paths whose route is not navigable, or that are no page: a real load from now on, never prefetched. */
+	/**
+	 * Paths whose route is not navigable, that are no page, or that another
+	 * server answers (no natsu header at all: a blog behind the same proxy):
+	 * a real load from now on, never prefetched.
+	 */
 	const refused = new Set<string>();
 	/** The server's `navigate.prefetch: false`. */
-	const quiet = OFF.test(META!.getAttribute("data-prefetch")!);
+	const quiet = OFF.test(META!.dataset.prefetch!);
 	const get = (u: URL, pre?: 1) =>
-		fetch(bare(u), { headers: { "Natsu-Nav": KEY!, ...(pre && { "Natsu-Prefetch": "1" }) } }).then(async (r): Promise<Answer> => {
-			if (/^(route|response)$/.test(r.headers.get("natsu-reload")!)) refused.add(u.pathname);
-			return [r, await r.text()];
-		});
+		fetch(bare(u), { headers: { "Natsu-Nav": KEY!, ...(pre && { "Natsu-Prefetch": "1" }) } }).then(
+			async (r): Promise<Answer> => (
+				(/^(route|response)$/.test(r.headers.get("natsu-reload")!) || !/natsu-/.test("" + [...r.headers.keys()])) && refused.add(u.pathname),
+				[r, await r.text()]
+			),
+		);
 	/** A cached answer young enough to use, taken out of the cache. */
 	const fresh = (k: string) => {
 		const hit = cache.get(k);
 		cache.delete(k);
-		return hit && Date.now() - hit.t < 1e4 ? hit : undefined;
+		return (Date.now() - hit?.t! < 1e4 && hit) as typeof hit;
 	};
 	const prefetch = (url: string | URL) => {
 		const u = new URL(url, L.href);
@@ -489,27 +563,27 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 		const drop = (): undefined => void cache.delete(k);
 		cache.set(k, {
 			t: Date.now(),
-			// Kept: a 200 part, or a 204 that says reload or go elsewhere, which
-			// the click acts on as it is. A skip stays as no answer, so hovers stop
-			// asking and the click fetches; anything else goes.
+			// Kept: a 200 part, or an answer that says reload or go elsewhere,
+			// which the click acts on as it is. Anything else (a skip, a 404
+			// part) stays as no answer, so hovers stop asking and the click
+			// fetches; a network error goes.
 			p: get(u, 1)
 				.then((a) => {
 					const x = a[0].headers;
-					if (x.has("natsu-part") ? a[0].status == 200 : x.has("natsu-reload") || x.has("natsu-location")) return a;
-					if (!x.has("natsu-prefetch")) drop();
+					if (x.has("natsu-part") ? a[0].status == 200 : !x.has("natsu-prefetch")) return a;
 				}, drop)
 				.finally(() => flying--),
 		});
-		if (cache.size > 5) cache.delete(cache.keys().next().value!);
+		if (cache.size > 5) cache.delete([...cache.keys()][0]!);
 	};
 	let over: Element | undefined;
 	let dwell: ReturnType<typeof setTimeout>;
 	const intent = (e: Event) => {
 		const a = link(e);
-		if (!a || a == over) return;
-		over = a;
+		if (!a || a[0] == over) return;
+		over = a[0];
 		clearTimeout(dwell);
-		dwell = setTimeout(() => flag(a, "prefetch") == false || prefetch(a.href), 65);
+		dwell = setTimeout(() => flag(a[0], "prefetch") == false || prefetch(a[1]), 65);
 	};
 	const forget = () => {
 		clearTimeout(dwell);
@@ -521,7 +595,6 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	on("pointerover", intent, PASSIVE);
 	on("pointerout", (e: PointerEvent) => over && !over.contains(e.relatedTarget as Node) && forget());
 	on("pointercancel", forget);
-	on("scroll", forget, PASSIVE);
 
 	// --- visit ----------------------------------------------------------
 	let seq = 0;
@@ -534,7 +607,8 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	 * download, a 204) must not leave the mark on it.
 	 */
 	const full = (u: URL, h?: string) => (idle(), h == "none" ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
-	const ids = (els: Element[]) => els.map((e) => e.id).join(" ");
+	/** The regions' ids in order, each closed by a space, which no id holds. */
+	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
 	const href = (l: Element) => l.getAttribute("href");
 
@@ -552,8 +626,7 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 		const n = ++seq;
 		// A hover's pending prefetch would only fetch the same page twice; and
 		// the link it holds may be in a region about to go, which it would keep.
-		clearTimeout(dwell);
-		over = undefined;
+		forget();
 		clearTimeout(timer);
 		timer = setTimeout(() => H.setAttribute(LOADING, ""), 300);
 		let a: Answer | undefined;
@@ -578,10 +651,8 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 		if (to) {
 			const v = new URL(to, u);
 			v.hash ||= u.hash;
-			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: (o.hops ?? 0) + 1 };
-			if (v.origin == L.origin && next.hops! < 6) return visit(v, next);
-			if (DEV) why("redirect to", v.href);
-			return full(v, next.history);
+			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: -~o.hops! };
+			return next.hops! < 6 ? visit(v, next) : (DEV && why("redirect to", v.href), full(v, next.history));
 		}
 		if (!head.has("natsu-part")) {
 			if (DEV) why(head.get("natsu-reload") ?? "not a part", u.href);
@@ -598,13 +669,13 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 			for (const e of doc.querySelectorAll("noscript")) e.remove();
 			// A nonce in the part's head is the real one, and Natsu-Nonce lists the
 			// ones the server vouched for. Those read "" (as a live element shows its
-			// hidden nonce, so the merge sees an unchanged one as unchanged) and get
-			// the boot nonce if they go in; any other nonce goes.
+			// hidden nonce, so the merge sees an unchanged one as unchanged) and
+			// carry the boot nonce, the only one the CSP takes, if they go in; any
+			// other nonce goes.
 			const vouched = (head.get("natsu-nonce") || "").split(" ");
-			const trusted = new Set<Element>();
-			for (const e of doc.head.querySelectorAll("[nonce]")) {
+			for (const e of doc.head.querySelectorAll<HTMLElement>("[nonce]")) {
 				const v = e.getAttribute("nonce");
-				if (v && vouched.includes(v)) e.setAttribute("nonce", ""), trusted.add(e);
+				if (v && vouched.includes(v)) e.setAttribute("nonce", ""), (e.nonce = NONCE);
 				else e.removeAttribute("nonce");
 			}
 			// The page's scripts come from Natsu-Scripts, never from markup: each
@@ -617,9 +688,13 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 			const now = regions(D);
 			const next = regions(doc);
 			// DOMParser leaves a declarative shadow root an inert <template>; a real load attaches it.
-			const shadow = doc.querySelector("template[shadowrootmode]");
-			if (ids(now) != ids(next) || shadow) {
-				if (DEV) why(...(shadow ? ["a declarative shadow root in a region:", shadow] : ["regions differ:", ids(now), "->", ids(next)]));
+			if (ids(now) != ids(next) || doc.querySelector("template[shadowrootmode]")) {
+				if (DEV)
+					why(
+						...(ids(now) != ids(next)
+							? ["regions differ:", now.map((e) => e.id), "->", next.map((e) => e.id)]
+							: ["a declarative shadow root in a region:", doc.querySelector("template[shadowrootmode]")]),
+					);
 				return full(u, h);
 			}
 
@@ -637,12 +712,12 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 						if (x) {
 							const c = D.importNode(l);
 							c.setAttribute("href", x);
-							if (trusted.has(l)) c.nonce = NONCE;
+							c.nonce = l.nonce;
 							adds.push(c);
 						}
-			let fine: unknown = 1;
-			if (adds[0])
-				fine = await new Promise((y) => {
+			const fine =
+				!adds[0] ||
+				(await new Promise<unknown>((y) => {
 					let left = adds.length;
 					// Settled (every load, an error, or four seconds, a failure too): the
 					// handlers and the timer go, or they would keep this whole visit
@@ -664,9 +739,9 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 						try {
 							if (l.sheet!.cssRules) done(l);
 						} catch {}
-				});
+				}));
 			if (n != seq || !fine) {
-				for (const l of adds) l.remove();
+				adds.forEach((l) => l.remove());
 				if (DEV && n == seq) why("a stylesheet did not load", u.href);
 				return n == seq ? full(u, h) : undefined;
 			}
@@ -682,32 +757,27 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 				// From here the runtime restores this document's scroll, so the
 				// browser must not: on the entry left, and on the entries after it.
 				HI.scrollRestoration = "manual";
-				// The entry left keeps its scroll and its page; the one shown gets a new page.
-				if (!h) put(ys.get(cur));
+				// The entry left keeps its scroll and its page (unless it is not the
+				// one on screen: a Back on its way); the one shown gets a new page.
+				h || away || put(ys.get(cur));
 				page = ++id;
-				if (h) {
-					// An entry reached by back/forward keeps its id; one with no state
-					// of ours (a script wrote it) is given one.
-					if (h == "none") cur = st()?.id ?? ++id;
-					put(undefined, f.href);
-				} else HI.pushState({ natsu: { id: (cur = ++id), p: page } }, "", f.href);
-				rendered = here();
+				// An entry replaced (one reached by back/forward too) keeps its id;
+				// one with no state of ours (a script wrote it) is given one.
+				cur = (h && st()?.id) || ++id;
+				h ? put(undefined, f.href) : HI.pushState({ natsu: { id: cur, p: page } }, "", f.href);
+				away = 0;
+				rendered = bare(f);
 				// The head: what is in both stays, what went away goes, what is new comes in.
 				const incoming = new Map<string, Element>();
-				for (const e of doc.head.children) if (e.localName != "script" && !e.matches(SHEET)) incoming.set(e.outerHTML, e);
+				for (const e of doc.head.children) if (!e.matches("script," + SHEET)) incoming.set(e.outerHTML, e);
 				for (const e of owned) {
 					if (e.matches(SHEET) ? keep.includes(href(e)) : incoming.delete(e.outerHTML)) continue;
 					// A lazy half that the page's own loader linked goes with its sheet.
-					const later = e.getAttribute(LATER);
-					if (later) D.head.querySelector(`link[href="${later}"]`)?.remove();
+					D.head.querySelector(`link[href="${e.getAttribute(LATER)}"]`)?.remove();
 					e.remove();
 					owned.delete(e);
 				}
-				for (const e of [...adds, ...incoming.values()]) {
-					owned.add(e);
-					// The CSP takes only the boot nonce, and only on what the server vouched for.
-					if (trusted.has(e)) (e as HTMLElement).nonce = NONCE;
-				}
+				for (const e of [...adds, ...incoming.values()]) owned.add(e);
 				D.head.append(...incoming.values());
 				// Focus inside a region going out: refresh() gives it back to its namesake.
 				const was = D.activeElement;
@@ -717,24 +787,23 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 					el.replaceWith(next[i]!);
 				});
 				const s = o.scroll;
-				if (s == "keep") fid && D.getElementById(fid)?.focus({ preventScroll: true });
+				if (s == "keep") fid && D.getElementById(fid)?.focus(QUIET);
 				else {
 					const t = anchor(f);
 					// A y (back/forward), else the hash target, else the top.
-					if (t && s == null) t.scrollIntoView();
-					else scrollTo(0, +s! || 0);
+					t && s == null ? t.scrollIntoView(INSTANT) : go(+s! || 0);
 					const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);
 					const auto = pick("[autofocus]");
 					const el = auto || pick("h1") || (next[0] as HTMLElement);
 					if (!auto && !el.hasAttribute("tabindex")) el.tabIndex = -1;
-					el.focus({ preventScroll: true });
+					el.focus(QUIET);
 					status!.textContent = D.title;
 				}
 			};
 			if (
 				H.hasAttribute("data-natsu-transition") &&
 				D.startViewTransition &&
-				D.visibilityState == "visible" &&
+				!D.hidden &&
 				!matchMedia("(prefers-reduced-motion: reduce)").matches
 			)
 				await D.startViewTransition(swap).updateCallbackDone;
@@ -742,8 +811,9 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 			if (n != seq) return;
 			idle();
 
-			// Mounts allowed here, then the scripts this document has not run, in order.
-			list = new Set(scripts.map((s) => s[0]));
+			// Mounts allowed here, then the scripts this document has not run (one
+			// a loader added before the visit began has run), in order.
+			list = scripts.map((s) => s[0]);
 			for (const el of next) mountIn(el);
 			await Promise.all(
 				scripts.map(
@@ -751,18 +821,25 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 						loaded.has(src) ||
 						new Promise((y) => {
 							const c = D.createElement("script");
-							p.forEach((v, k) => k != "nonce" && c.setAttribute(k, v));
-							c.async = false;
 							// One the server vouched for gets the boot nonce; any other is left
 							// to the page's CSP, exactly as on a full load.
-							if (p.has("nonce")) c.nonce = NONCE;
+							p.forEach((v, k) => (k == "nonce" ? (c.nonce = NONCE) : c.setAttribute(k, v)));
+							c.async = false;
 							loaded.add(src);
-							if (!p.has("data-natsu-once")) listed.push(c);
-							c.onload = c.onerror = y;
+							// One the browser never runs (nomodule, a consent-gated type) fires no event.
+							runs(c) ? (c.onload = c.onerror = y) : y(0);
 							D.body.append(c);
 						}),
 				),
 			);
+			if (n != seq) return;
+			// A script that never called mount (a new one waiting for
+			// DOMContentLoaded, say, which never comes again) left this page
+			// unbound: load it for real, which runs it as it expects.
+			if (unbound()) {
+				if (DEV) why([...listed].filter(blind), "never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)");
+				return L.reload();
+			}
 			fire("load", { url: f.href, regions: next });
 		} catch (e) {
 			if (begun) throw e;
@@ -774,4 +851,10 @@ if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState
 	api.visit = visit;
 	api.refresh = () => visit(L.href, { history: "replace", scroll: "keep" });
 	api.prefetch = prefetch;
+}
+// Last, so that a runtime added after load boots with all of the above set up.
+if (!first) {
+	D.addEventListener("DOMContentLoaded", boot);
+	on("load", boot);
+	if (D.readyState == "complete") boot();
 }

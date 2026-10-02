@@ -378,14 +378,21 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("an unconverted script makes the next click a full load", async () => {
+	e2e("an unconverted script gets its page loaded for real, and makes the next click a full load", async () => {
 		const page = await open("/a");
+		const start = fixture.seen.length;
 		await page.click("#to-legacy");
-		await title(page, "Legacy");
-		expect(await page.evaluate(() => [(window as any).__legacy, (window as any).__loads])).toEqual([1, 1]);
+		// Swapped in, its new script ran and never called natsu.mount (one that waits
+		// for DOMContentLoaded, which never comes again, would leave the page dead):
+		// the page is loaded again, for real, and the script runs once in it.
+		await page.waitForFunction(() => document.title === "Legacy" && (window as any).__loads === 2);
+		expect(await page.evaluate(() => (window as any).__legacy)).toBe(1);
+		// A part first (a hover may have asked for it already), then the page.
+		expect(asked(start, "/legacy").map((a) => a[0])).toContain("part");
+		expect(asked(start, "/legacy").at(-1)).toEqual(["page", "load"]);
 		const from = fixture.seen.length;
 		await page.click("#to-a");
-		await page.waitForFunction(() => document.title === "A" && (window as any).__loads === 2);
+		await page.waitForFunction(() => document.title === "A" && (window as any).__loads === 3);
 		expect(await h1(page)).toBe("Page A");
 		expect(asked(from, "/a")).toEqual([["page", "load"]]);
 		expect(fixture.seen.slice(from).every((s) => s.nav === null)).toBe(true);
