@@ -132,6 +132,8 @@ app.use(assets.middleware());
 
 Routes.get("/products/:id", navigable(showProduct));
 Routes.get("/checkout/review", navigable(review, { prefetch: false }));
+Routes.get("/shop", navigable("Shop@index"));    // or @Navigable() on a decorated method
+Routes.get("/api/bell", island(bell));           // fills <span data-natsu-island="/api/bell">
 ```
 
 ```html
@@ -142,13 +144,18 @@ Routes.get("/checkout/review", navigable(review, { prefetch: false }));
 That is all an app writes on the server. `src/navigate.ts` holds the rest; it
 runs inside `Assets.middleware()`, which is what makes the order right with no
 rule to follow: after the asset rewrite, so a part links its whole page's CSS
-chunk, and inside `compress()`, which still sees a string.
+chunk, and inside `compress()`, which still sees a string. How to turn it on
+and what to change in an app: `v2/docs/page-navigation.md`.
 
-**Every page with a region** goes out with
-`<meta name="natsu" content="doc.shell">` and the runtime's
-`<script src nonce defer>` before `</head>`, the nonce read from that
-response's CSP (after any PageCache fill). The two hashes are what a swap
-cannot change:
+**Every page with a head** gets the runtime's `<script src nonce defer>`
+before the head's first deferred script (one with a `src`, or a module), or
+before `</head>`, with the nonce the response's CSP lets scripts run by,
+read after any PageCache fill so it is this visitor's. **Every page with a
+region** also gets `<meta name="natsu" content="doc.shell">` beside it
+(`data-prefetch="off"` with `navigate.prefetch: false`). A page PageCache
+answered and handed to `assets.markRewritten(ctx, page)` is read once while
+it is kept, and each answer is built from its pieces with the tags in
+place. The two hashes are what a swap cannot change:
 
 | Hash | Over | So a real load when |
 | --- | --- | --- |
@@ -167,23 +174,34 @@ to the ones the document on screen has); Set-Cookie always passes through.
 
 | Answer | When |
 | --- | --- |
-| `200` (or the page's 403/404/500), `Natsu-Part: 1`: the head less its scripts, the regions, the script list | the page has regions and both hashes match |
-| `204`, `Natsu-Location: <url>` | the route redirected; a target on the same site is sent as a path |
+| `200` (or the page's 403/404/500), `Natsu-Part: 1`: the head less its scripts, and the regions; the scripts in `Natsu-Scripts`, the head's nonces in `Natsu-Nonce` | the page has regions and both hashes match |
+| `204`, `Natsu-Location: <url>` | the route redirected; a target on the same site is sent as a path (`/.//x` for one that starts with `//`), one that is not http(s) is a reload |
 | `204`, `Natsu-Reload: route` | the route is not `navigable()` (its handler never ran), or it called `ctx.nav.reload()` |
 | `204`, `Natsu-Reload: document` / `shell` | a hash differs |
-| `204`, `Natsu-Reload: regions` | the page has no usable region (none, no id, nested, unclosed) |
+| `204`, `Natsu-Reload: regions` | the page has no usable region (none, no id, nested, unclosed, in the head, holding a declarative shadow root) |
 | `204`, `Natsu-Reload: response` | not a page: JSON, a download, a static file, no route |
 | `204`, `Natsu-Reload: inline-script` | a region holds a script that would not run when swapped in |
 | `204`, `Natsu-Prefetch: skip` | a prefetch the route or `ctx.nav.skip()` refused |
 
-The script list is every `<script src>` outside the head and the regions,
-and only those whose nonce is this response's: the runtime creates them
-itself, so markup that slipped into a page never becomes a trusted script.
-A nonce on anything else in the part's head (an inline `<style>`, a
-preload) goes out as `nonce=""` when it is this response's and is dropped
-when not: that is how the browser shows the live element once it hides its
-nonce, so the runtime's merge keeps an unchanged element, and gives a new
-one the document's own nonce.
+Nothing in a part's markup is trusted, because a browser can read a page
+differently from the scanner (a stray end tag, foreign content), and markup
+that slipped into a page must not ride along into trust. The part holds no
+`<script>` at all: `Natsu-Scripts` lists every `<script src>` outside the
+head and the regions, one entry of URL-encoded attributes each, the
+runtime's own left out. Under a nonce CSP an entry gets a `nonce` key (the
+runtime gives that script the document's nonce) only if the page gave it
+this response's nonce; one without is dropped under `'strict-dynamic'` (a
+script the runtime makes would run whatever its host) and listed without
+the key otherwise, so the CSP's host list decides, as on a full load. A
+page listing more than a header carries is a full load. In the part's head
+a nonce keeps its value when it is this response's and is removed when not
+(bare ones too); the response's nonces go in `Natsu-Nonce`, and the runtime
+trusts an element only by a value no markup could know in advance.
+
+An island fetch (`Natsu-Island: 1`) reaches only a route made with
+`island()`, whose answer says `Natsu-Island: 1` back; any other route
+answers `204` without running, so an attribute slipped into user content
+cannot pull a page's forms and CSRF token into another page.
 
 **In a handler**, `ctx.nav` refuses, it never changes what is drawn:
 
@@ -195,9 +213,11 @@ ctx.nav.shown(() => ctx.deleteCookie("flash"));           // only once the visit
 
 On a request that is not a navigation `skip`, `reload` and `stale` return
 false and `shown` runs at once. A route's CSP has to be on the response by
-the time `Assets.middleware()` sees it (set by the handler, or by middleware
-registered after Assets). In development every refusal is logged with its
-reason, and a shell change with the first line that changed.
+the time `Assets.middleware()` sees it (set by the handler, by middleware
+registered after Assets, or by one that sets it before calling `next()`);
+in development a page whose scripts carry nonces without one is named. In
+development every refusal is logged with its reason, and a shell change
+with the first line that changed.
 
 **In the browser** the runtime (`src/client/navigate.ts`, about 3.9 KB
 brotli; its types, `NatsuClient` and the event details, in

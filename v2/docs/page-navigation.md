@@ -77,26 +77,39 @@ natsu.mount("[data-clock]", (el, signal) => {
   in the head: the runtime is placed before the head's first deferred
   script, so `natsu` exists when they run. A classic script without `defer`
   runs before the runtime; guard it with `window.natsu &&`.
-- Call `natsu.mount` at the top level of the script. A script on the page
-  that never calls it makes the next visit a full load, so a page you have
-  not converted keeps behaving as it always did. A script that needs no
-  mount (analytics, a polyfill) says so with `data-natsu-once`.
+- Call `natsu.mount` at the top level of the script. Every script the page
+  ran counts, inline, module, `defer` or `async`, and one that never calls
+  it makes the next visit a full load, so a page you have not converted
+  keeps behaving as it always did (the console names the script). A script
+  that needs no mount (analytics, a tag manager, a polyfill) says so with
+  `data-natsu-once`; a script that such a script adds later counts too, so
+  tag it where it is created. Left out: data blocks, `nomodule`, and a
+  classic script in the head without `defer` or `async`, which runs once
+  per document like the shell.
 - Scripts inside a region do not run when the region is swapped in, so a
   page with one is a full load: move it after the region. Data blocks
   (`type="application/json"`, JSON-LD) are fine.
 
-Also on `window.natsu`: `visit(url)`, `refresh()` (draw the current page
-again after an action, scroll and focus kept), `prefetch(url)` and
-`island(el)`. Events on `document`: `natsu:visit` (cancelable),
+Also on `natsu` (a global): `visit(url, { history, scroll })`, `refresh()`
+(draw the current page again after an action, scroll and focus kept),
+`prefetch(url)` and `island(el)`. Events on `document`: `natsu:visit`
+(cancelable; a cancelled Back or Forward loads the page for real),
 `natsu:before-swap`, and `natsu:load`, once per page shown (at boot and
-after each visit).
+after each visit) with `detail: { url, regions }`.
+
+In TypeScript, the types are in natsu's `src/client/types.ts`
+(`NatsuClient`, `NatsuVisitOptions`, `NatsuVisitDetail`,
+`NatsuLoadDetail`); a type import of that file also declares the `natsu`
+global and the events. They are not exported from natsu's main entry, which
+would bring the DOM's types into server code.
 
 Attributes:
 
 | Attribute | Effect |
 | --- | --- |
-| `data-natsu-reload` on a link, a form or any ancestor | always a real load |
-| `data-natsu-prefetch="off"` | no hover prefetch for that link |
+| `data-natsu-reload` on a link, a form or any ancestor | always a real load; on `<html>`, for every visit from that page |
+| `data-natsu-prefetch="off"` on a link or any ancestor | no hover prefetch below it |
+| `data-natsu-once` on a script | needs no mount (see above) |
 | `data-natsu-island="/url"` | fill the element from an island route (below) |
 | `data-natsu-transition` on `<html>` | swap inside a view transition |
 
@@ -138,9 +151,9 @@ becomes a trusted script.
   added after the route has answered is one Assets never saw; the
   runtime's tag then has no nonce and the browser blocks it (pages still
   load, just never swap). In development natsu logs this.
-- Under Trusted Types (`require-trusted-types-for 'script'`), allow the
-  runtime's policy: `trusted-types natsu`. Without it the runtime stays
-  inert and every link loads for real.
+- Under Trusted Types (`require-trusted-types-for 'script'`) the runtime
+  cannot parse a part, so every visit is a full load and islands keep the
+  content the server drew; nothing breaks.
 
 ## PageCache
 
