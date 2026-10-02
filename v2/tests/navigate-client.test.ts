@@ -963,6 +963,28 @@ describe("mounts and scripts", () => {
 		expect(log).toEqual(["mount shell", "mount a", "abort a", "cleanup a", "mount b"]);
 	});
 
+	test("a mount whose element page code removed is stopped at the next swap, not kept forever", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/toast.js"], shell: LINKS + `<b data-toast>t</b>` }),
+			scripts: {
+				"/js/toast.js": (w) =>
+					w.natsu.mount("[data-toast]", (_: Element, signal: AbortSignal) => {
+						signal.addEventListener("abort", () => log.push("abort"));
+						return () => log.push("cleanup");
+					}),
+			},
+			routes: { "/b": () => answer(part({ scripts: ["/js/toast.js"] })), "/c": () => answer(part({ scripts: ["/js/toast.js"] })) },
+		});
+		p.document.querySelector("[data-toast]").remove();
+		p.click("#to-b");
+		await settle();
+		expect(log).toEqual(["abort", "cleanup"]);
+		p.click("#to-c");
+		await settle();
+		expect(log).toEqual(["abort", "cleanup"]);
+	});
+
 	test("mounts are scoped to the page's script list: two scripts on one selector, only the listed one binds", async () => {
 		const log: string[] = [];
 		const binder = (name: string) => (w: W) =>

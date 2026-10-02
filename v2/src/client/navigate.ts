@@ -197,10 +197,13 @@ const mountIn = (root: Element, only?: Reg) => {
 			}
 };
 
-/** Stop the mounts inside `root`, and on it unless `inner`. */
+/**
+ * Stop the mounts inside `root`, and on it unless `inner`; and any whose
+ * element page code took out of the document since, which nothing else stops.
+ */
 const unmount = (root: Element, inner?: 1) =>
 	(live = live.filter(([el, stop]) => {
-		if (!root.contains(el) || (inner && el == root)) return 1;
+		if ((!root.contains(el) || (inner && el == root)) && el.isConnected) return 1;
 		try {
 			stop();
 		} catch (e) {
