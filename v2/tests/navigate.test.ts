@@ -376,7 +376,7 @@ describe("the part", () => {
 				body: page({ nonce: n, csrf: t, main }),
 				status: 200,
 			}));
-			if (kept?.prepared) assets.markRewritten(ctx);
+			if (kept?.prepared) assets.markRewritten(ctx, kept);
 			return kept?.body;
 		};
 		new Router().get("/a", navigable(shared('<h1 class="card">A</h1>')));
@@ -965,7 +965,7 @@ describe("delivery", () => {
 			const nonce = crypto.randomUUID().replaceAll("-", "");
 			csp(ctx, nonce);
 			const kept = await pages.serve("/p", [nonce], async ([mark]) => ({ body: page({ nonce: mark }), status: 200 }));
-			if (kept?.prepared) assets.markRewritten(ctx);
+			if (kept?.prepared) assets.markRewritten(ctx, kept);
 			return kept?.body;
 		}));
 		for (let i = 0; i < 2; i++) {
@@ -976,6 +976,41 @@ describe("delivery", () => {
 			expect(html).not.toContain("natsu-secret-");
 		}
 		expect(pages.counts.fresh).toBe(1);
+	});
+
+	test("a kept page's answers are the fresh render's, byte for byte, secrets in the shell included", async () => {
+		const { assets, app } = await pipeline();
+		const pages = new PageCache({ prepare: (html) => assets.rewrite(html) });
+		const secrets = (ctx: Context) => [ctx.request.headers.get("x-nonce") ?? "", ctx.request.headers.get("x-visitor") ?? ""];
+		const draw = ([nonce, csrf]: readonly string[]) => page({ nonce, csrf, main: `<p class="card" data-n="${nonce}">${csrf}</p>` });
+		new Router().get("/fresh", navigable((ctx) => {
+			csp(ctx, secrets(ctx)[0]!);
+			return draw(secrets(ctx));
+		}));
+		new Router().get("/kept", navigable(async (ctx) => {
+			csp(ctx, secrets(ctx)[0]!);
+			const kept = await pages.serve("/kept", secrets(ctx), async (marks) => ({ body: draw(marks), status: 200 }));
+			if (kept?.prepared) assets.markRewritten(ctx, kept);
+			return kept?.body;
+		}));
+		// Changed after PageCache: the answer is read as it is.
+		new Router().get("/changed", navigable(async (ctx) => {
+			csp(ctx, secrets(ctx)[0]!);
+			const kept = await pages.serve("/kept", secrets(ctx), async (marks) => ({ body: draw(marks), status: 200 }));
+			if (kept?.prepared) assets.markRewritten(ctx, kept);
+			return kept?.body.replace("<h1", "<h1 data-changed");
+		}));
+		for (const visitor of ["alice-token", "bob-token", "alice-token"]) {
+			const headers = { "x-nonce": crypto.randomUUID().replaceAll("-", ""), "x-visitor": visitor };
+			const fresh = await (await get(app, "/fresh", headers)).text();
+			const kept = await (await get(app, "/kept", headers)).text();
+			expect(kept).toBe(fresh);
+			expect(metaKey(kept)).not.toBe("");
+			expect(kept).toContain(`nonce="${headers["x-nonce"]}" defer></script>`);
+			const changed = await (await get(app, "/changed", headers)).text();
+			expect(changed).toBe(fresh.replace("<h1", "<h1 data-changed"));
+		}
+		expect(pages.counts.rendered).toBe(1);
 	});
 
 	test("parts are compressed like pages; 204s are left alone", async () => {

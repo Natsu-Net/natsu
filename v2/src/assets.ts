@@ -50,6 +50,7 @@ import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
 import { type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
+import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
 
 export interface AssetsOptions {
 	/** Where built chunks are written. Created if it is not there. */
@@ -206,6 +207,8 @@ export class Assets {
 	private safelist: Array<string | RegExp> = [];
 	/** Answers whose page went through `rewrite` already (see markRewritten). */
 	private readonly rewritten = new WeakSet<Context>();
+	/** Answers PageCache filled from a page kept rewritten, and the body it gave. */
+	private readonly filled = new WeakMap<Context, { body: string; filled: Filled }>();
 	/** Page navigation, when the `navigate` option turns it on. */
 	private readonly navigation: Navigation | undefined;
 
@@ -299,9 +302,13 @@ export class Assets {
 	 * This answer's page went through `rewrite` already (a page kept rewritten,
 	 * see PageCache's `prepare`), so the middleware sends it as it is: a second
 	 * pass costs as much as the first, and renames what it already renamed.
+	 * Given the `page` PageCache answered, navigation reads the kept page once
+	 * rather than every answer (see `Navigation.fullFilled`).
 	 */
-	public markRewritten(ctx: Context): void {
+	public markRewritten(ctx: Context, page?: CachedPage): void {
 		this.rewritten.add(ctx);
+		const filled = page?.prepared ? filledOf(page) : undefined;
+		if (filled) this.filled.set(ctx, { body: page!.body, filled });
 	}
 
 	private pattern: RegExp | null | undefined;
@@ -488,7 +495,13 @@ export class Assets {
 			// happens to carry an asset path is not a page to rewrite.
 			if (typeof body !== "string" || !isDocument(ctx, body)) return;
 			const page = this.rewritten.has(ctx) ? body : this.rewrite(body);
-			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
+			if (!navigation) {
+				ctx.response.body = page;
+				return;
+			}
+			// Still the body PageCache gave (the same string, so this reads none of it)?
+			const kept = this.filled.get(ctx);
+			ctx.response.body = kept?.body === body ? navigation.fullFilled(ctx, page, kept.filled) : navigation.full(ctx, page);
 		};
 	}
 

@@ -48,6 +48,7 @@ import { addVary } from "./compress.ts";
 import { config } from "./config.ts";
 import type { Context, Handler } from "./context.ts";
 import { log } from "./logger.ts";
+import type { CachedPage, Filled } from "./page-cache.ts";
 
 export interface NavigateOptions {
 	/**
@@ -373,6 +374,8 @@ export class Navigation {
 	private readonly shells = new Map<string, string>();
 	/** Development only: paths already warned about, so a log is not a flood. */
 	private readonly warned = new Set<string>();
+	/** What `full` read off each kept page (see `fullFilled`). */
+	private readonly shapes = new WeakMap<CachedPage, Shape>();
 
 	constructor(options: NavigateOptions = {}) {
 		this.documentHeaders = [
@@ -516,31 +519,50 @@ export class Navigation {
 	 */
 	public full(ctx: Context, page: string): string {
 		addVary(ctx.response.headers, "Natsu-Nav");
-		if (page.indexOf(REGION_ATTRIBUTE) === -1) return page;
-		const scan = scanPage(page);
-		if (scan === null) return page;
+		const shape = shapeOf(page);
+		const tags = this.tags(ctx, shape, shape.shell, shape.hash);
+		return tags ? `${page.slice(0, shape.at)}${tags}${page.slice(shape.at)}` : page;
+	}
+
+	/**
+	 * `full` for `page`, an answer PageCache filled from a page it keeps
+	 * rewritten. The kept page is read once, not on every answer, and the
+	 * answer is built from its pieces: cutting `page` itself would copy it a
+	 * second time, which costs about as much as the rest of a hit.
+	 */
+	public fullFilled(ctx: Context, page: string, filled: Filled): string {
+		addVary(ctx.response.headers, "Natsu-Nav");
+		let shape = this.shapes.get(filled.page);
+		if (shape === undefined) {
+			const kept = filled.page.body;
+			shape = shapeOf(kept);
+			if (shape.at !== -1) shape = { ...shape, before: kept.slice(0, shape.at), after: kept.slice(shape.at) };
+			this.shapes.set(filled.page, shape);
+		}
+		// A secret outside the regions (a CSRF token in a header form) makes
+		// the shell this visitor's, and its hash too.
+		const shell = shape.shell === undefined ? undefined : filled.fill(shape.shell);
+		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!));
+		return tags ? filled.fill(shape.before!) + tags + filled.fill(shape.after!) : page;
+	}
+
+	/** The key and the runtime for a page of this shape; "" for none. */
+	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string): string {
+		if (shape.refusal && development() && this.warned.size < 256 && !this.warned.has(ctx.path)) {
+			this.warned.add(ctx.path);
+			log.warn(`[<yellow>navigate</yellow>] ${ctx.path}: no soft navigation from this page (${shape.refusal.reason}: ${shape.refusal.detail})`);
+		}
+		if (shape.at === -1) return "";
 		let tags = "";
-		if ("reason" in scan) {
-			if (development() && this.warned.size < 256 && !this.warned.has(ctx.path)) {
-				this.warned.add(ctx.path);
-				log.warn(`[<yellow>navigate</yellow>] ${ctx.path}: no soft navigation from this page (${scan.reason}: ${scan.detail})`);
-			}
-			// No key, so the runtime stays inert here: no soft visit from this
-			// page, but its scripts' mounts and its islands still work.
-			if (scan.reason === "response") return page;
-		} else {
-			const shellText = shellOf(page, scan);
-			const shell = hashOf(shellText);
-			if (development()) this.remember(shell, shellText);
-			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${shell}">`;
+		if (shell !== undefined) {
+			if (development()) this.remember(hash, shell);
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}">`;
 		}
 		if (this.inject && this.runtime) {
 			const nonce = cspNonces(header(ctx, "content-security-policy"))[0];
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
 		}
-		if (!tags) return page;
-		const at = "reason" in scan ? headCloseOf(page) : scan.head[2];
-		return at === -1 ? page : `${page.slice(0, at)}${tags}${page.slice(at)}`;
+		return tags;
 	}
 
 	/** The document key: the build and the document headers, nonces left out. */
@@ -634,6 +656,36 @@ export class Navigation {
 
 // --- reading a page --------------------------------------------------------------
 
+/** What `full` reads off a page: the same for every answer filled from one kept page. */
+interface Shape {
+	/** Where the tags go; -1 for a page that gets none. */
+	at: number;
+	/** The shell, for a page that gets a key, and its hash. */
+	shell: string | undefined;
+	hash: string;
+	/** Why a page with a region gets no key (development says so, once per path). */
+	refusal: { reason: string; detail: string } | undefined;
+	/** A kept page either side of `at` (see `fullFilled`). */
+	before?: string;
+	after?: string;
+}
+
+const NO_SHAPE: Shape = { at: -1, shell: undefined, hash: "", refusal: undefined };
+
+function shapeOf(page: string): Shape {
+	if (page.indexOf(REGION_ATTRIBUTE) === -1) return NO_SHAPE;
+	const scan = scanPage(page);
+	if (scan === null) return NO_SHAPE;
+	if ("reason" in scan) {
+		// No key, so the runtime stays inert here: no soft visit from this
+		// page, but its scripts' mounts and its islands still work.
+		return { at: scan.reason === "response" ? -1 : headCloseOf(page), shell: undefined, hash: "", refusal: scan };
+	}
+	const shell = shellOf(page, scan);
+	return { at: scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
+}
+
+
 interface Region {
 	id: string;
 	/** From the region's `<` to past its end tag's `>`. */
@@ -695,11 +747,12 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 	if (headEnd === 0) return { reason: "response", detail: "the page's </head> never ends" };
 
 	const regions: Region[] = [];
-	// The last `<` before the hit, found walking forward from the last one, and
-	// the tag read there: text that mentions the name a thousand times costs
-	// one walk over it, not a walk back from each mention.
+	// The tag a hit sits in starts at the last `<` before it. That `<` and the
+	// tag read there are kept until a `<` comes between two hits, so text that
+	// mentions the name a thousand times costs one walk over it, not a walk
+	// back from each mention.
 	let lt = -1;
-	let after = html.indexOf("<");
+	let after = 0;
 	let tag: Tag | null = null;
 	for (let hit = html.indexOf(REGION_ATTRIBUTE); hit !== -1; hit = html.indexOf(REGION_ATTRIBUTE, hit + REGION_ATTRIBUTE.length)) {
 		// An attribute is preceded by whitespace and followed by `=`, `>`, `/`
@@ -707,10 +760,8 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		if (!isSpace(html.charCodeAt(hit - 1)) || !isAttributeEnd(html.charCodeAt(hit + REGION_ATTRIBUTE.length))) continue;
 		if (inside(raw, hit)) continue;
 		if (after !== -1 && after < hit) {
-			while (after !== -1 && after < hit) {
-				lt = after;
-				after = html.indexOf("<", lt + 1);
-			}
+			lt = html.lastIndexOf("<", hit);
+			after = html.indexOf("<", hit);
 			tag = readTag(html, lt);
 		}
 		if (lt === -1 || !tag || tag.end <= hit || !tag.attributes.some((a) => a.at === hit && a.name === REGION_ATTRIBUTE)) continue;
@@ -902,17 +953,8 @@ export function cspNonces(csp: string | null): string[] {
 
 // --- the scanner's pieces ------------------------------------------------------------
 
-/**
- * Where a comment or an element whose insides the parser reads as text opens;
- * the name is captured, or undefined for a comment. One regular expression
- * rather than an `indexOf` per opener: it is one pass over the page, and
- * Bun's `indexOf` slows several times over on needles such as `<style` that
- * a page never holds.
- */
-const RAW_OPEN = /<(?:!--|(script|style|textarea|title)[\s/>])/gi;
-
-/** `<name` or `</name` as a tag, per tag name: what a region's end is found by. */
-const TAG_PATTERNS = new Map<string, RegExp>();
+/** Elements whose insides the parser reads as text, not markup. */
+const RAW_NAMES = ["script", "style", "textarea", "title"];
 
 /** No end tag, so never a region. */
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
@@ -949,52 +991,64 @@ function headCloseOf(html: string): number {
 	return open === -1 ? -1 : findTag(html, raw, "</head", open);
 }
 
-/** Comments and raw-text elements, as flat start/end pairs in document order. */
+/**
+ * Comments and raw-text elements, as flat start/end pairs in document order.
+ * One walk from `<` to `<`, looking at the character after each: about three
+ * times quicker than a regular expression over the page, and in any case, as
+ * browsers read tag names.
+ */
 function rawRanges(html: string): number[] {
 	const out: number[] = [];
-	const open = RAW_OPEN;
-	open.lastIndex = 0;
-	for (let match = open.exec(html); match !== null; match = open.exec(html)) {
-		const lt = match.index;
-		const name = match[1];
-		let end: number;
-		if (name === undefined) {
-			// `<!-->` and `<!--->` are whole comments, empty ones.
-			if (html.startsWith(">", lt + 4)) end = lt + 5;
-			else if (html.startsWith("->", lt + 4)) end = lt + 6;
-			else {
-				// A comment ends at `-->`, or at `--!>` as browsers also read it.
-				const close = html.indexOf("--", lt + 4);
-				end = html.length;
-				for (let at = close; at !== -1; at = html.indexOf("--", at + 1)) {
-					if (html.startsWith(">", at + 2)) end = at + 3;
-					else if (html.startsWith("!>", at + 2)) end = at + 4;
-					else continue;
-					break;
-				}
+	for (let lt = html.indexOf("<"); lt !== -1; ) {
+		const next = html.charCodeAt(lt + 1);
+		let end = -1;
+		if (next === 33) {
+			if (html.startsWith("--", lt + 2)) end = commentEnd(html, lt);
+		} else if ((next | 32) === 115 || (next | 32) === 116) {
+			for (const name of RAW_NAMES) {
+				if (!isTagEnd(html.charCodeAt(lt + 1 + name.length)) || !namedAt(html, lt + 1, name)) continue;
+				end = closeOf(html, name, html.indexOf(">", lt + name.length + 1));
+				break;
 			}
-		} else {
-			end = closeOf(html, name.toLowerCase(), html.indexOf(">", lt + name.length + 1));
+		}
+		if (end === -1) {
+			lt = html.indexOf("<", lt + 1);
+			continue;
 		}
 		out.push(lt, end);
-		open.lastIndex = end;
+		lt = html.indexOf("<", end);
 	}
 	return out;
 }
 
-/** `</name` end tags of the raw-text elements, in any case, as browsers read them. */
-const CLOSE_PATTERNS = new Map<string, RegExp>();
+/** Past the end of the comment opening at `lt`: `-->`, or `--!>` as browsers also read it; `<!-->` and `<!--->` are whole. */
+function commentEnd(html: string, lt: number): number {
+	if (html.startsWith(">", lt + 4)) return lt + 5;
+	if (html.startsWith("->", lt + 4)) return lt + 6;
+	for (let at = html.indexOf("--", lt + 4); at !== -1; at = html.indexOf("--", at + 1)) {
+		if (html.charCodeAt(at + 2) === 62) return at + 3;
+		if (html.startsWith("!>", at + 2)) return at + 4;
+	}
+	return html.length;
+}
 
-/** Past the `>` of the first `</name` end tag at or after `from`; the end of the page if there is none. */
+/** Whether the lower-case tag name `name` is spelled at `at`, in any case. */
+function namedAt(html: string, at: number, name: string): boolean {
+	for (let i = 0; i < name.length; i++) {
+		if ((html.charCodeAt(at + i) | 32) !== name.charCodeAt(i)) return false;
+	}
+	return true;
+}
+
+/** Past the `>` of the first `</name` end tag (any case) at or after `from`; the end of the page if there is none. */
 function closeOf(html: string, name: string, from: number): number {
 	if (from === -1) return html.length;
-	let pattern = CLOSE_PATTERNS.get(name);
-	if (!pattern) CLOSE_PATTERNS.set(name, (pattern = new RegExp(`</${name}[\\s/>]`, "gi")));
-	pattern.lastIndex = from;
-	const match = pattern.exec(html);
-	if (match === null) return html.length;
-	const gt = html.indexOf(">", match.index);
-	return gt === -1 ? html.length : gt + 1;
+	for (let at = html.indexOf("</", from); at !== -1; at = html.indexOf("</", at + 2)) {
+		if (!namedAt(html, at + 2, name) || !isTagEnd(html.charCodeAt(at + 2 + name.length))) continue;
+		const gt = html.indexOf(">", at);
+		return gt === -1 ? html.length : gt + 1;
+	}
+	return html.length;
 }
 
 /** The first `<name` (or `</name`) at or after `from` that is a tag outside raw text, or -1. */
@@ -1011,22 +1065,17 @@ function findTag(html: string, raw: number[], needle: string, from: number): num
  * -1 without one.
  */
 function endOf(html: string, raw: number[], name: string, from: number): number {
-	let pattern = TAG_PATTERNS.get(name);
-	if (!pattern) {
-		// Names are letters, digits and dashes (readTag), so nothing in one is a pattern.
-		pattern = new RegExp(`<(/?)${name}[\\s/>]`, "gi");
-		if (TAG_PATTERNS.size < 64) TAG_PATTERNS.set(name, pattern);
-	}
-	pattern.lastIndex = from;
 	let depth = 1;
-	for (let match = pattern.exec(html); match !== null; match = pattern.exec(html)) {
-		if (inside(raw, match.index)) continue;
-		if (match[1] === "") {
+	for (let at = html.indexOf("<", from); at !== -1; at = html.indexOf("<", at + 1)) {
+		const close = html.charCodeAt(at + 1) === 47;
+		const start = close ? at + 2 : at + 1;
+		if (!isTagEnd(html.charCodeAt(start + name.length)) || !namedAt(html, start, name) || inside(raw, at)) continue;
+		if (!close) {
 			depth++;
 			continue;
 		}
 		if (--depth === 0) {
-			const gt = html.indexOf(">", match.index);
+			const gt = html.indexOf(">", at);
 			return gt === -1 ? -1 : gt + 1;
 		}
 	}
