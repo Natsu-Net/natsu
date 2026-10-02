@@ -59,7 +59,8 @@
  *     `<noscript><style>` would otherwise become a live style.
  *  2. Its region ids must equal the current ones, in order.
  *  3. Its stylesheets go in before the current ones and must load first
- *     (four seconds at most). Every page's sheet is a slice of the same
+ *     (four seconds at most; one the memory cache had, readable as it goes
+ *     in, counts as loaded then). Every page's sheet is a slice of the same
  *     source in source order, so the old sheet, later in the cascade, keeps
  *     the old markup exactly as it was while the new one loads. A lazy half
  *     (`data-natsu-later`) loads too. There is no font step: in Chromium a

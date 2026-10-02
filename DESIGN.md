@@ -199,7 +199,7 @@ the time `Assets.middleware()` sees it (set by the handler, or by middleware
 registered after Assets). In development every refusal is logged with its
 reason, and a shell change with the first line that changed.
 
-**In the browser** the runtime (`src/client/navigate.ts`, about 3.2 KB
+**In the browser** the runtime (`src/client/navigate.ts`, about 3.3 KB
 brotli) is built by `Assets.build()` as the classic entry `natsu-navigate`,
 readable and with console lines saying why a visit was a full load when
 `General.development` is on. A page script that keeps state or listeners
