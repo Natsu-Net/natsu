@@ -119,7 +119,7 @@ for (const size of [19, 72, 282]) {
 		return `${html.slice(0, at)}<meta name="natsu" content="a.${shell}">${html.slice(at)}`;
 	});
 	const rewriteMs = time(() => assets.rewrite(raw), Math.max(10, RUNS >> 2));
-	const part = partOf(html, scan, "a.b", [NONCE]);
+	const part = partOf(html, scan, "a.b", [NONCE]).html;
 	const fullBr = brotli(html);
 	const partBr = brotli(part);
 	const brFullMs = time(() => brotli(html), Math.max(10, RUNS >> 2));

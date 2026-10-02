@@ -40,7 +40,7 @@ export interface PageCacheOptions {
 	 * Work done once on each page as it is kept rather than on every answer,
 	 * such as `(html) => assets.rewrite(html)`. Answers built from it say so
 	 * (`prepared`), so the step that would repeat it can skip them
-	 * (`assets.markRewritten(ctx)`).
+	 * (`assets.markRewritten(ctx, page)`).
 	 */
 	prepare?: (body: string) => string;
 }
@@ -68,6 +68,31 @@ export interface CachedPage {
  * this visitor only.
  */
 export type PageRender = (marks: readonly string[]) => Promise<CachedPage | null>;
+
+/**
+ * How an answer came out of a kept page, for a step after the route that
+ * would otherwise read the whole answer again (`Assets` adding navigation's
+ * tags to a page kept rewritten): it reads the kept page once instead, and
+ * builds each answer from its pieces.
+ */
+export interface Filled {
+	/** The kept page, with marks where this answer's secrets went. */
+	readonly page: CachedPage;
+	/**
+	 * `text`, a piece of the kept page (or text with no marks), with this
+	 * answer's secrets in place of its marks: the same string when it holds
+	 * none. Pieces put back together with `+` are copied once, when the
+	 * answer is read.
+	 */
+	fill(text: string): string;
+}
+
+const fills = new WeakMap<CachedPage, Filled>();
+
+/** How `answer`, a page `PageCache.serve` gave, was filled; undefined for any other page. */
+export function filledOf(answer: CachedPage): Filled | undefined {
+	return fills.get(answer);
+}
 
 interface Entry {
 	/** The page with marks where the secrets go. */
@@ -296,10 +321,29 @@ export class PageCache {
 	}
 
 	private fill(page: CachedPage, secrets: readonly string[]): CachedPage {
-		let body = page.body;
-		// split/join, not replaceAll: a `$&` in a secret is text, not a pattern.
-		for (const [index, secret] of secrets.entries()) body = body.split(`${this.mark}${index}.`).join(secret);
+		const fill = (text: string): string => this.fillText(text, secrets);
 		const { keep: _keep, ...answer } = page;
-		return { ...answer, body, ...(page.headers ? { headers: { ...page.headers } } : {}) };
+		const filled = { ...answer, body: fill(page.body), ...(page.headers ? { headers: { ...page.headers } } : {}) };
+		fills.set(filled, { page, fill });
+		return filled;
+	}
+
+	private fillText(text: string, secrets: readonly string[]): string {
+		// One split on what every mark starts with, then each piece starts with
+		// its mark's index. The pieces are joined with `+`, which copies nothing
+		// until the answer is read: a copy of a large page is most of a hit's
+		// cost, and a step that cuts the page to add to it (see `Filled`) builds
+		// from the kept page instead, so the page is copied once, as it goes
+		// out. Not replaceAll: a `$&` in a secret is text, not a pattern.
+		const pieces = text.split(this.mark);
+		if (pieces.length === 1) return text;
+		let body = pieces[0]!;
+		for (let i = 1; i < pieces.length; i++) {
+			const piece = pieces[i]!;
+			const dot = piece.indexOf(".");
+			const index = dot > 0 && dot < 7 ? Number(piece.slice(0, dot)) : Number.NaN;
+			body += Number.isInteger(index) && index < secrets.length ? secrets[index]! + piece.slice(dot + 1) : this.mark + piece;
+		}
+		return body;
 	}
 }
