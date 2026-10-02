@@ -119,6 +119,79 @@ per state scope, so a `global` store fans out with a single `server.publish`.
 Both directions default to closed. A field is read-only and a method is
 un-callable until the author opts in.
 
+## Page navigation
+
+A link click fetches only the part of the next page that changes, and a
+small runtime swaps it in. There is no client-side rendering: the server
+renders and caches the page exactly as it does for anyone, cuts the finished
+page, and sends HTML.
+
+```ts
+const assets = new Assets({ ...existing, navigate: true });
+app.use(assets.middleware());
+
+Routes.get("/products/:id", navigable(showProduct));
+Routes.get("/checkout/review", navigable(review, { prefetch: false }));
+```
+
+```html
+<main id="main" data-natsu-region>…</main>
+<footer id="site-footer" data-natsu-region>…</footer>
+```
+
+That is all an app writes on the server. `src/navigate.ts` holds the rest; it
+runs inside `Assets.middleware()`, which is what makes the order right with no
+rule to follow: after the asset rewrite, so a part links its whole page's CSS
+chunk, and inside `compress()`, which still sees a string.
+
+**Every page with a region** goes out with
+`<meta name="natsu" content="doc.shell">` and the runtime's
+`<script src nonce defer>` before `</head>`, the nonce read from that
+response's CSP (after any PageCache fill). The two hashes are what a swap
+cannot change:
+
+| Hash | Over | So a real load when |
+| --- | --- | --- |
+| `doc` | the build (a hash of the manifest) and CSP, CSP-Report-Only, Referrer-Policy, Permissions-Policy, COOP, COEP (`documentHeaders` adds more), nonces left out | a deploy, an ad network allowed on one page only, a checkout origin in `form-action` |
+| `shell` | every byte outside the head and the regions, less the script list and nonces, plus the region ids | a signed-in header, a re-minted CSRF token in the sign-out form, a banner |
+
+**A navigation** is a GET carrying `Natsu-Nav: <doc>.<shell>` (and
+`Natsu-Prefetch: 1` for a hover prefetch). natsu deletes both headers before
+any route runs, so neither a handler, a render nor a PageCache key can see
+them, and ignores them on any other method, on a browser navigation
+(`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) and when malformed.
+Every answer varies on `Natsu-Nav`; parts and 204s are `private, no-store`;
+Set-Cookie always passes through.
+
+| Answer | When |
+| --- | --- |
+| `200` (or the page's 403/404/500), `Natsu-Part: 1`: the head less its scripts, the regions, the script list | the page has regions and both hashes match |
+| `204`, `Natsu-Location: <url>` | the route redirected; a target on the same site is sent as a path |
+| `204`, `Natsu-Reload: route` | the route is not `navigable()` (its handler never ran), or it called `ctx.nav.reload()` |
+| `204`, `Natsu-Reload: document` / `shell` | a hash differs |
+| `204`, `Natsu-Reload: regions` | the page has no usable region (none, no id, nested, unclosed) |
+| `204`, `Natsu-Reload: response` | not a page: JSON, a download, a static file, no route |
+| `204`, `Natsu-Reload: inline-script` | a region holds a script that would not run when swapped in |
+| `204`, `Natsu-Prefetch: skip` | a prefetch the route or `ctx.nav.skip()` refused |
+
+The script list is every `<script src>` outside the head and the regions,
+and only those whose nonce is this response's: the runtime creates them
+itself, so markup that slipped into a page never becomes a trusted script.
+
+**In a handler**, `ctx.nav` refuses, it never changes what is drawn:
+
+```ts
+if (flashed && ctx.nav.skip()) return;                    // a prefetch must not eat the flash
+if (ctx.nav.stale(decision.responseHeaders)) return;      // CSP differs: leave before fetching data
+ctx.nav.shown(() => ctx.deleteCookie("flash"));           // only once the visitor sees this page
+```
+
+On a request that is not a navigation `skip`, `reload` and `stale` return
+false and `shown` runs at once. A route's CSP has to be on the response by
+the time `Assets.middleware()` sees it (set by the handler, or by middleware
+registered after Assets). In development every refusal is logged with its
+reason, and a shell change with the first line that changed.
+
 ## Defaults chosen where the request was open
 
 | Fork | Default chosen | Why |
