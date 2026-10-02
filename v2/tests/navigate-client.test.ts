@@ -357,13 +357,13 @@ describe("boot", () => {
 		expect(path(p)).toBe("/b");
 	});
 
-	test("natsu:load fires once at boot, from <body>", () => {
+	test("natsu:load fires once at boot, on document, with the URL and the regions", () => {
 		const p = open({ html: page(), ready: false });
-		const seen: string[] = [];
-		p.document.addEventListener("natsu:load", (e: Event) => seen.push((e.target as Element).localName));
+		const seen: unknown[] = [];
+		p.document.addEventListener("natsu:load", (e: W) => seen.push([e.target === p.document, e.detail.url, e.detail.regions.map((r: Element) => r.id)]));
 		p.ready();
 		p.window.dispatchEvent(new p.window.Event("load"));
-		expect(seen).toEqual(["body"]);
+		expect(seen).toEqual([[true, `${ORIGIN}/a`, ["main", "foot"]]]);
 	});
 
 	test("the entry gets an id and a page number; scroll restoration is the browser's until a swap makes the entries manual", async () => {
@@ -1183,7 +1183,7 @@ describe("mounts and scripts", () => {
 });
 
 describe("events and attributes", () => {
-	test("natsu:visit can cancel; natsu:before-swap comes before the swap; natsu:load bubbles from each new region after new scripts ran", async () => {
+	test("natsu:visit can cancel; natsu:before-swap comes before the swap; natsu:load comes once, on document, after new scripts ran", async () => {
 		const order: string[] = [];
 		const p = open({
 			html: page(),
@@ -1192,11 +1192,13 @@ describe("events and attributes", () => {
 		});
 		p.document.addEventListener("natsu:visit", (e: W) => e.detail.url.endsWith("/c") && e.preventDefault());
 		p.document.addEventListener("natsu:before-swap", () => order.push(`before-swap ${text(p, "main h1")}`));
-		p.document.addEventListener("natsu:load", (e: Event) => order.push(`load ${(e.target as Element).id}`));
+		p.document.addEventListener("natsu:load", (e: W) =>
+			order.push(`load ${e.target === p.document} ${e.detail.url} ${e.detail.regions.map((r: Element) => r.id).join(" ")} ${e.detail.regions[0].isConnected}`),
+		);
 		await p.natsu.visit("/c");
 		expect(p.calls).toEqual([]);
-		await p.natsu.visit("/b");
-		expect(order).toEqual(["before-swap Page A", "b.js ran", "load main", "load foot"]);
+		await p.natsu.visit("/b#x");
+		expect(order).toEqual(["before-swap Page A", "b.js ran", `load true ${ORIGIN}/b#x main foot true`]);
 	});
 
 	test("a cancelled natsu:visit: a click or visit() does nothing; a back/forward, whose URL already changed, reloads", async () => {

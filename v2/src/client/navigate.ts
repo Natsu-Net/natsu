@@ -281,7 +281,8 @@ const boot = () => {
 	}
 	if (status) D.body.append(status);
 	mountIn(D.body);
-	fire("load", D.body);
+	// One natsu:load per page shown, this one included: a page-view hook counts each once.
+	fire("load", D, { url: L.href, regions: [...D.querySelectorAll(REGION)] });
 };
 if (D.readyState == "complete") boot();
 else {
@@ -708,7 +709,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 						}),
 				),
 			);
-			for (const el of next) fire("load", el);
+			fire("load", D, { url: f.href, regions: next });
 		} catch (e) {
 			if (begun) throw e;
 			if (DEV) why("the part could not be read:", e);
