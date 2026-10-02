@@ -130,6 +130,8 @@ interface Open {
 	/** Stylesheet hrefs that fail, or never load. */
 	failCss?: string[];
 	holdCss?: string[];
+	/** Runs on the window before the runtime does: history state, stubs. */
+	before?: (window: W) => void;
 }
 
 interface Opened {
@@ -229,6 +231,7 @@ function open(o: Open): Opened {
 	// What the browser does after parsing: the deferred runtime, then the page's deferred scripts in order.
 	const runtime = document.querySelector('script[src="/_a/natsu.js"]');
 	if (runtime) runtime.nonce = "N0NCE";
+	o.before?.(window);
 	runAs(runtime, () => new Function("window", `with (window) {${o.dev ? DEV_CODE : CODE}}`)(window));
 	for (const s of document.body.querySelectorAll("script[src]")) script(s);
 
@@ -287,6 +290,20 @@ function open(o: Open): Opened {
 
 const text = (p: Opened, sel: string) => p.document.querySelector(sel)?.textContent;
 const path = (p: Opened) => p.window.location.pathname + p.window.location.search + p.window.location.hash;
+
+/**
+ * A same-page hash link, followed as a browser follows it: the jump moves
+ * the page at once, popstate comes (with no state), and the scroll event
+ * comes before it or after. happy-dom only pushes the entry.
+ */
+function jump(p: Opened, sel: string, y: number, eventFirst = false) {
+	p.click(sel, {}, true);
+	p.window.scrollTo(0, y);
+	const scrolled = () => p.window.dispatchEvent(new p.window.Event("scroll"));
+	if (eventFirst) scrolled();
+	p.window.dispatchEvent(new p.window.PopStateEvent("popstate", { state: null }));
+	if (!eventFirst) scrolled();
+}
 
 // --- tests ------------------------------------------------------------------
 
@@ -348,10 +365,20 @@ describe("boot", () => {
 		expect(seen).toEqual(["body"]);
 	});
 
-	test("the history entry gets an id, and scroll restoration is manual", () => {
-		const p = open({ html: page() });
+	test("the entry gets an id and a page number; scroll restoration is the browser's until a swap makes the entries manual", async () => {
+		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()) } });
+		expect(p.window.history.scrollRestoration).toBe("auto");
+		const s = p.window.history.state.natsu;
+		expect([typeof s.id, typeof s.p]).toEqual(["number", "number"]);
+		p.click("#to-b");
+		await settle();
 		expect(p.window.history.scrollRestoration).toBe("manual");
-		expect(typeof p.window.history.state.natsu.id).toBe("number");
+		expect(p.window.history.state.natsu.p).not.toBe(s.p);
+		// The entry left was made manual before the push.
+		p.window.history.back();
+		await settle();
+		expect(path(p)).toBe("/a");
+		expect(p.window.history.scrollRestoration).toBe("manual");
 	});
 });
 
@@ -1212,15 +1239,19 @@ describe("history", () => {
 		expect(p.loads).toEqual([]);
 	});
 
-	test("a hash link's entry (null state) followed by Back shows the right page", async () => {
+	const anchors = `<h1>Page A</h1><a id="jump" href="#results">results</a><div class="tall"></div><div id="results">r</div>`;
+
+	test("a hash link's entry (no state) is given an id and this page's number; Back to it from another page shows the right page", async () => {
 		const p = open({
-			html: page({ main: `<h1>Page A</h1><a id="jump" href="#results">results</a><div id="results">r</div>` }),
+			html: page({ main: anchors }),
 			routes: { "/a": () => answer(part({ title: "A", main: `<h1>Page A again</h1><div id="results">r</div>` })), "/b": () => answer(part()) },
 		});
-		p.click("#jump", {}, true);
-		await settle();
+		const first = p.window.history.state.natsu;
+		jump(p, "#jump", 4000);
 		expect(path(p)).toBe("/a#results");
-		expect(p.window.history.state).toBeNull();
+		const hashed = p.window.history.state.natsu;
+		expect(hashed.id).not.toBe(first.id);
+		expect(hashed.p).toBe(first.p);
 		expect(p.calls).toEqual([]);
 		p.click("#to-b");
 		await settle();
@@ -1229,19 +1260,72 @@ describe("history", () => {
 		await settle();
 		expect(path(p)).toBe("/a#results");
 		expect(text(p, "main h1")).toBe("Page A again");
+		expect(p.window.scrollY).toBe(4000);
 		p.window.history.forward();
 		await settle();
 		expect(text(p, "main h1")).toBe("Page B");
 	});
 
-	test("a hash change (same path and query) is the browser's: no visit", async () => {
-		const p = open({ html: page({ main: `<h1>Page A</h1><a id="jump" href="#x">x</a>` }) });
-		p.click("#jump", {}, true);
-		await settle();
+	test("Back and Forward across a hash link restore each entry's scroll, whether the jump's scroll event comes before popstate or after", async () => {
+		for (const eventFirst of [true, false]) {
+			const p = open({ html: page({ main: anchors }) });
+			// What layout would do with the target.
+			p.document.getElementById("results").scrollIntoView = () => p.window.scrollTo(0, 4000);
+			p.scroll(300);
+			jump(p, "#jump", 4000, eventFirst);
+			p.scroll(4100);
+			p.window.history.back();
+			await settle();
+			expect([eventFirst, path(p), p.window.scrollY]).toEqual([eventFirst, "/a", 300]);
+			p.window.history.forward();
+			await settle();
+			expect([eventFirst, path(p), p.window.scrollY]).toEqual([eventFirst, "/a#results", 4100]);
+			expect(p.calls).toEqual([]);
+		}
+	});
+
+	test("a new hash entry with no scroll of its own goes to its target; with no target, it stays", async () => {
+		const p = open({ html: page({ main: anchors + `<a id="nowhere" href="#gone">x</a>` }) });
+		let aimed = 0;
+		p.document.getElementById("results").scrollIntoView = () => aimed++;
+		p.scroll(200);
+		jump(p, "#jump", 4000);
+		expect(aimed).toBe(1);
+		p.click("#nowhere", {}, true);
+		p.window.dispatchEvent(new p.window.PopStateEvent("popstate", { state: null }));
+		expect([aimed, p.window.scrollY]).toEqual([1, 4000]);
+	});
+
+	test("Back to this page's own entry while a visit is pending cancels the visit and its loading mark", async () => {
+		let release!: () => void;
+		const p = open({ html: page({ main: anchors }), routes: { "/b": () => new Promise((y) => (release = () => y(answer(part())))) } });
+		jump(p, "#jump", 4000);
+		p.click("#to-b");
+		await tick(350);
+		expect(p.document.documentElement.hasAttribute("data-natsu-loading")).toBe(true);
 		p.window.history.back();
 		await settle();
+		expect(p.document.documentElement.hasAttribute("data-natsu-loading")).toBe(false);
+		release();
+		await settle();
 		expect(path(p)).toBe("/a");
+		expect(text(p, "main h1")).toBe("Page A");
+		expect(p.loads).toEqual([]);
+	});
+
+	test("an entry a script rewrote with its state kept is still this page: its hash links, Back and Forward fetch nothing", async () => {
+		const p = open({ html: page({ main: anchors }) });
+		// What a tab strip does: the query changes, the page does not.
+		p.window.history.replaceState(p.window.history.state, "", "/a?tab=2");
+		jump(p, "#jump", 4000);
+		expect(path(p)).toBe("/a?tab=2#results");
+		p.window.history.back();
+		await settle();
+		expect(path(p)).toBe("/a?tab=2");
+		p.window.history.forward();
+		await settle();
 		expect(p.calls).toEqual([]);
+		expect(p.loads).toEqual([]);
 	});
 
 	test("an entry with no state that a script pushed is visited and given an id", async () => {
@@ -1293,18 +1377,39 @@ describe("history", () => {
 		expect(p.loads).toEqual([["reload"]]);
 	});
 
-	test("pagehide writes the scroll into the entry on screen; a later load of it scrolls back", async () => {
+	test("pagehide writes the scroll into the entry on screen", () => {
 		const p = open({ html: page() });
 		p.scroll(450);
 		p.window.dispatchEvent(new p.window.Event("pagehide"));
 		expect(p.window.history.state.natsu.y).toBe(450);
-		const state = p.window.history.state;
-		// The same entry loaded again (a reload): the runtime restores it.
-		const q = open({ html: page(), ready: false });
-		q.window.history.replaceState(state, "");
-		q.window.scrollTo(0, 0);
-		new Function("window", `with (window) {${CODE}}`)(q.window);
-		expect(q.window.scrollY).toBe(450);
+	});
+
+	test("a reload of an entry a swap made (manual) scrolls back to its y, and again at load unless the visitor scrolled", () => {
+		// Before load the page is shorter than it will be: a scroll stops at 300.
+		let max = 300;
+		const before = (w: W) => {
+			w.history.replaceState({ natsu: { id: 1, p: 2, y: 450 } }, "");
+			w.history.scrollRestoration = "manual";
+			const to = w.scrollTo.bind(w);
+			w.scrollTo = (x: number, y: number) => to(x, Math.min(y, max));
+		};
+		const p = open({ html: page(), ready: false, before });
+		expect(p.window.scrollY).toBe(300);
+		max = 5000;
+		p.window.dispatchEvent(new p.window.Event("load"));
+		expect(p.window.scrollY).toBe(450);
+		max = 300;
+		const q = open({ html: page(), ready: false, before });
+		q.scroll(120);
+		max = 5000;
+		q.window.dispatchEvent(new q.window.Event("load"));
+		expect(q.window.scrollY).toBe(120);
+	});
+
+	test("a reload of an entry the browser restores (auto) is left to the browser", () => {
+		const p = open({ html: page(), before: (w) => w.history.replaceState({ natsu: { id: 1, p: 2, y: 450 } }, "") });
+		expect(p.window.scrollY).toBe(0);
+		expect(p.window.history.state.natsu).toMatchObject({ id: 1, y: 450 });
 	});
 });
 

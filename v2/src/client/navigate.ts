@@ -269,21 +269,42 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	};
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
 	const here = () => L.pathname + L.search;
+	/** The element a URL's hash names. */
+	const anchor = (u: URL | Location) => {
+		try {
+			return D.getElementById(decodeURIComponent(u.hash.slice(1)));
+		} catch {}
+	};
 
 	// --- history --------------------------------------------------------
-	const st = (): { id: number; y?: number } | undefined => HI.state?.natsu;
+	/** Ours in an entry's state: its id, the page it shows, its scroll when left. */
+	const st = (): { id: number; p?: number; y?: number } | undefined => HI.state?.natsu;
 	let id = Date.now();
-	/** The history entry the page on screen belongs to. Changes only in the swap. */
+	/** The history entry on screen: a swap or a same-page popstate changes it. */
 	let cur = st()?.id ?? ++id;
+	/**
+	 * The page on screen, numbered. Every entry made from it carries the
+	 * number (a hash link's, one a script rewrote with its state kept), so a
+	 * popstate between two of them is a scroll, whatever the URL says.
+	 */
+	let page = ++id;
+	/** Its path and query, for an entry with no state of ours. */
 	let rendered = here();
+	/** The entry a same-page hash link is leaving, until its popstate: the jump's scroll is not its own. */
+	let frozen: number | undefined;
 	const ys = new Map<number, number>();
-	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: cur, y } }, "", url);
-	HI.scrollRestoration = "manual";
-	// A reload, or a way back into this document: the browser leaves scroll to us now.
+	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: cur, p: page, y } }, "", url);
+	// The browser restores scroll, on a reload too, until a swap makes the
+	// entries manual. A reload keeps that, and leaves the scroll to us: now,
+	// and again at load (images, fonts) unless the visitor scrolled meanwhile.
 	const y0 = st()?.y;
 	put(y0);
-	if (y0) scrollTo(0, y0);
-	on("scroll", () => ys.set(cur, scrollY), PASSIVE);
+	if (y0 && HI.scrollRestoration == "manual") {
+		scrollTo(0, y0);
+		const at = scrollY;
+		on("load", () => scrollY == at && scrollTo(0, y0));
+	}
+	on("scroll", () => cur != frozen && ys.set(cur, scrollY), PASSIVE);
 	on("pagehide", () => {
 		if ((st()?.id ?? cur) == cur) put(scrollY);
 		cache.clear();
@@ -293,8 +314,18 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	on("pageshow", (e: PageTransitionEvent) => e.persisted && idle());
 	on("popstate", () => {
 		const s = st();
-		// The same path and query is a hash change: the browser's own.
-		if (here() != rendered) visit(L.href, { history: "none", scroll: s && (ys.get(s.id) ?? s.y) });
+		const y = s && (ys.get(s.id) ?? s.y);
+		const same = s ? s.p == page : frozen != null || here() == rendered;
+		// Whatever was on its way is over: this entry is what shows now.
+		++seq;
+		idle();
+		frozen = undefined;
+		if (!same) return visit(L.href, { history: "none", scroll: y });
+		// The same page (a hash link's entry, or one made from this page): the
+		// scroll the entry had, else its hash target, else where it is.
+		if (s) cur = s.id;
+		else (cur = ++id), put();
+		y != null ? scrollTo(0, y) : anchor(L)?.scrollIntoView();
 	});
 
 	// --- which clicks and forms -----------------------------------------
@@ -302,17 +333,23 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		u.origin == L.origin &&
 		(el.closest("[data-natsu-reload]")?.getAttribute("data-natsu-reload") ?? "false") == "false" &&
 		!/\.(?!html?$)\w+$/i.test(u.pathname);
-	const link = (e: Event) => {
+	const link = (e: Event, click?: 1) => {
 		const a = (e.target as Element).closest?.("a[href]");
 		if (!(a instanceof HTMLAnchorElement) || (a.target && a.target != "_self") || a.hasAttribute("download")) return;
 		const u = new URL(a.href);
-		// The same page with a hash is the browser's own scroll to an anchor.
-		return ok(a, u) && !(bare(u) == bare(L) && u.href.includes("#")) ? a : undefined;
+		// The same page with a hash is the browser's own jump to an anchor, and
+		// the scroll it makes belongs to the entry it pushes: the one left keeps
+		// where it is now.
+		if (bare(u) == bare(L) && u.href.includes("#")) {
+			if (click) ys.set((frozen = cur), scrollY);
+			return;
+		}
+		return ok(a, u) ? a : undefined;
 	};
 	// On window, bubbling: after every listener on the document, so one that
 	// called preventDefault always wins.
 	on("click", (e: MouseEvent) => {
-		const a = !e.defaultPrevented && !e.button && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && link(e);
+		const a = !e.defaultPrevented && !e.button && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && link(e, 1);
 		if (a) {
 			e.preventDefault();
 			visit(a.href);
@@ -522,21 +559,18 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			const swap = () => {
 				begun = 1;
 				fire("before-swap", D, { url: f.href });
-				const y = ys.get(cur);
-				if (h == "none") {
+				// From here the runtime restores this document's scroll, so the
+				// browser must not: on the entry left, and on the entries after it.
+				HI.scrollRestoration = "manual";
+				// The entry left keeps its scroll and its page; the one shown gets a new page.
+				if (!h) put(ys.get(cur));
+				page = ++id;
+				if (h) {
 					// An entry reached by back/forward keeps its id; one with no state
-					// (a hash link's, or one a script wrote) is given one.
-					const s = st();
-					if (s) cur = s.id;
-					else {
-						cur = ++id;
-						put();
-					}
-				} else if (h == "replace") put(undefined, f.href);
-				else {
-					put(y);
-					HI.pushState({ natsu: { id: (cur = ++id) } }, "", f.href);
-				}
+					// of ours (a script wrote it) is given one.
+					if (h == "none") cur = st()?.id ?? ++id;
+					put(undefined, f.href);
+				} else HI.pushState({ natsu: { id: (cur = ++id), p: page } }, "", f.href);
 				rendered = here();
 				// The head: what is in both stays, what went away goes, what is new comes in.
 				const incoming = new Map<string, Element>();
@@ -561,10 +595,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 				});
 				const s = o.scroll;
 				if (s != "keep") {
-					let t: Element | null = null;
-					try {
-						t = D.getElementById(decodeURIComponent(f.hash.slice(1)));
-					} catch {}
+					const t = anchor(f);
 					// A y (back/forward), else the hash target, else the top.
 					if (t && s == null) t.scrollIntoView();
 					else scrollTo(0, +s! || 0);
