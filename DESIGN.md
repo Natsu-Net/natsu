@@ -219,7 +219,7 @@ in development a page whose scripts carry nonces without one is named. In
 development every refusal is logged with its reason, and a shell change
 with the first line that changed.
 
-**In the browser** the runtime (`src/client/navigate.ts`, about 3.9 KB
+**In the browser** the runtime (`src/client/navigate.ts`, under 4 KB
 brotli; its types, `NatsuClient` and the event details, in
 `src/client/types.ts`) is built by `Assets.build()` as the classic entry
 `natsu-navigate`, readable and with console lines saying why a visit was a
@@ -239,14 +239,28 @@ natsu.mount("[data-clock]", (el, signal) => {
 A mount runs on every match now and on every match in a region swapped in,
 while the page shown lists the script that registered it; a swap stops it
 when its element goes, or when page code has taken the element out. Every
-script the document ran counts toward a safe swap: inline, module, `defer`
-or `async`, in the head or the body. One that never calls `natsu.mount`
-(found by `document.currentScript`, or for a module or a later call by the
-stack) makes every later visit a full load, so an unconverted page behaves
-as it always did. Left out are the runtime, a tag with `data-natsu-once`,
-data blocks, `nomodule`, and a classic head script that blocks the parser.
-A head script runs once per document, as the shell does, so its mounts
-apply on every page whatever the page lists.
+script the document runs counts toward a safe swap: inline, module, `defer`
+or `async`, in the head or the body, and one a loader adds later (the
+document's scripts are read again as each visit starts). One that never
+calls `natsu.mount` (found by `document.currentScript`, or for a module or
+a later call by the stack) makes every later visit a full load, so an
+unconverted page behaves as it always did. A script a swap created that has
+not called it once it has run gets its page loaded for real: it may be
+waiting for a `DOMContentLoaded` that never comes again, and a page swapped
+in with it would stay dead. Left out are the runtime, a tag with
+`data-natsu-once`, data blocks, `nomodule` and any other type the browser
+does not run (neither counted nor waited for), and a classic head script
+that blocks the parser. A head script runs once per document, as the shell
+does, so its mounts apply on every page whatever the page lists. A script
+already on the page, a loader's included, is never created again.
+
+The runtime takes a plain left click on a link to this site and the submit
+of a GET form, and leaves the rest to the browser: a modifier (on a submit
+button too), a target other than `_self` (the element's own, else `<base
+target>`), `download`, a file, a link inside `contenteditable`,
+`data-natsu-reload`, and a form whose `accept-charset` is not UTF-8. A
+form's query is the browser's own: a file as its name, a line break as
+CRLF.
 
 The runtime takes nothing from a part's markup on trust. It creates the
 page's scripts from `Natsu-Scripts` (each entry one tag's URL-encoded
@@ -259,22 +273,29 @@ load. An island is fetched on this origin only, with `Natsu-Island: 1`, and
 filled only from a `200` `text/html` answer that says `Natsu-Island: 1`
 back, which only an `island()` route sends.
 
-Scroll is kept per history entry and saved on it at `pagehide`, so Back,
-Forward and a reload come back to it. Each page shown is numbered and every
-entry made from it carries the number, the browser's own entry for a hash
-link included, so a popstate between them is a scroll, never a fetch. Back
-or Forward ends any visit on its way, as does a newer visit, during a
-stylesheet load or a view transition alike: an overtaken visit swaps
-nothing and leaves nothing behind.
+Scroll is kept per history entry, and written into it once a scroll
+settles (200 ms) and at `beforeunload` and `pagehide`, so Back, Forward, a
+reload and a return after the document is gone come back to it. Every
+scroll the runtime makes is a jump, whatever `scroll-behavior` says. Each
+page shown is numbered and every entry made from it carries the number,
+the browser's own entry for a hash link included, so a popstate between
+them is a scroll, never a fetch. Back or Forward ends any visit on its way,
+as does a newer visit, during a stylesheet load, a view transition or its
+scripts alike: an overtaken visit swaps nothing, leaves nothing behind and
+fires no `natsu:load`. While a Back or Forward to another page is on its
+way, nothing is written into the entry in the address bar, and a link or
+form is read against the page still on screen.
 
 A pointer resting 65 ms on a link prefetches the part (a finger too, unless
 the browser takes the touch to pan or the page scrolls), two at a time,
 never on Save-Data or 2G or when the meta says `data-prefetch="off"`
 (`navigate.prefetch: false`). A click within ten seconds uses the answer,
 yielding a frame first so the click paints at once; a prefetched redirect
-or reload is acted on as it is, and a skip stops hovers asking until then.
-A path answered with `Natsu-Reload: route` or `response` is a full load,
-never prefetched, for the rest of the document.
+or reload is acted on as it is, and anything else (a skip, a 404 part)
+stops hovers asking until then. A path answered with `Natsu-Reload: route`
+or `response`, or with no `natsu-` header at all (another server behind
+the same proxy), is a full load, never prefetched, for the rest of the
+document.
 
 Also on `natsu` (a global): `visit(url, { history, scroll })`, `refresh()`
 (after an action; scroll and focus kept), `prefetch(url)`, `island(el)`.

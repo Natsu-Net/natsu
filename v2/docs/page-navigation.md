@@ -57,6 +57,17 @@ That is all. Every page now goes out with the runtime's
 `<script src="/_a/natsu-navigate.….js" defer>` in its head, and every page
 with a region with `<meta name="natsu" content="…">` next to it.
 
+A visit starts from a plain left click on a link to your site, or from the
+submit of a GET form. The browser keeps the rest, as it would without
+natsu: a click with Ctrl, Shift, Meta or Alt (on a submit button too, which
+opens the result in a new tab or window), a link or form with a target
+other than `_self` (its own, or the page's `<base target>`), `download`, a
+link to a file (an extension other than `.html`), a link inside an editor
+(`contenteditable`), and a form whose `accept-charset` is not UTF-8. A
+form's query is built as the browser builds it, a file as its name and a
+line break as CRLF. Scroll comes back on Back, Forward and a reload, and
+every scroll the runtime makes is a jump, whatever `scroll-behavior` says.
+
 ## Page scripts
 
 A page that is swapped in does not run the scripts of a full load again, so
@@ -78,14 +89,20 @@ natsu.mount("[data-clock]", (el, signal) => {
   script, so `natsu` exists when they run. A classic script without `defer`
   runs before the runtime; guard it with `window.natsu &&`.
 - Call `natsu.mount` at the top level of the script. Every script the page
-  ran counts, inline, module, `defer` or `async`, and one that never calls
+  runs counts, inline, module, `defer` or `async`, and one that never calls
   it makes the next visit a full load, so a page you have not converted
-  keeps behaving as it always did (the console names the script). A script
-  that needs no mount (analytics, a tag manager, a polyfill) says so with
-  `data-natsu-once`; a script that such a script adds later counts too, so
-  tag it where it is created. Left out: data blocks, `nomodule`, and a
-  classic script in the head without `defer` or `async`, which runs once
-  per document like the shell.
+  keeps behaving as it always did (the console names the script). A page
+  swapped in whose new script has not called it once it has run (one that
+  waits for `DOMContentLoaded`, which a swap never fires again) is loaded
+  again, for real, so it works as it does on a full load. A script that
+  needs no mount (analytics, a tag manager, a polyfill) says so with
+  `data-natsu-once`; a script that such a script adds later counts too,
+  from the next visit on, so tag it where it is created. Left out: data
+  blocks, `nomodule` and any other type the browser does not run (a consent
+  manager's `type="text/plain"`), and a classic script in the head without
+  `defer` or `async`, which runs once per document like the shell. A
+  script already on the page, one a loader added included, never runs
+  twice.
 - Scripts inside a region do not run when the region is swapped in, so a
   page with one is a full load: move it after the region. Data blocks
   (`type="application/json"`, JSON-LD) are fine.
@@ -213,7 +230,10 @@ says which:
 A redirect is followed by the runtime (`Natsu-Location`), softly when it
 stays on your site. In the browser, a page whose scripts never called
 `natsu.mount` makes the next visit a full load, and the console names the
-scripts.
+scripts; a page swapped in with a new script that never called it is
+loaded again, for real, at once. A path whose answer carried no `natsu-`
+header at all (another server behind the same proxy, a blog say) is a full
+load from then on.
 
 ## What to check after turning it on
 
@@ -221,5 +241,7 @@ scripts.
   as `fetch` requests answered `200` with `Natsu-Part: 1`.
 - In development, read the server log and the console for full loads you did
   not expect.
-- A page whose listeners stop working after a visit has a script that is not
-  a mount yet.
+- A page that loads again right after a visit (a `fetch`, then a document
+  load of the same URL), or whose listeners stop working after one, has a
+  script that is not a mount yet; in development the console names it
+  (keep its log across loads to see it).
