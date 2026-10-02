@@ -398,8 +398,10 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		// The page already shown: the browser too replaces rather than pushes.
 		if (!h && u.href == L.href) h = "replace";
 		const n = ++seq;
-		// A hover's pending prefetch would only fetch the same page twice.
+		// A hover's pending prefetch would only fetch the same page twice; and
+		// the link it holds may be in a region about to go, which it would keep.
 		clearTimeout(dwell);
+		over = undefined;
 		clearTimeout(timer);
 		timer = setTimeout(() => H.setAttribute(LOADING, ""), 300);
 		let a: Answer | undefined;
@@ -482,11 +484,18 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			if (adds[0])
 				fine = await new Promise((y) => {
 					let left = adds.length;
-					// Four seconds without every load counts as a failure too (undefined).
-					setTimeout(y, 4e3);
-					const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || y(1));
+					// Settled (every load, an error, or four seconds, a failure too): the
+					// handlers and the timer go, or they would keep this whole visit
+					// alive on links that stay, chained to the next visit's.
+					const end = (ok?: unknown) => {
+						clearTimeout(t);
+						for (const l of adds) l.onload = l.onerror = null;
+						y(ok);
+					};
+					const t = setTimeout(end, 4e3);
+					const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || end(1));
 					// The handlers go on before the links go in: a cached sheet may load at once.
-					for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => y(0));
+					for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => end(0));
 					old[0] ? old[0].before(...adds) : D.head.append(...adds);
 					// A sheet the memory cache held is parsed as it goes in, but its load
 					// event can wait for the next frame: rules that can be read (never

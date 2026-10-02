@@ -625,11 +625,15 @@ describe("stylesheets", () => {
 		async () => {
 			const p = open({ html: page(), routes: { "/b": () => answer(part({ sheet: "/_a/site.b.css" })) }, holdCss: ["/_a/site.b.css"] });
 			p.click("#to-b");
+			await settle();
+			const link = p.document.querySelector('link[href="/_a/site.b.css"]');
 			await tick(3800);
 			expect(p.loads).toEqual([]);
 			await tick(400);
 			expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
 			expect(sheets(p)).toEqual(["/_a/site.a.css"]);
+			// Given up on, the link keeps no handler that would hold the visit.
+			expect([link.onload, link.onerror]).toEqual([null, null]);
 		},
 		{ timeout: 8000 },
 	);
@@ -661,6 +665,42 @@ describe("stylesheets", () => {
 		await settle();
 		expect(sheets(p)).toEqual(["/_a/site.b.css", "/_a/site-later.b.css"]);
 		expect(text(p, "main h1")).toBe("Page B");
+	});
+
+	test("once the wait settles (load or error) no handler stays on the links, and the 4 s timer is cleared", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/b": () => answer(part({ sheet: "/_a/site.b.css" })),
+				"/c": () => answer(part({ title: "C", sheet: "/_a/site.c.css" })),
+			},
+			failCss: ["/_a/site.c.css"],
+		});
+		const added: W[] = [];
+		new p.window.MutationObserver((records: W[]) => {
+			for (const r of records) for (const n of r.addedNodes) if (n.localName === "link") added.push(n);
+		}).observe(p.document.head, { childList: true });
+		const pending = new Set<unknown>();
+		const set = p.window.setTimeout;
+		const clear = p.window.clearTimeout;
+		p.window.setTimeout = (fn: () => void, ms: number) => {
+			const t = set.call(p.window, fn, ms);
+			if (ms === 4e3) pending.add(t);
+			return t;
+		};
+		p.window.clearTimeout = (t: unknown) => (pending.delete(t), clear.call(p.window, t));
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		p.click("#to-c");
+		await settle();
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
+		expect(added.map((l) => l.getAttribute("href"))).toEqual(["/_a/site.b.css", "/_a/site.c.css"]);
+		expect(added.map((l) => [l.onload, l.onerror])).toEqual([
+			[null, null],
+			[null, null],
+		]);
+		expect(pending.size).toBe(0);
 	});
 
 	test("a visit overtaken while its sheet loads leaves nothing behind", async () => {
@@ -1294,6 +1334,18 @@ describe("prefetch", () => {
 		await tick(150);
 		expect(p.calls).toEqual([{ url: "/b", headers: { "Natsu-Nav": "k1.s1" } }]);
 		expect(text(p, "main h1")).toBe("Page B");
+	});
+
+	test("a visit lets go of the hovered link: hovering it again on the new page prefetches again", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part({ title: "C" })) } });
+		hover(p, "#to-c");
+		await tick(90);
+		await p.natsu.visit("/b");
+		// Empty the prefetch cache, so a second prefetch of /c shows as a request.
+		p.window.dispatchEvent(new p.window.Event("pagehide"));
+		hover(p, "#to-c");
+		await tick(90);
+		expect(p.calls.map((c) => c.url)).toEqual(["/c", "/b", "/c"]);
 	});
 
 	test("skipped: Save-Data, 2g, data-natsu-prefetch=off, the current URL, an unsafe page", async () => {
