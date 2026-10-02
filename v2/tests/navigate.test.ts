@@ -443,6 +443,41 @@ describe("the part", () => {
 		expect(refused.headers.get("content-type")).toBeNull();
 	});
 
+	test("parts and 204s carry no document headers: they are never a document, and the key proved them equal", async () => {
+		const headers = (ctx: Context) => {
+			ctx.response.headers.set("referrer-policy", "same-origin");
+			ctx.response.headers.set("permissions-policy", "camera=()");
+			ctx.response.headers.set("x-frame-options", "DENY");
+			ctx.response.headers.set("x-app", "kept");
+		};
+		new Router().get("/a", navigable((ctx) => {
+			headers(ctx);
+			const nonce = crypto.randomUUID().replaceAll("-", "");
+			csp(ctx, nonce);
+			return page({ nonce });
+		}));
+		new Router().get("/other", navigable((ctx) => {
+			headers(ctx);
+			csp(ctx, crypto.randomUUID().replaceAll("-", ""), " https://ads.test");
+			return page();
+		}));
+		const { app } = await pipeline({ navigate: { documentHeaders: ["X-Frame-Options"] } });
+		const whole = await get(app, "/a");
+		const key = metaKey(await whole.text());
+		const part = await nav(app, "/a", key);
+		const stale = await nav(app, "/other", key);
+		expect(whole.headers.get("content-security-policy")).toContain("'nonce-");
+		expect([part.headers.get("natsu-part"), stale.headers.get("natsu-reload")]).toEqual(["1", "document"]);
+		for (const answer of [part, stale]) {
+			for (const name of ["content-security-policy", "referrer-policy", "permissions-policy", "x-frame-options"]) {
+				expect(answer.headers.get(name)).toBeNull();
+			}
+			expect(answer.headers.get("x-app")).toBe("kept");
+		}
+		// The part still lists the scripts this response's nonce vouched for.
+		expect(await part.text()).toContain('<script src="/assets/site.js" defer></script>');
+	});
+
 	test("an answer that is not a page is a full load, cookies kept", async () => {
 		route("/from");
 		new Router().get("/json", navigable(() => ({ ok: true })));
@@ -855,8 +890,10 @@ describe("delivery", () => {
 	test("two visitors' secrets never cross through a kept page's parts", async () => {
 		const { assets, app } = await pipeline();
 		const pages = new PageCache({ prepare: (html) => assets.rewrite(html) });
+		let lastNonce = "";
 		const visitorPage: Handler = async (ctx) => {
 			const nonce = crypto.randomUUID().replaceAll("-", "");
+			lastNonce = nonce;
 			const token = ctx.request.headers.get("x-visitor") ?? "";
 			csp(ctx, nonce);
 			const kept = await pages.serve(ctx.path, [nonce, token], async ([n, t]) => ({
@@ -881,8 +918,8 @@ describe("delivery", () => {
 		expect(bobPart).toContain('value="bob-token"');
 		expect(bobPart).not.toContain("alice-token");
 		expect(bobPart).not.toContain("natsu-secret-");
-		const nonce = /'nonce-([^']+)'/.exec(forBob.headers.get("content-security-policy") ?? "")?.[1];
-		expect(bobPart).toContain(`nonce="${nonce}"`);
+		// The region's data block carries Bob's own nonce (the part itself carries no CSP).
+		expect(bobPart).toContain(`nonce="${lastNonce}"`);
 
 		// Alice's key does not open Bob's shell.
 		const crossed = await nav(app, "/two", alice, as("bob-token"));

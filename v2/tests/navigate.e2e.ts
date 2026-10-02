@@ -852,9 +852,13 @@ describe("page switching in Chromium, against a natsu app", () => {
 				return median(ms);
 			};
 
-			rows.push("| Page | Full document (brotli body + headers) | Part (brotli body + headers) | Saved |", "|---|---|---|---|");
+			rows.push("| Page | Full document (brotli body + headers) | Part (brotli body + headers) | Saved: body / all |", "|---|---|---|---|");
 			for (const [path, b] of Object.entries(bytes)) {
-				rows.push(`| ${path} | ${b.full} + ${b.fullHeaders} B | ${b.part} + ${b.partHeaders} B | ${Math.round((1 - b.part / b.full) * 100)}% of the body |`);
+				const saved = (part: number, whole: number) => `${Math.round((1 - part / whole) * 100)}%`;
+				rows.push(
+					`| ${path} | ${b.full} + ${b.fullHeaders} B | ${b.part} + ${b.partHeaders} B | ` +
+						`${saved(b.part, b.full)} / ${saved(b.part + b.partHeaders, b.full + b.fullHeaders)} |`,
+				);
 			}
 			rows.push("", "| Page | Full load, nav start to load (median ms) | Soft visit, natsu:visit to swap / to natsu:load | Server, full page (socket / handle) | Server, part (socket / handle) |", "|---|---|---|---|---|");
 			for (const path of ["/catalog", "/p/1"]) {

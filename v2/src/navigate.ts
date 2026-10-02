@@ -145,6 +145,7 @@ const NONCE_VALUE = /^[A-Za-z0-9+/=_-]+$/;
 
 /**
  * Headers that describe a body, dropped from a 204: the answer has none.
+ * The document headers go too (see `Navigation.dropDocumentHeaders`);
  * Set-Cookie and every other header pass through.
  */
 const ENTITY_HEADERS = [
@@ -411,15 +412,17 @@ export class Navigation {
 		// It is a part: what waited for a page the visitor sees runs now, and
 		// may still add headers (a cookie that clears a flash).
 		nav.flush();
+		const nonces = cspNonces(header(ctx, "content-security-policy"));
 		const headers = response.headers;
 		for (const name of ["content-length", "content-encoding", "etag", "last-modified", "expires", "location", "refresh"]) {
 			headers.delete(name);
 		}
+		this.dropDocumentHeaders(headers);
 		headers.set("content-type", "text/html; charset=utf-8");
 		headers.set("cache-control", NO_STORE);
 		headers.set("natsu-part", "1");
 		addVary(headers, "Natsu-Nav");
-		response.body = partOf(page, scan, `${doc}.${shell}`, cspNonces(header(ctx, "content-security-policy")), this.runtime);
+		response.body = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime);
 	}
 
 	/**
@@ -460,6 +463,19 @@ export class Navigation {
 		return hashOf(text);
 	}
 
+	/**
+	 * Take the document headers (CSP and the rest the document key hashes)
+	 * off a part or a 204. Neither is ever a document: the runtime reads it
+	 * with `fetch`, and the document on screen keeps the headers of its first
+	 * load, which the key has just proved equal. A CSP is also the longest
+	 * header most pages carry, and with a fresh nonce in it no header
+	 * compression shares it between answers: on a small part it is a good
+	 * share of the bytes.
+	 */
+	private dropDocumentHeaders(headers: Headers): void {
+		for (const name of this.documentHeaders) headers.delete(name);
+	}
+
 	/** A 204 that carries the decision, Set-Cookie and nothing that describes a body. */
 	private control(ctx: Context, decision: Decision): void {
 		const response = ctx.response;
@@ -476,6 +492,7 @@ export class Navigation {
 		response.body = null;
 		response.status = 204;
 		for (const name of ENTITY_HEADERS) headers.delete(name);
+		this.dropDocumentHeaders(headers);
 		headers.set("cache-control", NO_STORE);
 		addVary(headers, "Natsu-Nav");
 		if (decision.kind === "location") headers.set("natsu-location", decision.url);

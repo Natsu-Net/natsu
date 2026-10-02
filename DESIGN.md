@@ -160,8 +160,10 @@ cannot change:
 any route runs, so neither a handler, a render nor a PageCache key can see
 them, and ignores them on any other method, on a browser navigation
 (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) and when malformed.
-Every answer varies on `Natsu-Nav`; parts and 204s are `private, no-store`;
-Set-Cookie always passes through.
+Every answer varies on `Natsu-Nav`; parts and 204s are `private, no-store`
+and carry none of the document headers (the runtime reads them with
+`fetch`; they are never a document, and the key proved those headers equal
+to the ones the document on screen has); Set-Cookie always passes through.
 
 | Answer | When |
 | --- | --- |
