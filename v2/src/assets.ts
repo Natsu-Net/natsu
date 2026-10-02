@@ -31,18 +31,25 @@
  *
  * Templates keep the paths they already have; `rewrite` says which of them
  * the pipeline owns, and pages go out pointing at the chunks.
+ *
+ * With `navigate` on, the same middleware answers page navigations: a click
+ * fetches only the head and the regions of the next page, cut from the page
+ * this pipeline just pointed at its chunks (see `src/navigate.ts`).
  */
 
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, constants, gzip } from "node:zlib";
 import { type DocumentProfile, profileDocument, selectorNames, shakeCSS, splitCSS } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import { addVary, negotiate } from "./compress.ts";
+import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
+import { type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
 
 export interface AssetsOptions {
 	/** Where built chunks are written. Created if it is not there. */
@@ -139,6 +146,14 @@ export interface AssetsOptions {
 	 * inferred, so nothing is rewritten by surprise.
 	 */
 	rewrite?: Record<string, string>;
+	/**
+	 * Page navigation: a link click fetches only the parts of the next page
+	 * that change, and a small runtime swaps them in. Pages opt in by marking
+	 * regions (`<main id="main" data-natsu-region>`), routes by `navigable()`.
+	 * The runtime is built with the other entries and linked from the head of
+	 * every page with a region. See `src/navigate.ts`.
+	 */
+	navigate?: boolean | NavigateOptions;
 }
 
 export interface AssetReport {
@@ -191,9 +206,13 @@ export class Assets {
 	private safelist: Array<string | RegExp> = [];
 	/** Answers whose page went through `rewrite` already (see markRewritten). */
 	private readonly rewritten = new WeakSet<Context>();
+	/** Page navigation, when the `navigate` option turns it on. */
+	private readonly navigation: Navigation | undefined;
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
+		const navigate = options.navigate;
+		if (navigate) this.navigation = new Navigation(navigate === true ? {} : navigate);
 	}
 
 	/** Build every entry. Call once at boot. */
@@ -206,6 +225,7 @@ export class Assets {
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
+		await this.buildNavigation();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
 	}
@@ -265,7 +285,12 @@ export class Assets {
 				const tag = out.slice(out.lastIndexOf("<", at), end + 1);
 				if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
 			}
-			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
+			if (close === -1) continue;
+			// With navigation on, the link names its lazy half too: a part
+			// carries no inline script, so this is how the runtime learns it.
+			const attribute = this.navigation ? ` data-natsu-later="${lazy.url}"` : "";
+			const tagEnd = out[close - 1] === "/" ? close - 1 : close;
+			out = `${out.slice(0, tagEnd)}${attribute}${out.slice(tagEnd, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
 		}
 		return out;
 	}
@@ -389,6 +414,9 @@ export class Assets {
 	 *
 	 * One middleware rather than two, because they are one feature: a link
 	 * rewritten to a chunk that is not being served is a page with no styling.
+	 * Navigation answers live here for the same reason: a part must link the
+	 * chunk its whole page links, so it is cut after the rewrite, and inside
+	 * `compress()`, which sees it as the string it still is.
 	 */
 	public middleware(): Middleware {
 		const prefix = `${this.options.publicPath}/`;
@@ -436,15 +464,27 @@ export class Assets {
 				return;
 			}
 
+			// Read and delete the navigation headers before anything further in
+			// can see them; a prefetch refused outright never reaches a route.
+			const navigation = this.navigation;
+			if (navigation?.begin(ctx)) return;
+
 			await next();
 
+			// A navigation is answered whatever the body, including a page
+			// PageCache kept rewritten: the rewrite runs only for a page worth
+			// cutting, and only if it has not run already.
+			if (navigation && ctx.nav.requested) {
+				navigation.answer(ctx, (html) => (this.rewritten.has(ctx) ? html : this.rewrite(html)));
+				return;
+			}
+
 			const body = ctx.response.body;
-			if (typeof body !== "string" || this.rewritten.has(ctx)) return;
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
-			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
-			if (type ? !type.includes("html") : !body.startsWith("<")) return;
-			ctx.response.body = this.rewrite(body);
+			if (typeof body !== "string" || !isDocument(ctx, body)) return;
+			const page = this.rewritten.has(ctx) ? body : this.rewrite(body);
+			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
 		};
 	}
 
@@ -593,6 +633,44 @@ export class Assets {
 			this.entries.set(name, url);
 			this.report.sizes[name] = { from: await sourceSize(file), to: body.length };
 		}
+	}
+
+	/**
+	 * The navigation runtime, built as a classic script (an IIFE: it is a
+	 * plain `<script defer>` in the head), and the build id that goes into
+	 * every page's document key: a hash of the manifest, so a deploy that
+	 * changes any entry makes the next navigation a real load. In development
+	 * the runtime is built unminified with its console diagnostics
+	 * (`__NATSU_DEV__`); otherwise minified, whatever `minify` says, because
+	 * every visitor downloads it.
+	 */
+	private async buildNavigation(): Promise<void> {
+		const navigation = this.navigation;
+		if (!navigation) return;
+		const file = fileURLToPath(new URL("./client/navigate.ts", import.meta.url));
+		const dev = config.General.development;
+		const built = await Bun.build({
+			entrypoints: [file],
+			target: "browser",
+			format: "iife",
+			splitting: false,
+			minify: !dev,
+			define: {
+				__NATSU_DEV__: dev ? "true" : "false",
+				"process.env.NODE_ENV": JSON.stringify(dev ? "development" : "production"),
+			},
+		});
+		if (!built.success || !built.outputs[0]) {
+			for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
+		} else {
+			const body = await built.outputs[0].text();
+			const url = this.hold(`${RUNTIME_ENTRY}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
+			this.pin(url);
+			this.entries.set(RUNTIME_ENTRY, url);
+			this.report.sizes[RUNTIME_ENTRY] = { from: await sourceSize(file), to: body.length };
+		}
+		navigation.runtime = this.url(RUNTIME_ENTRY);
+		navigation.buildId = Bun.hash(JSON.stringify(this.manifest())).toString(36);
 	}
 
 	private async buildFiles(): Promise<void> {
