@@ -170,8 +170,9 @@ let ready = false;
 
 const on = (type: string, fn: (e: never) => unknown, options?: AddEventListenerOptions) =>
 	addEventListener(type, fn as EventListener, options);
-const fire = (name: string, target: EventTarget, detail?: unknown) =>
-	target.dispatchEvent(new CustomEvent("natsu:" + name, { bubbles: true, cancelable: true, detail }));
+/** Every natsu event is on document, bubbling and cancelable. */
+const fire = (name: string, detail: unknown) =>
+	D.dispatchEvent(new CustomEvent("natsu:" + name, { bubbles: true, cancelable: true, detail }));
 /** The nearest `data-natsu-<name>` at or above `el`: present is on, "false" and "off" are off; undefined if none. */
 const flag = (el: Element, name: string) => {
 	const v = el.closest(`[data-natsu-${name}]`)?.getAttribute("data-natsu-" + name);
@@ -230,13 +231,9 @@ const api: NatsuClient = (window.natsu = {
 		let s = D.currentScript as HTMLScriptElement | null;
 		if (!s) {
 			// A module script, or a call made later (an event, after an await):
-			// the stack names the script, nearest frame first, in every engine.
-			const stack = new Error().stack || "";
-			let at = 1e9;
-			for (const e of D.scripts) {
-				const i = e != me && e.src ? stack.indexOf(e.src + ":") : -1;
-				if (i >= 0 && i < at) (at = i), (s = e);
-			}
+			// the stack names the script's URL, in every engine.
+			const stack = new Error().stack!;
+			s = [...D.scripts].find((e) => e != me && e.src && stack.includes(e.src + ":"))!;
 		}
 		if (s) aware.add(s).add(s.src || s);
 		// A script in <head> runs once per document, as the shell does: its mounts go everywhere.
@@ -262,6 +259,8 @@ let status: HTMLElement | undefined;
  */
 const JS = /script|^(module)?$/i;
 
+const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
+
 const boot = () => {
 	if (ready) return;
 	ready = true;
@@ -282,7 +281,7 @@ const boot = () => {
 	if (status) D.body.append(status);
 	mountIn(D.body);
 	// One natsu:load per page shown, this one included: a page-view hook counts each once.
-	fire("load", D, { url: L.href, regions: [...D.querySelectorAll(REGION)] });
+	fire("load", { url: L.href, regions: regions(D) });
 };
 if (D.readyState == "complete") boot();
 else {
@@ -310,7 +309,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 						? ["<html data-natsu-reload>"]
 						: [bad, "never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)"]),
 			);
-		return !ready || off || bad.length > 0;
+		return !ready || off || bad[0];
 	};
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
 	const here = () => L.pathname + L.search;
@@ -460,21 +459,24 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	};
 	let over: Element | undefined;
 	let dwell: ReturnType<typeof setTimeout>;
-	const intent = (e: Event, wait: number) => {
+	const intent = (e: Event) => {
 		const a = link(e);
 		if (!a || a == over) return;
 		over = a;
 		clearTimeout(dwell);
-		dwell = setTimeout(() => flag(a, "prefetch") == false || prefetch(a.href), wait);
+		dwell = setTimeout(() => flag(a, "prefetch") == false || prefetch(a.href), 65);
 	};
-	on("pointerover", (e: PointerEvent) => e.pointerType != "touch" && intent(e, 65), PASSIVE);
-	on("pointerout", (e: PointerEvent) => {
-		if (over && !over.contains(e.relatedTarget as Node)) {
-			clearTimeout(dwell);
-			over = undefined;
-		}
-	});
-	on("touchstart", (e: TouchEvent) => intent(e, 0), PASSIVE);
+	const forget = () => {
+		clearTimeout(dwell);
+		over = undefined;
+	};
+	// A finger waits as a mouse does: a flick across a grid of links is a
+	// scroll, which the browser says (pointercancel, as it takes the touch to
+	// pan) or the page does.
+	on("pointerover", intent, PASSIVE);
+	on("pointerout", (e: PointerEvent) => over && !over.contains(e.relatedTarget as Node) && forget());
+	on("pointercancel", forget);
+	on("scroll", forget, PASSIVE);
 
 	// --- visit ----------------------------------------------------------
 	let seq = 0;
@@ -487,7 +489,6 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	 * download, a 204) must not leave the mark on it.
 	 */
 	const full = (u: URL, h?: string) => (idle(), h == "none" ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
-	const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
 	const ids = (els: Element[]) => els.map((e) => e.id).join(" ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
 	const href = (l: Element) => l.getAttribute("href");
@@ -496,7 +497,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		const u = new URL(url, L.href);
 		let h = o.history;
 		// Cancelled: nothing happens, unless the URL already changed (back/forward).
-		if (!fire("visit", D, { url: u.href })) {
+		if (!fire("visit", { url: u.href })) {
 			if (DEV && h == "none") why("natsu:visit was cancelled", u.href);
 			return h == "none" ? full(u, h) : undefined;
 		}
@@ -527,7 +528,8 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			return full(u, h);
 		}
 		const [r, text] = a;
-		const to = r.headers.get("natsu-location");
+		const head = r.headers;
+		const to = head.get("natsu-location");
 		if (to) {
 			const v = new URL(to, u);
 			v.hash ||= u.hash;
@@ -536,8 +538,8 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			if (DEV) why("redirect to", v.href);
 			return full(v, next.history);
 		}
-		if (!r.headers.has("natsu-part")) {
-			if (DEV) why(r.headers.get("natsu-reload") ?? "not a part", u.href);
+		if (!head.has("natsu-part")) {
+			if (DEV) why(head.get("natsu-reload") ?? "not a part", u.href);
 			return full(u, h);
 		}
 		// Anything that throws before the swap (DOMParser under Trusted Types, a
@@ -553,7 +555,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			// ones the server vouched for. Those read "" (as a live element shows its
 			// hidden nonce, so the merge sees an unchanged one as unchanged) and get
 			// the boot nonce if they go in; any other nonce goes.
-			const vouched = (r.headers.get("natsu-nonce") || "").split(" ");
+			const vouched = (head.get("natsu-nonce") || "").split(" ");
 			const trusted = new Set<Element>();
 			for (const e of doc.head.querySelectorAll("[nonce]")) {
 				const v = e.getAttribute("nonce");
@@ -562,7 +564,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			}
 			// The page's scripts come from Natsu-Scripts, never from markup: each
 			// entry is one tag's attributes, its src made absolute against the part.
-			const scripts = (r.headers.get("natsu-scripts") || "")
+			const scripts = (head.get("natsu-scripts") || "")
 				.split(" ")
 				.map((e) => new URLSearchParams(e))
 				.filter((p) => p.has("src"))
@@ -631,7 +633,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 				// a Back): this one is over, and leaves nothing behind.
 				if (n != seq) return adds.forEach((l) => l.remove());
 				begun = 1;
-				fire("before-swap", D, { url: f.href });
+				fire("before-swap", { url: f.href });
 				// From here the runtime restores this document's scroll, so the
 				// browser must not: on the entry left, and on the entries after it.
 				HI.scrollRestoration = "manual";
@@ -716,7 +718,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 						}),
 				),
 			);
-			fire("load", D, { url: f.href, regions: next });
+			fire("load", { url: f.href, regions: next });
 		} catch (e) {
 			if (begun) throw e;
 			if (DEV) why("the part could not be read:", e);

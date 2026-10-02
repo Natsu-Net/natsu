@@ -178,7 +178,7 @@ function open(o: Open): Opened {
 	} as never);
 	windows.push(window);
 	// happy-dom outside its own VM leaves the language's builtins unset on the window.
-	for (const name of ["Map", "Set", "WeakMap", "Promise", "Date", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "TypeError", "decodeURIComponent", "reportError"])
+	for (const name of ["Map", "Set", "WeakMap", "Promise", "Date", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "TypeError", "Math", "decodeURIComponent", "reportError"])
 		if (window[name] === undefined) window[name] = (globalThis as W)[name];
 	const errors: unknown[] = [];
 	window.reportError = (e: unknown) => void errors.push(e);
@@ -1635,7 +1635,6 @@ describe("prefetch", () => {
 		p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
 	const leave = (p: Opened, sel: string) =>
 		p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerout", { bubbles: true, pointerType: "mouse", relatedTarget: p.document.body }));
-	const touch = (p: Opened, sel: string) => p.document.querySelector(sel).dispatchEvent(new p.window.Event("touchstart", { bubbles: true }));
 
 	test("a 65 ms hover prefetches, marked Natsu-Prefetch, and the click uses it", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
@@ -1668,16 +1667,37 @@ describe("prefetch", () => {
 		}
 	});
 
-	test("leaving the link before 65 ms cancels; a touch prefetches at once", async () => {
-		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part()) } });
+	test("leaving the link before 65 ms cancels", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
 		hover(p, "#to-b");
 		await tick(20);
 		leave(p, "#to-b");
 		await tick(80);
 		expect(p.calls).toEqual([]);
-		touch(p, "#to-c");
-		await tick(5);
-		expect(p.calls.map((c) => c.url)).toEqual(["/c"]);
+	});
+
+	test("a touch prefetches after 65 ms, as a mouse does; a touch the browser takes to pan, or a scroll, cancels it", async () => {
+		const routes: Record<string, Route> = {};
+		for (const x of "bcd") routes[`/${x}`] = () => answer(part());
+		const shell = LINKS + `<a id="to-d" href="/d">D</a>`;
+		const p = open({ html: page({ shell }), routes });
+		const finger = (type: string, sel: string) =>
+			p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent(type, { bubbles: true, pointerType: "touch" }));
+		// A tap.
+		finger("pointerover", "#to-b");
+		await tick(30);
+		expect(p.calls).toEqual([]);
+		await tick(50);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		// A flick: the browser pans, and says so.
+		finger("pointerover", "#to-c");
+		finger("pointercancel", "#to-c");
+		await tick(90);
+		// Momentum: the page scrolls.
+		finger("pointerover", "#to-d");
+		p.window.dispatchEvent(new p.window.Event("scroll"));
+		await tick(90);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
 	});
 
 	test("a click before the dwell is over cancels the hover's prefetch: one request, the visit's", async () => {
