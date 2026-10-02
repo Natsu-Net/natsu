@@ -290,7 +290,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	});
 	// Back from the back/forward cache after a visit became a real load: no
 	// longer loading, and a loading timer frozen with the page must not fire.
-	on("pageshow", (e: PageTransitionEvent) => e.persisted && (clearTimeout(timer), H.removeAttribute(LOADING)));
+	on("pageshow", (e: PageTransitionEvent) => e.persisted && idle());
 	on("popstate", () => {
 		const s = st();
 		// The same path and query is a hash change: the browser's own.
@@ -383,8 +383,14 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	// --- visit ----------------------------------------------------------
 	let seq = 0;
 	let timer: ReturnType<typeof setTimeout>;
-	/** A real navigation, which nothing intercepts: the answer to anything unsure. */
-	const full = (u: URL, h?: string) => (h == "none" ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
+	/** No visit under way: no loading mark, and no timer to set one. */
+	const idle = () => (clearTimeout(timer), H.removeAttribute(LOADING));
+	/**
+	 * A real navigation, which nothing intercepts: the answer to anything
+	 * unsure. Not loading any more: one that never leaves the page (a
+	 * download, a 204) must not leave the mark on it.
+	 */
+	const full = (u: URL, h?: string) => (idle(), h == "none" ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
 	const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
 	const ids = (els: Element[]) => els.map((e) => e.id).join(" ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
@@ -578,8 +584,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			)
 				await D.startViewTransition(swap).updateCallbackDone;
 			else swap();
-			clearTimeout(timer);
-			H.removeAttribute(LOADING);
+			idle();
 
 			// Mounts allowed here, then the scripts this document has not run, in order.
 			list = new Set(scripts.map((s) => s[0]));

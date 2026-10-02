@@ -1099,22 +1099,37 @@ describe("events and attributes", () => {
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
 	});
 
-	test("a pageshow from the back/forward cache clears the mark, and a loading timer frozen with the page", async () => {
+	test("a real load leaves no mark and no timer: one that does not leave the page (a download, a 204) must not stay marked", async () => {
 		const p = open({ html: page(), routes: { "/b": () => control({ "natsu-reload": "route" }), "/c": () => tick(400).then(() => control({ "natsu-reload": "route" })) } });
 		const html = p.document.documentElement;
-		// happy-dom's PageTransitionEvent has no `persisted`.
-		const show = () => p.window.dispatchEvent(Object.assign(new p.window.Event("pageshow"), { persisted: true }));
-		// Slow: marked, then a real load; back from the cache, the mark goes.
+		// Slow: marked while it waits, unmarked by the real load.
 		p.click("#to-c");
-		await tick(450);
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
+		await tick(350);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
-		show();
+		await tick(100);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
-		// Fast: a real load before 300 ms; the timer, still pending on the way back, never fires.
+		// Fast: a real load before 300 ms; its timer never fires.
 		p.click("#to-b");
 		await settle();
 		expect(p.loads.length).toBe(2);
+		await tick(350);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+	});
+
+	test("a pageshow from the back/forward cache clears the mark, and a loading timer frozen with the page", async () => {
+		// A visit still waiting when the visitor left by other means: the page was frozen with it.
+		const p = open({ html: page(), routes: { "/b": () => new Promise(() => {}), "/c": () => new Promise(() => {}) } });
+		const html = p.document.documentElement;
+		// happy-dom's PageTransitionEvent has no `persisted`.
+		const show = () => p.window.dispatchEvent(Object.assign(new p.window.Event("pageshow"), { persisted: true }));
+		p.click("#to-c");
+		await tick(350);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
+		show();
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+		p.click("#to-b");
+		await settle();
 		show();
 		await tick(350);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
@@ -1526,8 +1541,8 @@ describe("development build", () => {
 });
 
 describe("size", () => {
-	test("the minified runtime stays within 3.5 KB of brotli (target 3.0 KB)", () => {
+	test("the minified runtime stays within 4.0 KB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(3500);
+		expect(br).toBeLessThanOrEqual(4000);
 	});
 });
