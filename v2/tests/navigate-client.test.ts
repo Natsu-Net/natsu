@@ -81,20 +81,36 @@ interface PartInit {
 	main?: string;
 	foot?: string;
 	regions?: string;
+	/** Natsu-Scripts entries: a bare src is a vouched `<script src defer>`; anything with `=` is sent as written. */
 	scripts?: string[];
+	/** Natsu-Nonce. */
+	nonces?: string;
 }
 
-/** A part: the page's head without scripts, its regions, then its script list (nonces removed). */
-const part = (o: PartInit = {}) =>
-	`<!doctype html><html><head><meta charset="utf-8"><title>${o.title ?? "B"}</title>` +
-	`<link rel="stylesheet" href="${o.sheet ?? "/_a/site.a.css"}">${o.head ?? ""}<meta name="natsu" content="k1.s1"></head><body>` +
-	(o.regions ??
-		`<main id="main" data-natsu-region>${o.main ?? "<h1>Page B</h1>"}</main><footer id="foot" data-natsu-region>${o.foot ?? "footer B"}</footer>`) +
-	(o.scripts ?? []).map((s) => `<script src="${s}" defer></script>`).join("") +
-	`</body></html>`;
+interface Part {
+	body: string;
+	headers: Record<string, string>;
+}
 
-const answer = (body: string, status = 200) =>
-	new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "natsu-part": "1" } });
+/** One Natsu-Scripts entry, as the server writes a `<script src defer>` carrying the response's nonce. */
+const entry = (src: string) => (src.includes("=") ? src : new URLSearchParams({ src, defer: "", nonce: "" }).toString());
+
+/** A part: the page's head without scripts and its regions; the scripts and the vouched nonces go in headers. */
+const part = (o: PartInit = {}): Part => ({
+	body:
+		`<!doctype html><html><head><meta charset="utf-8"><title>${o.title ?? "B"}</title>` +
+		`<link rel="stylesheet" href="${o.sheet ?? "/_a/site.a.css"}">${o.head ?? ""}<meta name="natsu" content="k1.s1"></head><body>` +
+		(o.regions ??
+			`<main id="main" data-natsu-region>${o.main ?? "<h1>Page B</h1>"}</main><footer id="foot" data-natsu-region>${o.foot ?? "footer B"}</footer>`) +
+		`</body></html>`,
+	headers: {
+		...(o.scripts && { "natsu-scripts": o.scripts.map(entry).join(" ") }),
+		...(o.nonces && { "natsu-nonce": o.nonces }),
+	},
+});
+
+const answer = (p: Part, status = 200) =>
+	new Response(p.body, { status, headers: { "content-type": "text/html; charset=utf-8", "natsu-part": "1", ...p.headers } });
 const control = (headers: Record<string, string>) => new Response(null, { status: 204, headers });
 
 // --- the harness ----------------------------------------------------------
@@ -483,20 +499,43 @@ describe("head", () => {
 		expect(p.document.getElementById("third-party")).toBe(ad);
 	});
 
-	test("a nonce the server vouched for (nonce=\"\") gets the boot nonce on a new element; an unchanged one stays", async () => {
-		// A browser shows a live element's nonce as "" (it hides it); the part writes it the same way.
+	test("a nonce Natsu-Nonce vouches for gets the boot nonce on a new element; an unchanged one stays; any other nonce goes", async () => {
+		// A browser shows a live element's nonce as "" (it hides it); the part carries the real one.
 		const p = open({
 			html: page({ head: `<style nonce="">.shell{}</style>` }),
-			routes: { "/b": () => answer(part({ head: `<style nonce="">.shell{}</style><style nonce="">.b{}</style><style>.unvouched{}</style>` })) },
+			routes: {
+				"/b": () =>
+					answer(
+						part({
+							head:
+								`<style nonce="r1">.shell{}</style><style nonce="r2">.b{}</style><style>.plain{}</style>` +
+								`<style nonce="forged">.forged{}</style><style nonce="">.bare{}</style><link rel="preload" as="font" href="/f.woff2" nonce="r1">`,
+							nonces: "r1 r2",
+						}),
+					),
+				"/c": () => answer(part({ title: "C", head: `<style nonce="r1">.c{}</style>` })),
+			},
 		});
 		const shell = p.document.querySelector("head style");
 		p.click("#to-b");
 		await settle();
-		const styles = [...p.document.head.querySelectorAll("style")] as W[];
-		expect(styles.map((s) => s.textContent)).toEqual([".shell{}", ".b{}", ".unvouched{}"]);
+		let styles = [...p.document.head.querySelectorAll("style")] as W[];
+		expect(styles.map((s) => s.textContent)).toEqual([".shell{}", ".b{}", ".plain{}", ".forged{}", ".bare{}"]);
 		expect(styles[0]).toBe(shell);
-		expect(styles[1].nonce).toBe("N0NCE");
-		expect(styles[2].nonce || "").toBe("");
+		expect(styles.map((s) => [s.getAttribute("nonce"), s.nonce || ""])).toEqual([
+			["", ""],
+			["", "N0NCE"],
+			[null, ""],
+			[null, ""],
+			[null, ""],
+		]);
+		const preload = p.document.querySelector('link[rel="preload"]');
+		expect([preload.getAttribute("nonce"), preload.nonce]).toEqual(["", "N0NCE"]);
+		// No Natsu-Nonce: nothing is vouched for, whatever the markup says.
+		p.click("#to-c");
+		await settle();
+		styles = [...p.document.head.querySelectorAll("style")] as W[];
+		expect(styles.map((s) => [s.textContent, s.getAttribute("nonce"), s.nonce || ""])).toEqual([[".c{}", null, ""]]);
 	});
 
 	test("scripts in either head are never touched", async () => {
@@ -602,13 +641,10 @@ describe("stylesheets", () => {
 				`href="/_a/site.a.css" data-natsu-later="/_a/site-later.a.css">`,
 			),
 			routes: {
-				"/b": () =>
-					answer(
-						part({ sheet: "/_a/site.b.css" }).replace(
-							`href="/_a/site.b.css">`,
-							`href="/_a/site.b.css" data-natsu-later="/_a/site-later.b.css">`,
-						),
-					),
+				"/b": () => {
+					const p = part({ sheet: "/_a/site.b.css" });
+					return answer({ ...p, body: p.body.replace(`href="/_a/site.b.css">`, `href="/_a/site.b.css" data-natsu-later="/_a/site-later.b.css">`) });
+				},
 			},
 			holdCss: ["/_a/site-later.b.css"],
 		});
@@ -839,8 +875,7 @@ describe("mounts and scripts", () => {
 			html: page({ scripts: ["/js/site.js"] }),
 			scripts: { "/js/site.js": (w) => w.natsu.mount("x", () => {}), "/js/b.js": (w) => w.natsu.mount("x", () => {}), "/js/c.js": (w) => w.natsu.mount("x", () => {}) },
 			routes: {
-				"/b": () =>
-					answer(part({ scripts: ["/js/site.js", "/js/b.js", "/js/c.js"] }).replace(`src="/js/b.js"`, `src="/js/b.js" data-x="1" crossorigin="anonymous"`)),
+				"/b": () => answer(part({ scripts: ["/js/site.js", "src=%2Fjs%2Fb.js&data-x=1&crossorigin=anonymous&defer=&nonce=", "/js/c.js"] })),
 			},
 		});
 		p.click("#to-b");
@@ -851,10 +886,55 @@ describe("mounts and scripts", () => {
 			["N0NCE", false],
 			["N0NCE", false],
 		]);
+		expect([...added[0].attributes].map((a: W) => a.name)).toEqual(["src", "data-x", "crossorigin", "defer"]);
 		expect(added[0].getAttribute("data-x")).toBe("1");
 		expect(added[0].getAttribute("crossorigin")).toBe("anonymous");
 		expect(added[0].getAttribute("nonce")).toBeNull();
 		expect(p.document.querySelectorAll('script[src="/js/site.js"]').length).toBe(1);
+	});
+
+	test("scripts come only from Natsu-Scripts: a script in the part's markup is never created", async () => {
+		const p = open({
+			html: page(),
+			scripts: { "/js/b.js": (w) => w.natsu.mount("x", () => {}) },
+			routes: {
+				"/b": () => {
+					const q = part({ main: `<h1>B</h1><script src="/js/in-region.js"></script>`, scripts: ["/js/b.js"] });
+					return answer({ ...q, body: q.body.replace("</body>", `<script src="/js/evil.js" defer></script></body>`) });
+				},
+			},
+		});
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("B");
+		expect([...p.document.querySelectorAll("body > script:not([data-booted])")].map((s: W) => s.getAttribute("src"))).toEqual(["/js/b.js"]);
+		expect(p.document.querySelector('script[src="/js/evil.js"]')).toBeNull();
+	});
+
+	test("an entry without the nonce key is created without one; a src is resolved against the part's URL", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page(),
+			scripts: {
+				"rel.js": (w) => w.natsu.mount("[data-rel]", (el: Element) => void log.push(el.textContent!)),
+				"/js/plain.js": (w) => w.natsu.mount("x", () => {}),
+			},
+			routes: {
+				"/shop/b": () => answer(part({ main: `<h1>B</h1><p data-rel>b</p>`, scripts: ["src=rel.js", "src=%2Fjs%2Fplain.js&async="] })),
+				"/shop/c": () => answer(part({ main: `<h1>C</h1><p data-rel>c</p>`, scripts: ["src=rel.js"] })),
+			},
+		});
+		await p.natsu.visit("/shop/b");
+		const added = [...p.document.querySelectorAll("body > script:not([data-booted])")] as W[];
+		expect(added.map((s) => [s.getAttribute("src"), s.nonce || "", s.hasAttribute("nonce"), s.async])).toEqual([
+			["rel.js", "", false, false],
+			["/js/plain.js", "", false, false],
+		]);
+		// Listed as /shop/rel.js: its mount runs on this page and the next, and it is never created twice.
+		await p.natsu.visit("/shop/c");
+		expect(log).toEqual(["b", "c"]);
+		expect(p.document.querySelectorAll('script[src="rel.js"]').length).toBe(1);
+		expect(p.loads).toEqual([]);
 	});
 
 	test("an unconverted script makes the next click a real load; data-natsu-once does not", async () => {

@@ -419,16 +419,35 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			if (DEV) why(r.headers.get("natsu-reload") ?? "not a part", u.href);
 			return full(u, h);
 		}
+		const f = new URL(r.url || u);
+		f.hash = u.hash;
 		const doc = new DOMParser().parseFromString(text, "text/html");
 		// Read with scripting off, their content is markup: a <noscript><style> would apply.
 		for (const e of doc.querySelectorAll("noscript")) e.remove();
+		// A nonce in the part's head is the real one, and Natsu-Nonce lists the
+		// ones the server vouched for. Those read "" (as a live element shows its
+		// hidden nonce, so the merge sees an unchanged one as unchanged) and get
+		// the boot nonce if they go in; any other nonce goes.
+		const vouched = (r.headers.get("natsu-nonce") || "").split(" ");
+		const trusted = new Set<Element>();
+		for (const e of doc.head.querySelectorAll("[nonce]")) {
+			const v = e.getAttribute("nonce");
+			if (v && vouched.includes(v)) e.setAttribute("nonce", ""), trusted.add(e);
+			else e.removeAttribute("nonce");
+		}
+		// The page's scripts come from Natsu-Scripts, never from markup: each
+		// entry is one tag's attributes, its src made absolute against the part.
+		const scripts = (r.headers.get("natsu-scripts") || "")
+			.split(" ")
+			.map((e) => new URLSearchParams(e))
+			.filter((p) => p.has("src"))
+			.map((p) => [new URL(p.get("src")!, f).href, p] as const);
 		const now = regions(D);
 		const next = regions(doc);
 		if (ids(now) != ids(next)) {
 			if (DEV) why("regions differ:", ids(now), "->", ids(next));
 			return full(u, h);
 		}
-		const srcs = [...doc.querySelectorAll<HTMLScriptElement>("body>script[src]")];
 
 		// Where the page is, read now: once the new sheets are in, reading it
 		// costs a style pass over the whole page. Every scroll after keeps it.
@@ -444,6 +463,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 					if (x) {
 						const c = D.importNode(l);
 						c.setAttribute("href", x);
+						if (trusted.has(l)) c.nonce = NONCE;
 						adds.push(c);
 					}
 		let fine: unknown = 1;
@@ -471,8 +491,6 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		}
 		/** Sheets that stay, by the href the server wrote: the new page's and their lazy halves. */
 		const keep = want.flatMap((l) => [href(l), l.getAttribute(LATER)]);
-		const f = new URL(r.url || u);
-		f.hash = u.hash;
 
 		const swap = () => {
 			fire("before-swap", D, { url: f.href });
@@ -505,8 +523,8 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			}
 			for (const e of [...adds, ...incoming.values()]) {
 				owned.add(e);
-				// The server writes `nonce=""` on what it vouched for; the CSP takes only the boot nonce.
-				if (e.hasAttribute("nonce")) (e as HTMLElement).nonce = NONCE;
+				// The CSP takes only the boot nonce, and only on what the server vouched for.
+				if (trusted.has(e)) (e as HTMLElement).nonce = NONCE;
 			}
 			D.head.append(...incoming.values());
 			now.forEach((el, i) => {
@@ -542,19 +560,21 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		H.removeAttribute(LOADING);
 
 		// Mounts allowed here, then the scripts this document has not run, in order.
-		list = new Set(srcs.map((s) => s.src));
+		list = new Set(scripts.map((s) => s[0]));
 		for (const el of next) mountIn(el);
 		await Promise.all(
-			srcs.map(
-				(s) =>
-					loaded.has(s.src) ||
+			scripts.map(
+				([src, p]) =>
+					loaded.has(src) ||
 					new Promise((y) => {
 						const c = D.createElement("script");
-						for (const at of s.attributes) c.setAttribute(at.name, at.value);
+						p.forEach((v, k) => k != "nonce" && c.setAttribute(k, v));
 						c.async = false;
-						c.nonce = NONCE;
-						loaded.add(s.src);
-						if (!c.hasAttribute("data-natsu-once")) listed.push(s.src);
+						// One the server vouched for gets the boot nonce; any other is left
+						// to the page's CSP, exactly as on a full load.
+						if (p.has("nonce")) c.nonce = NONCE;
+						loaded.add(src);
+						if (!p.has("data-natsu-once")) listed.push(src);
 						c.onload = c.onerror = y;
 						D.body.append(c);
 					}),
