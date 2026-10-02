@@ -170,6 +170,11 @@ const on = (type: string, fn: (e: never) => unknown, options?: AddEventListenerO
 	addEventListener(type, fn as EventListener, options);
 const fire = (name: string, target: EventTarget, detail?: unknown) =>
 	target.dispatchEvent(new CustomEvent("natsu:" + name, { bubbles: true, cancelable: true, detail }));
+/** The nearest `data-natsu-<name>` at or above `el`: present is on, "false" and "off" are off; undefined if none. */
+const flag = (el: Element, name: string) => {
+	const v = el.closest(`[data-natsu-${name}]`)?.getAttribute("data-natsu-" + name);
+	return v == null ? v : !/^(false|off)$/.test(v);
+};
 
 const mountIn = (root: Element, only?: Reg) => {
 	for (const r of only ? [only] : regs)
@@ -264,8 +269,11 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	const owned = new Set([...D.head.children].filter((e) => e.localName != "script"));
 	const unsafe = () => {
 		const bad = listed.filter((s) => !aware.has(s));
-		if (DEV && (!ready || bad[0])) why(ready ? "these scripts never called natsu.mount:" : "before DOMContentLoaded", bad);
-		return !ready || bad.length > 0;
+		// The page said this document is never to be swapped again (an ad shown, say).
+		const off = flag(H, "reload");
+		if (DEV && (!ready || off || bad[0]))
+			why(!ready ? "before DOMContentLoaded" : off ? "<html data-natsu-reload>" : "these scripts never called natsu.mount:", bad);
+		return !ready || off || bad.length > 0;
 	};
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
 	const here = () => L.pathname + L.search;
@@ -331,7 +339,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	// --- which clicks and forms -----------------------------------------
 	const ok = (el: Element, u: URL) =>
 		u.origin == L.origin &&
-		(el.closest("[data-natsu-reload]")?.getAttribute("data-natsu-reload") ?? "false") == "false" &&
+		!flag(el, "reload") &&
 		!/\.(?!html?$)\w+$/i.test(u.pathname);
 	const link = (e: Event, click?: 1) => {
 		const a = (e.target as Element).closest?.("a[href]");
@@ -407,7 +415,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		if (!a || a == over) return;
 		over = a;
 		clearTimeout(dwell);
-		dwell = setTimeout(() => a.closest("[data-natsu-prefetch=off]") || prefetch(a.href), wait);
+		dwell = setTimeout(() => flag(a, "prefetch") == false || prefetch(a.href), wait);
 	};
 	on("pointerover", (e: PointerEvent) => e.pointerType != "touch" && intent(e, 65), PASSIVE);
 	on("pointerout", (e: PointerEvent) => {
@@ -437,7 +445,11 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	const visit = async (url: string | URL, o: Opts = {}): Promise<void> => {
 		const u = new URL(url, L.href);
 		let h = o.history;
-		if (!fire("visit", D, { url: u.href }) && h != "none") return;
+		// Cancelled: nothing happens, unless the URL already changed (back/forward).
+		if (!fire("visit", D, { url: u.href })) {
+			if (DEV && h == "none") why("natsu:visit was cancelled", u.href);
+			return h == "none" ? full(u, h) : undefined;
+		}
 		if (unsafe() || u.origin != L.origin) return full(u, h);
 		// The page already shown: the browser too replaces rather than pushes.
 		if (!h && u.href == L.href) h = "replace";

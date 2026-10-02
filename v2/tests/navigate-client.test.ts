@@ -1124,6 +1124,64 @@ describe("events and attributes", () => {
 		expect(order).toEqual(["before-swap Page A", "b.js ran", "load main", "load foot"]);
 	});
 
+	test("a cancelled natsu:visit: a click or visit() does nothing; a back/forward, whose URL already changed, reloads", async () => {
+		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()) } });
+		await p.natsu.visit("/b");
+		p.document.addEventListener("natsu:visit", (e: Event) => e.preventDefault());
+		expect(p.click("#to-c")).toBe(true);
+		await settle();
+		p.window.history.back();
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([["reload"]]);
+	});
+
+	test("<html data-natsu-reload> makes every visit a real load: links, forms, back/forward, visit, refresh, and no prefetch", async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<form id="f" action="/search"><input name="q" value="1"></form>` }),
+			routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()), "/c": () => answer(part()) },
+		});
+		await p.natsu.visit("/b");
+		// An ad unit just showed: this document must never be swapped again.
+		p.document.documentElement.setAttribute("data-natsu-reload", "");
+		expect(p.click("#to-c")).toBe(false);
+		expect(p.submit("#f")).toBe(false);
+		p.natsu.prefetch("/c");
+		await p.natsu.visit("/c");
+		await p.natsu.refresh();
+		p.window.history.back();
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`], ["replace", `${ORIGIN}/b`], ["reload"]]);
+		// Turned off again ("false" or "off"), the document swaps.
+		p.document.documentElement.setAttribute("data-natsu-reload", "off");
+		expect(p.click("#to-c")).toBe(true);
+		await settle();
+		expect(path(p)).toBe("/c");
+	});
+
+	test("data-natsu-reload and data-natsu-prefetch: present is on, \"false\" and \"off\" are off, the nearest wins", async () => {
+		const p = open({
+			html: page({
+				shell:
+					LINKS +
+					`<div data-natsu-reload="true"><a id="r1" href="/b">x</a><p data-natsu-reload="off"><a id="r2" href="/b">x</a></p></div>` +
+					`<div data-natsu-prefetch="false"><a id="p1" href="/b">x</a><p data-natsu-prefetch><a id="p2" href="/c">x</a></p></div>` +
+					`<a id="p3" href="/d" data-natsu-prefetch="off">x</a>`,
+			}),
+			routes: { "/b": () => answer(part()), "/c": () => answer(part()), "/d": () => answer(part()) },
+		});
+		const hover = (sel: string) =>
+			p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
+		for (const sel of ["#p1", "#p2", "#p3"]) {
+			hover(sel);
+			await tick(90);
+		}
+		expect(p.calls.map((c) => c.url)).toEqual(["/c"]);
+		expect(p.click("#r1")).toBe(false);
+		expect(p.click("#r2")).toBe(true);
+	});
+
 	test("html[data-natsu-loading] appears after 300 ms and goes at the swap", async () => {
 		let release!: () => void;
 		const p = open({ html: page(), routes: { "/b": () => new Promise((y) => (release = () => y(answer(part())))) } });
