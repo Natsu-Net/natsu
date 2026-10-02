@@ -160,8 +160,8 @@ const PASSIVE = { passive: true };
 const regs: Reg[] = [];
 /** Live mounts: the element, and what stops it (abort the signal, run the cleanup). */
 let live: [Element, () => void][] = [];
-/** Scripts that called `mount` while they ran. */
-const aware = new Set<string>();
+/** Scripts that called `mount`: each element, and its src. */
+const aware = new Set<unknown>();
 /** Srcs whose mounts may run on the page shown. Unset at boot: all of them. */
 let list: Set<string> | undefined;
 let ready = false;
@@ -225,8 +225,18 @@ regs.push(["[data-natsu-island]", (el, signal) => island(el, signal).catch(() =>
 
 const api: NatsuClient = (window.natsu = {
 	mount(selector, fn) {
-		const s = D.currentScript as HTMLScriptElement | null;
-		if (s?.src) aware.add(s.src);
+		let s = D.currentScript as HTMLScriptElement | null;
+		if (!s) {
+			// A module script, or a call made later (an event, after an await):
+			// the stack names the script, nearest frame first, in every engine.
+			const stack = new Error().stack || "";
+			let at = 1e9;
+			for (const e of D.scripts) {
+				const i = e != me && e.src ? stack.indexOf(e.src + ":") : -1;
+				if (i >= 0 && i < at) (at = i), (s = e);
+			}
+		}
+		if (s) aware.add(s).add(s.src || s);
 		// A script in <head> runs once per document, as the shell does: its mounts go everywhere.
 		const r: Reg = [selector, fn, s && s.parentNode != D.head ? s.src : ""];
 		regs.push(r);
@@ -240,15 +250,29 @@ const api: NatsuClient = (window.natsu = {
 
 /** Every script this document ran or started. */
 const loaded = new Set([...D.scripts].map((s) => s.src));
-/** The ones that must have called `mount` for a swap to be safe. */
-let listed: string[] = [];
+/** The ones that must have called `mount` by the time a visit starts, for a swap to be safe. */
+const listed: HTMLScriptElement[] = [];
 let status: HTMLElement | undefined;
+/** What the browser runs: no type, a JavaScript one, or a module (not JSON, nor any other data block). */
+const JS = /^((application|text)\/(x-)?(java|ecma)script|text\/(javascript1\.[0-5]|jscript|livescript)|module|)$/i;
 
 const boot = () => {
 	if (ready) return;
 	ready = true;
-	for (const s of D.body.querySelectorAll("script[src]") as NodeListOf<HTMLScriptElement>)
-		if (s != me && !s.hasAttribute("data-natsu-once")) listed.push(s.src);
+	// Every script that ran here counts, inline and module ones too, but for
+	// the runtime, a data-natsu-once tag, and a classic head script that
+	// blocks the parser: it ran before the body existed, so it is shell.
+	for (const s of D.scripts) {
+		const t = s.type.trim();
+		if (
+			s != me &&
+			JS.test(t) &&
+			!s.noModule &&
+			!s.hasAttribute("data-natsu-once") &&
+			!(s.parentNode == D.head && !/^module$/i.test(t) && !(s.src && (s.defer || s.async)))
+		)
+			listed.push(s);
+	}
 	if (status) D.body.append(status);
 	mountIn(D.body);
 	fire("load", D.body);
@@ -268,11 +292,17 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	/** Head elements the server sent: the only ones a merge may remove. */
 	const owned = new Set([...D.head.children].filter((e) => e.localName != "script"));
 	const unsafe = () => {
-		const bad = listed.filter((s) => !aware.has(s));
+		const bad = listed.filter((s) => !aware.has(s) && !aware.has(s.src));
 		// The page said this document is never to be swapped again (an ad shown, say).
 		const off = flag(H, "reload");
 		if (DEV && (!ready || off || bad[0]))
-			why(!ready ? "before DOMContentLoaded" : off ? "<html data-natsu-reload>" : "these scripts never called natsu.mount:", bad);
+			why(
+				...(!ready
+					? ["before DOMContentLoaded"]
+					: off
+						? ["<html data-natsu-reload>"]
+						: [bad, "never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)"]),
+			);
 		return !ready || off || bad.length > 0;
 	};
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
@@ -653,7 +683,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 							// to the page's CSP, exactly as on a full load.
 							if (p.has("nonce")) c.nonce = NONCE;
 							loaded.add(src);
-							if (!p.has("data-natsu-once")) listed.push(src);
+							if (!p.has("data-natsu-once")) listed.push(c);
 							c.onload = c.onerror = y;
 							D.body.append(c);
 						}),

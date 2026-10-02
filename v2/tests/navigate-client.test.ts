@@ -8,10 +8,12 @@
  * written in the server's wire format, and `location.assign`, `replace`
  * and `reload` only record what a real load would have been.
  *
- * Page scripts are plain functions keyed by their src: the harness runs one
- * when its tag runs (at boot, or when the runtime appends it), with
- * `document.currentScript` set, which is how `natsu.mount` learns who is
- * calling. A tag with no function is a script that never calls `mount`.
+ * Page scripts are plain functions keyed by their src (an inline one by
+ * `#id`): the harness runs one when its tag runs (at boot, after the
+ * runtime, or when the runtime appends it), with `document.currentScript`
+ * set, which is how `natsu.mount` learns who is calling; a module script
+ * runs with none, as in a browser. A tag with no function is a script that
+ * never calls `mount`.
  *
  * happy-dom fires `load` on stylesheets and scripts synchronously, and has
  * no layout, fonts or view transitions: the real-browser half is
@@ -207,9 +209,8 @@ function open(o: Open): Opened {
 		}
 	};
 	const script = (el: Element) => {
-		const src = el.getAttribute("src") ?? "";
-		const fn = o.scripts?.[src];
-		if (fn) runAs(el, () => fn(window, el));
+		const fn = o.scripts?.[el.getAttribute("src") ?? `#${el.id}`];
+		if (fn) runAs(el.getAttribute("type") === "module" ? null! : el, () => fn(window, el));
 	};
 	// Scripts the runtime appends: run in the capture phase of their (synchronous) load event.
 	document.addEventListener(
@@ -233,7 +234,7 @@ function open(o: Open): Opened {
 	if (runtime) runtime.nonce = "N0NCE";
 	o.before?.(window);
 	runAs(runtime, () => new Function("window", `with (window) {${o.dev ? DEV_CODE : CODE}}`)(window));
-	for (const s of document.body.querySelectorAll("script[src]")) script(s);
+	for (const s of document.scripts) if (s !== runtime) script(s);
 
 	const opened: Opened = {
 		window,
@@ -580,13 +581,14 @@ describe("head", () => {
 	test("scripts in either head are never touched", async () => {
 		const p = open({
 			html: page({ head: `<script src="/js/head.js" defer></script>` }),
-			scripts: { "/js/head.js": () => {} },
+			scripts: { "/js/head.js": (w) => w.natsu.mount("x", () => {}) },
 			routes: { "/b": () => answer(part({ head: `<script src="/js/other-head.js"></script>` })) },
 		});
 		p.click("#to-b");
 		await settle();
 		const srcs = [...p.document.head.querySelectorAll("script")].map((s: W) => s.getAttribute("src"));
 		expect(srcs).toEqual(["/js/head.js", "/_a/natsu.js"]);
+		expect(p.loads).toEqual([]);
 	});
 });
 
@@ -1067,14 +1069,87 @@ describe("mounts and scripts", () => {
 		expect(path(q)).toBe("/b");
 	});
 
-	test("a script that calls mount only later (not while it runs) still counts as unconverted", async () => {
+	/** An Error whose stack names `src` as the caller, past the runtime's own frame, as a browser's does. */
+	const stackFrom = (src: string) => (w: W) => {
+		// A plain function, which works with `new` and without (the minifier drops it).
+		w.Error = function () {
+			return { stack: `Error\n    at Object.mount (${ORIGIN}/_a/natsu.js:1:2000)\n    at ${ORIGIN}${src}:3:7` };
+		};
+	};
+
+	test("a script that calls mount later (not while it runs) is known by the stack; with no stack naming it, it is unconverted", async () => {
+		const late = { "/js/late.js": (w: W) => w.document.addEventListener("DOMContentLoaded", () => w.natsu.mount("x", () => {})) };
+		const routes = { "/b": () => answer(part()) };
+		const p = open({ html: page({ scripts: ["/js/late.js"] }), scripts: late, routes });
+		await p.natsu.visit("/b");
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		const q = open({ html: page({ scripts: ["/js/late.js"] }), scripts: late, routes, before: stackFrom("/js/late.js") });
+		await q.natsu.visit("/b");
+		expect(q.loads).toEqual([]);
+		expect(path(q)).toBe("/b");
+	});
+
+	test("every script that runs counts: head defer and async, module, inline", async () => {
+		const kinds: PageInit[] = [
+			{ head: `<script src="/js/x.js" defer></script>` },
+			{ head: `<script src="/js/x.js" async></script>` },
+			{ head: `<script type="module">import "/js/x.js";</script>` },
+			{ shell: LINKS + `<script type="module" src="/js/x.js"></script>` },
+			{ shell: LINKS + `<script>document.querySelectorAll("main a").forEach(bind);</script>` },
+			{ shell: LINKS + `<script type="text/javascript">bind();</script>` },
+		];
+		for (const kind of kinds) {
+			const p = open({ html: page(kind), routes: { "/b": () => answer(part()) } });
+			await p.natsu.visit("/b");
+			expect([kind, p.loads]).toEqual([kind, [["assign", `${ORIGIN}/b`]]]);
+		}
+	});
+
+	test("not counted: data blocks, templates, nomodule, a classic head script that blocks the parser, data-natsu-once", async () => {
 		const p = open({
-			html: page({ scripts: ["/js/late.js"] }),
-			scripts: { "/js/late.js": (w) => w.document.addEventListener("DOMContentLoaded", () => w.natsu.mount("x", () => {})) },
+			html: page({
+				head:
+					`<script>window.config = {};</script><script src="/js/blocking.js"></script><script defer>window.inline = 1;</script>` +
+					`<script type="application/ld+json">{}</script><script type="importmap">{"imports":{}}</script><script type="speculationrules">{}</script>`,
+				shell:
+					LINKS +
+					`<script type="text/x-template"><b>{{x}}</b></script><script type="application/json">{}</script>` +
+					`<script nomodule src="/js/old-browsers.js"></script><script type="module" src="/js/mod.js" data-natsu-once></script>`,
+			}),
 			routes: { "/b": () => answer(part()) },
 		});
 		await p.natsu.visit("/b");
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		expect(p.loads).toEqual([]);
+		expect(path(p)).toBe("/b");
+	});
+
+	test("an inline script that calls mount while it runs is swap-safe, and its mounts go everywhere", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ shell: LINKS + `<script id="inline">natsu.mount("h1", …)</script>` }),
+			scripts: { "#inline": (w) => w.natsu.mount("h1", (el: Element) => void log.push(el.textContent!)) },
+			routes: { "/b": () => answer(part({ scripts: ["/js/b.js"] })) },
+		});
+		await p.natsu.visit("/b");
+		expect(p.loads).toEqual([]);
+		expect(log).toEqual(["Page A", "Page B"]);
+	});
+
+	test("a module script is known by the stack: swap-safe once it mounts, its mounts scoped to the pages that list it", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ main: `<h1>A</h1><p data-m>a</p>`, shell: LINKS + `<script type="module" src="/js/mod.js"></script>` }),
+			scripts: { "/js/mod.js": (w) => w.natsu.mount("[data-m]", (el: Element) => void log.push(el.textContent!)) },
+			routes: {
+				"/b": () => answer(part({ main: `<h1>B</h1><p data-m>b</p>`, scripts: ["src=%2Fjs%2Fmod.js&type=module&nonce="] })),
+				"/c": () => answer(part({ main: `<h1>C</h1><p data-m>c</p>` })),
+			},
+			before: stackFrom("/js/mod.js"),
+		});
+		await p.natsu.visit("/b");
+		await p.natsu.visit("/c");
+		expect(p.loads).toEqual([]);
+		expect(log).toEqual(["a", "b"]);
 	});
 
 	test("a page swapped in whose new script never calls mount makes the next visit a real load", async () => {
@@ -1775,7 +1850,13 @@ describe("development build", () => {
 		const q = open({ html: page(), dev: true, routes: { "/b": () => control({ "natsu-reload": "shell" }) } });
 		q.window.console.info = (...a: unknown[]) => void said.push(a);
 		await q.natsu.visit("/b");
-		expect(said[0]).toEqual(["natsu: real load,", "these scripts never called natsu.mount:", [`${ORIGIN}/js/legacy.js`]]);
+		// The scripts are logged as elements (an inline one has no src); compared here by their src.
+		const [lead, bad, line] = said[0] as [string, W[], string];
+		expect([lead, bad.map((s) => s.src), line]).toEqual([
+			"natsu: real load,",
+			[`${ORIGIN}/js/legacy.js`],
+			"never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)",
+		]);
 		expect(said[1]).toEqual(["natsu: real load,", "shell", `${ORIGIN}/b`]);
 	});
 
