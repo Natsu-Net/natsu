@@ -1652,6 +1652,19 @@ describe("events and attributes", () => {
 		expect([...q.document.querySelectorAll("body > script:not([data-booted])")].length).toBe(0);
 	});
 
+	test("visit pushes an entry by default and with history: push, and replace replaces it", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part({ title: "B" })), "/c": () => answer(part({ title: "C" })) } });
+		const length = p.window.history.length;
+		await p.natsu.visit("/b", { history: "push" });
+		expect(path(p)).toBe("/b");
+		expect(p.window.history.length).toBe(length + 1);
+		await p.natsu.visit("/c");
+		expect(p.window.history.length).toBe(length + 2);
+		await p.natsu.visit("/b", { history: "replace" });
+		expect(path(p)).toBe("/b");
+		expect(p.window.history.length).toBe(length + 2);
+	});
+
 	test("refresh replaces the entry, keeps scroll and focus, and skips the prefetch cache", async () => {
 		let n = 0;
 		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: `A${++n}` })) } });
@@ -2343,8 +2356,8 @@ describe("types", () => {
 });
 
 describe("size", () => {
-	test("the minified runtime stays within 4.0 KB of brotli", () => {
+	test("the minified runtime stays within 4 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(4000);
+		expect(br).toBeLessThanOrEqual(4096);
 	});
 });

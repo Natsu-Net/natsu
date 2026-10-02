@@ -623,7 +623,8 @@ if (!first && KEY && regions(D)[0]) {
 
 	const visit = async (url: string | URL, o: Opts = {}): Promise<void> => {
 		const u = new URL(url, L.href);
-		let h = o.history;
+		// "push" is what no option means; "replace" and "none" write over the entry shown.
+		let h = o.history != "push" ? o.history : undefined;
 		// Cancelled: nothing happens, unless the URL already changed (back/forward).
 		if (!fire("visit", { url: u.href })) {
 			if (DEV && "none" == h) why("natsu:visit was cancelled", u.href);
