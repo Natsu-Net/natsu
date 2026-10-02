@@ -894,6 +894,27 @@ describe("events and attributes", () => {
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
 	});
 
+	test("a pageshow from the back/forward cache clears the mark, and a loading timer frozen with the page", async () => {
+		const p = open({ html: page(), routes: { "/b": () => control({ "natsu-reload": "route" }), "/c": () => tick(400).then(() => control({ "natsu-reload": "route" })) } });
+		const html = p.document.documentElement;
+		// happy-dom's PageTransitionEvent has no `persisted`.
+		const show = () => p.window.dispatchEvent(Object.assign(new p.window.Event("pageshow"), { persisted: true }));
+		// Slow: marked, then a real load; back from the cache, the mark goes.
+		p.click("#to-c");
+		await tick(450);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
+		show();
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+		// Fast: a real load before 300 ms; the timer, still pending on the way back, never fires.
+		p.click("#to-b");
+		await settle();
+		expect(p.loads.length).toBe(2);
+		show();
+		await tick(350);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+	});
+
 	test("focus goes to [autofocus], else the h1, else the region; the title is read out through role=status", async () => {
 		const p = open({
 			html: page(),
@@ -1097,6 +1118,17 @@ describe("prefetch", () => {
 		touch(p, "#to-c");
 		await tick(5);
 		expect(p.calls.map((c) => c.url)).toEqual(["/c"]);
+	});
+
+	test("a click before the dwell is over cancels the hover's prefetch: one request, the visit's", async () => {
+		// The visit is still in flight, on /a, when the dwell would have ended.
+		const p = open({ html: page(), routes: { "/b": () => tick(100).then(() => answer(part())) } });
+		hover(p, "#to-b");
+		await tick(20);
+		p.click("#to-b");
+		await tick(150);
+		expect(p.calls).toEqual([{ url: "/b", headers: { "Natsu-Nav": "k1.s1" } }]);
+		expect(text(p, "main h1")).toBe("Page B");
 	});
 
 	test("skipped: Save-Data, 2g, data-natsu-prefetch=off, the current URL, an unsafe page", async () => {

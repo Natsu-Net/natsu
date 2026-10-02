@@ -60,18 +60,24 @@
  *     (four seconds at most). Every page's sheet is a slice of the same
  *     source in source order, so the old sheet, later in the cascade, keeps
  *     the old markup exactly as it was while the new one loads. A lazy half
- *     (`data-natsu-later`) loads too. Font faces the new sheet brings again
- *     are loaded before the swap, so text never flashes in a fallback.
+ *     (`data-natsu-later`) loads too. There is no font step: in Chromium a
+ *     face the new sheet declares again comes from the memory cache as the
+ *     old sheet goes, so text does not flash in a fallback, and when the
+ *     font cannot be cached, loading the new face early does not help,
+ *     because removing the old sheet makes the browser build its faces
+ *     afresh (tests/navigate.e2e.ts).
  *  4. In one synchronous step (inside a view transition only when
  *     `<html data-natsu-transition>` opts in): `natsu:before-swap`, history,
  *     the head merged by `outerHTML` (only what the server sent: scripts,
  *     nodes a third party added and `<html>` attributes are never touched),
  *     the old stylesheets out, each region unmounted and replaced, scroll,
  *     focus, and the title read out through a `role=status` element.
- *  5. The listed scripts this document has not run are created with the
- *     boot nonce (which `'strict-dynamic'` trusts) and `async = false`, so
- *     they run in order; then mounts run on the new regions and
- *     `natsu:load` bubbles from each.
+ *  5. The mounts already registered run on the new regions. The listed
+ *     scripts this document has not run are created with the boot nonce
+ *     (which `'strict-dynamic'` does not need, and a bare nonce policy does)
+ *     and `async = false`, so they run in order and their `mount` calls bind
+ *     as they run; once they have loaded, `natsu:load` bubbles from each
+ *     region.
  *
  * **Scroll** is kept per history entry, keyed by the entry the page on
  * screen belongs to, never by whatever `history.state` says at the moment:
@@ -252,8 +258,6 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	};
 	const bare = (u: URL | Location) => u.href.split("#")[0]!;
 	const here = () => L.pathname + L.search;
-	const sleep = (ms: number) => new Promise((y) => setTimeout(y, ms));
-	const race = (p: Promise<unknown>, ms: number) => Promise.race([p, sleep(ms)]);
 
 	// --- history --------------------------------------------------------
 	const st = (): { id: number; y?: number } | undefined => HI.state?.natsu;
@@ -273,7 +277,9 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		if ((st()?.id ?? cur) == cur) put(scrollY);
 		cache.clear();
 	});
-	on("pageshow", (e: PageTransitionEvent) => e.persisted && H.removeAttribute(LOADING));
+	// Back from the back/forward cache after a visit became a real load: no
+	// longer loading, and a loading timer frozen with the page must not fire.
+	on("pageshow", (e: PageTransitionEvent) => e.persisted && (clearTimeout(timer), H.removeAttribute(LOADING)));
 	on("popstate", () => {
 		const s = st();
 		// The same path and query is a hash change: the browser's own.
@@ -381,6 +387,8 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		// The page already shown: the browser too replaces rather than pushes.
 		if (!h && u.href == L.href) h = "replace";
 		const n = ++seq;
+		// A hover's pending prefetch would only fetch the same page twice.
+		clearTimeout(dwell);
 		clearTimeout(timer);
 		timer = setTimeout(() => H.setAttribute(LOADING, ""), 300);
 		let a: Answer | undefined;
@@ -431,23 +439,15 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 						adds.push(c);
 					}
 		let fine: unknown = 1;
-		if (adds[0]) {
-			const loads = Promise.all(adds.map((l) => new Promise((y, f) => ((l.onload = y), (l.onerror = f)))));
-			old[0] ? old[0].before(...adds) : D.head.append(...adds);
-			fine = await race(
-				loads.then(() => 1, () => 0),
-				4e3,
-			);
-			// Faces the new sheet declares again: loaded now, or text would flash in a fallback.
-			const faces = [...(D.fonts ?? [])];
-			const face = (f: FontFace) => [f.family, f.weight, f.style, f.unicodeRange].join();
-			const used = faces.filter((f) => f.status == "loaded").map(face);
-			if (fine)
-				await race(
-					Promise.all(faces.filter((f) => f.status == "unloaded" && used.includes(face(f))).map((f) => f.load().catch(() => {}))),
-					500,
-				);
-		}
+		if (adds[0])
+			fine = await new Promise((y) => {
+				let left = adds.length;
+				// Four seconds without every load counts as a failure too (undefined).
+				setTimeout(y, 4e3);
+				// The handlers go on before the links go in: a cached sheet may load at once.
+				for (const l of adds) (l.onload = () => --left || y(1)), (l.onerror = () => y(0));
+				old[0] ? old[0].before(...adds) : D.head.append(...adds);
+			});
 		if (n != seq || !fine) {
 			for (const l of adds) l.remove();
 			if (DEV && n == seq) why("a stylesheet did not load", u.href);

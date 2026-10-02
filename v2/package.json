@@ -9,6 +9,7 @@
 	"types": "index.ts",
 	"scripts": {
 		"test": "bun test",
+		"test:e2e": "bun test ./tests/navigate.e2e.ts",
 		"bench": "bun run bench/bench.ts",
 		"dev": "bun run --watch example/app.ts",
 		"typecheck": "tsc --noEmit"
