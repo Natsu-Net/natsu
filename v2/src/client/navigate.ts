@@ -253,8 +253,12 @@ const loaded = new Set([...D.scripts].map((s) => s.src));
 /** The ones that must have called `mount` by the time a visit starts, for a swap to be safe. */
 const listed: HTMLScriptElement[] = [];
 let status: HTMLElement | undefined;
-/** What the browser runs: no type, a JavaScript one, or a module (not JSON, nor any other data block). */
-const JS = /^((application|text)\/(x-)?(java|ecma)script|text\/(javascript1\.[0-5]|jscript|livescript)|module|)$/i;
+/**
+ * What the browser runs: no type, a JavaScript one (each has "script" in
+ * it), or a module; not JSON nor any other data block. A rarer type with
+ * "script" in it counts too, which costs speed, never correctness.
+ */
+const JS = /script|^(module)?$/i;
 
 const boot = () => {
 	if (ready) return;
@@ -543,7 +547,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			const now = regions(D);
 			const next = regions(doc);
 			// DOMParser leaves a declarative shadow root an inert <template>; a real load attaches it.
-			const shadow = doc.querySelector(REGION + " template[shadowrootmode]");
+			const shadow = doc.querySelector("template[shadowrootmode]");
 			if (ids(now) != ids(next) || shadow) {
 				if (DEV) why(...(shadow ? ["a declarative shadow root in a region:", shadow] : ["regions differ:", ids(now), "->", ids(next)]));
 				return full(u, h);
