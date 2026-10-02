@@ -160,7 +160,7 @@ place. The two hashes are what a swap cannot change:
 | Hash | Over | So a real load when |
 | --- | --- | --- |
 | `doc` | the build (a hash of the manifest) and CSP, CSP-Report-Only, Referrer-Policy, Permissions-Policy, COOP, COEP (`documentHeaders` adds more), nonces left out | a deploy, an ad network allowed on one page only, a checkout origin in `form-action` |
-| `shell` | every byte outside the head and the regions, less the script list and nonces, plus the region ids | a signed-in header, a re-minted CSRF token in the sign-out form, a banner |
+| `shell` | every byte outside the head and the regions, less the script list and nonces, plus the region ids, and the head's scripts less natsu's lazy stylesheet loaders | a signed-in header, a re-minted CSRF token in the sign-out form, a banner |
 
 **A navigation** is a GET carrying `Natsu-Nav: <doc>.<shell>` (and
 `Natsu-Prefetch: 1` for a hover prefetch). natsu deletes both headers before
@@ -181,14 +181,21 @@ to the ones the document on screen has); Set-Cookie always passes through.
 | `204`, `Natsu-Reload: regions` | the page has no usable region (none, no id, nested, unclosed, in the head, holding a declarative shadow root) |
 | `204`, `Natsu-Reload: response` | not a page: JSON, a download, a static file, no route |
 | `204`, `Natsu-Reload: inline-script` | a region holds a script that would not run when swapped in |
+| `204`, `Natsu-Reload: markup` | a script comes after svg or math that holds HTML (a `<foreignObject>`, a `<title>` with tags), which the scanner does not follow |
 | `204`, `Natsu-Prefetch: skip` | a prefetch the route or `ctx.nav.skip()` refused |
 
 Nothing in a part's markup is trusted, because a browser can read a page
 differently from the scanner (a stray end tag, foreign content), and markup
 that slipped into a page must not ride along into trust. The part holds no
 `<script>` at all: `Natsu-Scripts` lists every `<script src>` outside the
-head and the regions, one entry of URL-encoded attributes each, the
-runtime's own left out. Under a nonce CSP an entry gets a `nonce` key (the
+head and the regions that a browser runs, one entry of URL-encoded
+attributes each, the runtime's own left out. The scanner reads a page as a
+browser's tokenizer does (attribute values, comments bogus or not, raw text
+and a script's `<!--<script>` escapes) and tracks template contents and svg
+and math as the tree builder opens and closes them, so a script that never
+runs on a full load (in a template, a noscript, an attribute value, an svg,
+or one the page ends inside) is never listed; a random-page fuzzer checks
+that against Chromium. Under a nonce CSP an entry gets a `nonce` key (the
 runtime gives that script the document's nonce) only if the page gave it
 this response's nonce; one without is dropped under `'strict-dynamic'` (a
 script the runtime makes would run whatever its host) and listed without

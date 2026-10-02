@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { brotliCompressSync, brotliDecompressSync } from "node:zlib";
@@ -598,6 +598,80 @@ describe("the scanner, as a browser reads the page", () => {
 		// Quadratic, this was seconds; linear it is a few milliseconds.
 		expect(took).toBeLessThan(200);
 	});
+
+	/** A page with `before` ahead of the region and `after` behind it, then one script a browser runs. */
+	const shellPage = (before: string, after = "") =>
+		`<!doctype html><html><head><title>t</title></head><body>${before}<main id="m" data-natsu-region>x</main>${after}<script src="/ok.js"></script></body></html>`;
+	const listed = (html: string): string[] => {
+		const scan = scanPage(html);
+		if (scan === null || "reason" in scan) throw new Error(`no scan: ${JSON.stringify(scan)}`);
+		return scan.scripts.map((script) => script.src);
+	};
+
+	// Each of these was checked in Chromium: the script never runs on a full
+	// load, so it must never run on a visit.
+	test.each([
+		["inside a template", '<template><script src="/evil.js"></script></template>'],
+		["inside a template, in capitals", '<TEMPLATE><script src="/evil.js"></script></Template>'],
+		["inside a nested template", '<template><template></template><script src="/evil.js"></script></template>'],
+		["inside a noscript, in any case", '<noscript><script src="/evil.js"></script></noscript><NOSCRIPT><script src="/evil.js"></script></NOSCRIPT>'],
+		["in the text of an iframe, xmp, noembed or noframes", '<iframe><script src="/evil.js"></script></iframe><xmp><script src="/evil.js"></script></xmp><noembed><script src="/evil.js"></script></noembed><noframes><script src="/evil.js"></script></noframes>'],
+		["in an attribute value", `<div title="<script src='/evil.js'></script>">x</div><div title='<script src="/evil.js"></script>'>x</div>`],
+		["in an end tag's attribute value", '</div title="<script src=/evil.js></script>">'],
+		["in the attribute value after an = that starts a name", '<a ="x title="><script src="/evil.js"></script>">a</a>'],
+		["in a raw-text end tag's attribute value", '<style>a{}</style x="><script src=/evil.js></script>">'],
+		["in a bogus comment", '<!x <script src="/evil.js"></script>><? <script src="/evil.js"></script>></ <script src="/evil.js"></script>>'],
+		["in CDATA outside svg, which is a bogus comment", '<![CDATA[ <script src="/evil.js"></script> ]]>'],
+		["in svg or math, where a script's src loads nothing", '<svg><script src="/evil.js"></script></svg><math><script src="/evil.js"></script></math>'],
+		["swallowed by a data block's <!--<script>, which runs on past its end tag", '<script type="application/json">{"a":"<!--<script>"}</script><script src="/evil.js"></script>--></script>'],
+	])("a script %s is never listed", (_, before) => {
+		expect(listed(shellPage(before))).toEqual(["/ok.js"]);
+	});
+
+	test("a script the page ends inside is never listed: the parser marks it started", () => {
+		const html = '<!doctype html><html><head></head><body><main id="m" data-natsu-region>x</main><script src="/a.js"></script><script src="/cut.js">';
+		expect(listed(html)).toEqual(["/a.js"]);
+	});
+
+	test.each([
+		["an svg icon with a title and a style", '<svg viewBox="0 0 1 1"><title>Close</title><style>.a{fill:red}</style><path d="M0 0"/></svg>'],
+		["a closed template", "<template><p>x</p></template>"],
+		["an attribute value with a > in it", '<div title="a > b">x</div>'],
+	])("a script after %s is listed", (_, before) => {
+		expect(listed(shellPage(before, '<script src="/a.js"></script>'))).toEqual(["/a.js", "/ok.js"]);
+	});
+
+	test("an HTML element inside svg closes it, as a browser does: the script after it runs, so it is listed", () => {
+		expect(listed(shellPage("", '<svg><g><div>x</div><script src="/a.js"></script>'))).toEqual(["/a.js", "/ok.js"]);
+	});
+
+	test.each([
+		["a foreignObject holding HTML", "<svg><foreignObject><div>x</div></foreignObject></svg>"],
+		["a title holding tags", "<svg><title>a <b>b</b></title></svg>"],
+		["an end tag for an element outside it", "<div><svg><g></div>"],
+	])("a script after svg with %s is a full load: natsu cannot be sure how a browser reads it", (_, after) => {
+		expect(scanPage(shellPage("", after))).toMatchObject({ reason: "markup" });
+	});
+
+	test("a region's end tag or attribute in an attribute value is not one; a region whose start tag holds a < is one", () => {
+		const page = (body: string) => `<!doctype html><html><head></head><body>${body}</body></html>`;
+		const ending = page('<main id="m" data-natsu-region><p title="</main><div>">x</p></main><footer>f</footer>');
+		const scan = scanPage(ending);
+		if (scan === null || "reason" in scan) throw new Error("no scan");
+		expect(ending.slice(scan.regions[0]!.start, scan.regions[0]!.end)).toBe('<main id="m" data-natsu-region><p title="</main><div>">x</p></main>');
+		expect(scanPage(page('<div title="<p id=x data-natsu-region>">x</div><main id="m" data-natsu-region>x</main>'))).toMatchObject({ regions: [{ id: "m" }] });
+		expect(scanPage(page('<main id="m" title="a<b" data-natsu-region>x</main>'))).toMatchObject({ regions: [{ id: "m" }] });
+	});
+
+	test("an element in a template or an svg is never a region: a swap could not find it", () => {
+		const html = '<!doctype html><html><head></head><body><template><div id="t" data-natsu-region>x</div></template><svg><g id="s" data-natsu-region></g></svg><main id="m" data-natsu-region>x</main></body></html>';
+		expect(scanPage(html)).toMatchObject({ regions: [{ id: "m" }] });
+	});
+
+	test("a declarative shadow root in a region is found in any spelling", () => {
+		const html = '<!doctype html><html><head></head><body><main id="m" data-natsu-region><div><template SHADOWROOTMODE="open">x</template></div></main></body></html>';
+		expect(scanPage(html)).toMatchObject({ reason: "regions" });
+	});
 });
 
 describe("the script list", () => {
@@ -774,6 +848,47 @@ describe("the key", () => {
 		expect(shellOf(one, scanOne)).not.toContain("<head>");
 		expect(shellOf(one, scanOne)).toContain("\0main\0");
 		expect(shellOf(one, scanOne)).toContain("\0site-footer\0");
+	});
+
+	test("pages that link different lazy chunks of one stylesheet still swap: natsu's loader is left out of the shell", async () => {
+		writeFileSync(join(dir, "lazy.css"), ".hdr{position:sticky}.card{border:1px solid}.list{display:grid}.menu{display:none}.menu.open{display:block}.player{width:100%}.player.playing{outline:1px solid}.toast{position:fixed}");
+		const draw = (main: string) => (ctx: Context) => {
+			const nonce = crypto.randomUUID().replaceAll("-", "");
+			csp(ctx, nonce);
+			return `<!doctype html><html><head><title>t</title><link rel="stylesheet" href="/assets/lazy.css"></head><body><header class="hdr"><nav class="menu">m</nav></header><main id="main" data-natsu-region>${main}</main></body></html>`;
+		};
+		new Router().get("/a", navigable(draw('<div class="player">video</div>')));
+		new Router().get("/b", navigable(draw('<ul class="list"><li>b</li></ul>')));
+		const { app } = await pipeline({ assets: { styles: { lazy: [join(dir, "lazy.css")] }, rewrite: { "/assets/lazy.css": "lazy" }, safelist: ["open", "playing", "toast"], lazyStyles: true } });
+		const a = await (await get(app, "/a")).text();
+		const b = await (await get(app, "/b")).text();
+		// Each page loads its own lazy half, by a loader that names it.
+		expect(stylesheet(a)).not.toBe(stylesheet(b));
+		expect(a).toContain("document.currentScript.previousElementSibling");
+		expect(metaKey(a).split(".")[1]).toBe(metaKey(b).split(".")[1]);
+		expect((await nav(app, "/b", metaKey(a))).headers.get("natsu-part")).toBe("1");
+	});
+
+	test("an unquoted nonce with base64 padding is taken out of the shell whole: a kept page and a fresh one agree on the key", async () => {
+		const draw = (nonce: string) => `<!doctype html><html><head><title>t</title></head><body><header>site</header><main id=m data-natsu-region>x</main><script nonce=${nonce}>window.a=1</script></body></html>`;
+		const { assets, app } = await pipeline();
+		const pages = new PageCache({ prepare: (html) => assets.rewrite(html) });
+		const nonceOf = (ctx: Context) => ctx.request.headers.get("x-n")!;
+		new Router().get("/fresh", navigable((ctx) => {
+			csp(ctx, nonceOf(ctx));
+			return draw(nonceOf(ctx));
+		}));
+		new Router().get("/kept", navigable(async (ctx) => {
+			csp(ctx, nonceOf(ctx));
+			const kept = await pages.serve("/kept", [nonceOf(ctx)], async ([nonce]) => ({ body: draw(nonce!), status: 200 }));
+			if (kept?.prepared) assets.markRewritten(ctx, kept);
+			return kept?.body;
+		}));
+		const b64 = () => Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64"); // ends in "=="
+		const fresh = await keyOf(app, "/fresh", { "x-n": b64() });
+		const kept = await keyOf(app, "/kept", { "x-n": b64() });
+		expect(kept.split(".")[1]).toBe(fresh.split(".")[1]);
+		expect((await nav(app, "/kept", kept, { "x-n": b64() })).headers.get("natsu-part")).toBe("1");
 	});
 });
 
@@ -1128,6 +1243,29 @@ describe("delivery", () => {
 		const html = await (await get(app, "/p")).text();
 		expect(html).toMatch(/<link rel="stylesheet" href="\/_a\/site\.[0-9a-f]+\.css" data-natsu-later="\/_a\/site-later\.[0-9a-f]+\.css">/);
 	});
+
+	test("the runtime goes before the head's first deferred script a browser runs: not one in a template, a noscript or an attribute value", async () => {
+		const head = '<template><script src="/t.js" defer></script></template><noscript><script src="/n.js" defer></script></noscript>' +
+			'<meta name="x" content="<script src=/m.js defer>"><script src="/assets/head.js" defer></script>';
+		route("/p", { head });
+		new Router().get("/flat", navigable(() => `<!doctype html><html><head><title>x</title>${head}</head><body>no regions</body></html>`));
+		const { assets, app } = await pipeline();
+		const runtime = assets.url("natsu-navigate");
+		for (const path of ["/p", "/flat"]) {
+			const html = await (await get(app, path)).text();
+			const at = html.indexOf(runtime);
+			expect(at).toBeGreaterThan(html.indexOf('content="<script src=/m.js defer>">'));
+			expect(at).toBeLessThan(html.indexOf('<script src="/assets/head.js" defer>'));
+		}
+	});
+
+	test("an HTML fragment whose inline script writes a <head> is sent as the handler drew it", async () => {
+		const fragment = '<div id="invoice"><p>Invoice #42</p></div>' +
+			'<script>function printInvoice(){const w=window.open("");w.document.write("<html><head><title>Invoice</title></head><body>"+document.getElementById("invoice").innerHTML+"</body></html>");w.print()}</script>';
+		new Router().get("/invoice/42/partial", () => fragment);
+		const { app } = await pipeline();
+		expect(await (await get(app, "/invoice/42/partial")).text()).toBe(fragment);
+	});
 });
 
 describe("islands", () => {
@@ -1187,6 +1325,26 @@ describe("islands", () => {
 		const answer = await get(app, "/plain", { "natsu-island": "1", "sec-fetch-mode": "navigate" });
 		expect(answer.status).toBe(200);
 		expect(ran).toBe(1);
+	});
+
+	test("only an island() route's answer says Natsu-Island: not a page a middleware draws, nor a static file", async () => {
+		new Router().get("/account/settings", () => "<p>never reached for a signed-out visitor</p>");
+		const { app } = await pipeline();
+		// An auth middleware, registered after Assets, drawing the sign-in page itself.
+		app.use(async (ctx, next) => {
+			if (!ctx.path.startsWith("/account/")) return next();
+			ctx.response.headers.set("content-type", "text/html; charset=utf-8");
+			ctx.response.body = '<form method="post" action="/login"><input type="hidden" name="csrf" value="viewer-token"></form>';
+		});
+		expect((await get(app, "/account/settings", { "natsu-island": "1" })).headers.get("natsu-island")).toBeNull();
+
+		const pub = join(dir, "public");
+		mkdirSync(pub);
+		writeFileSync(join(pub, "page.html"), "<!doctype html><title>static</title><p>static page</p>");
+		reset({ Static: { enabled: true, beforeRoutes: true, root: pub } as never });
+		new Router().get("/page.html", () => "route");
+		const { app: statics } = await pipeline();
+		expect((await get(statics, "/page.html", { "natsu-island": "1" })).headers.get("natsu-island")).toBeNull();
 	});
 });
 

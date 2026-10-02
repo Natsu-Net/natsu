@@ -50,7 +50,7 @@ import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
 import { scriptNonce } from "./csp.ts";
-import { type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
+import { LAZY_LOADER_HEAD, type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
 import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
 import { type PageShape, PageShapes } from "./page-shape.ts";
 
@@ -893,8 +893,8 @@ function lazyLoader(url: string, triggers: string[], nonce: string | undefined):
 	return `${open}${LOADER_HEAD}${JSON.stringify(triggers.join(","))}${LOADER_MIDDLE}${JSON.stringify(url)}${LOADER_TAIL}`;
 }
 
-/** A lazy loader's text after its opening tag and up to its selector. */
-const LOADER_HEAD = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=';
+/** A lazy loader's text after its opening tag and up to its selector (shared with navigation, which leaves it out of the shell). */
+const LOADER_HEAD = LAZY_LOADER_HEAD;
 /** Its text between the selector and the lazy stylesheet's URL. */
 const LOADER_MIDDLE = ',c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=';
 /** Its text after the URL. */

@@ -208,6 +208,7 @@ says which:
 | `document` | a deploy, or the CSP or another document header differs | expected; nothing |
 | `regions` | no region, one without an id or end tag, nested regions, a region in the head, or a declarative shadow root in a region | fix the markup |
 | `inline-script` | a region holds a script that would not run when swapped in | move it after the region |
+| `markup` | a script comes after svg or math that holds HTML (a `<foreignObject>`, a `<title>` with tags in it), which natsu cannot read as surely as a browser | keep svg titles to plain text, or accept a full load there |
 | `response` | not a page: JSON, a download, a static file, no route | expected; nothing |
 
 A redirect is followed by the runtime (`Natsu-Location`), softly when it

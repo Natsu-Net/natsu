@@ -122,7 +122,7 @@ export interface Nav {
 }
 
 /** Why a navigation became a real load, as the `Natsu-Reload` header says it. */
-export type ReloadReason = "route" | "document" | "shell" | "regions" | "response" | "inline-script";
+export type ReloadReason = "route" | "document" | "shell" | "regions" | "response" | "inline-script" | "markup";
 
 /** The attribute that makes an element a region. */
 export const REGION_ATTRIBUTE = "data-natsu-region";
@@ -145,11 +145,16 @@ const DOCUMENT_HEADERS = [
 
 /** A nonce differs on every response, so it is never part of a key. */
 const CSP_NONCE = /'nonce-[^']*'/gi;
-/** `shadowrootmode` as templates spell it (attribute names are not case-sensitive, but these are the spellings in use). */
-const SHADOW_ROOT = ["shadowrootmode", "shadowRootMode"];
+/** A script start tag anywhere, in any case. */
+const SCRIPT_TAG = /<script[\t\n\f\r />]/i;
 /** A script tag with a nonce, as a page using a nonce CSP carries (development checks only). */
 const SCRIPT_NONCE = /<script\b[^>]*\snonce\s*=/i;
-const NONCE_ATTRIBUTE = /\snonce\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi;
+const NONCE_ATTRIBUTE = /\snonce\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi;
+/**
+ * How the inline script that links a lazy stylesheet (Assets' `lazyLoader`)
+ * starts, up to its selector: left out of the shell (see `shellOf`).
+ */
+export const LAZY_LOADER_HEAD = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=';
 /** A CSP nonce is base64 or base64url (CSP3's `base64-value`). */
 const NONCE_VALUE = /^[A-Za-z0-9+/=_-]+$/;
 
@@ -246,6 +251,8 @@ export function island(ref: Handler | string): Handler {
 
 /** Island fetches in flight: refused before any route that is not an `island()`. */
 const islandRequests = new WeakSet<Context>();
+/** Island fetches an `island()` route was let through to answer: only these say Natsu-Island back. */
+const islandAnswers = new WeakSet<Context>();
 
 /** Whether this request is the runtime filling an island. */
 export function isIslandRequest(ctx: Context): boolean {
@@ -271,7 +278,10 @@ export function keepNavigable(from: Handler, to: Handler): void {
  */
 export function refuseBeforeHandler(ctx: Context, handler: Handler): boolean {
 	if (islandRequests.has(ctx)) {
-		if (islands.has(handler)) return false;
+		if (islands.has(handler)) {
+			islandAnswers.add(ctx);
+			return false;
+		}
 		refuseIsland(ctx);
 		return true;
 	}
@@ -524,7 +534,7 @@ export class Navigation {
 		if (!islandRequests.has(ctx)) return;
 		const headers = ctx.response.headers;
 		addVary(headers, "Natsu-Island");
-		if (ctx.response.status !== 204) headers.set("natsu-island", "1");
+		if (ctx.response.status !== 204 && islandAnswers.has(ctx)) headers.set("natsu-island", "1");
 	}
 
 	/**
@@ -715,71 +725,17 @@ function shapeOf(page: string, runtime: boolean): Shape {
 		return { at, shell: undefined, hash: "", refusal };
 	}
 	const shell = shellOf(page, scan);
-	return { at: firstHeadScript(page, scan) ?? scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
-}
-
-/**
- * The head's first script that runs after the page is parsed (one with a
- * `src`, or a module), from the scan. An inline classic script runs where it
- * stands, before any deferred one, so the runtime need not come before it
- * (and a lazy stylesheet loader must stay right after its link).
- */
-function firstHeadScript(html: string, scan: PageScan): number | undefined {
-	const [, headStart, headClose] = scan.head;
-	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
-		if (isDeferredScriptAt(html, scan.raw[i]!)) return scan.raw[i]!;
-	}
-	return undefined;
-}
-
-function isDeferredScriptAt(html: string, at: number): boolean {
-	if (!isScriptAt(html, at)) return false;
-	const tag = readTag(html, at);
-	return tag !== null && (tag.get("src") !== undefined || tag.get("type")?.trim().toLowerCase() === "module");
-}
-
-/** Whether a `<template>` between `from` and `to` has the attribute `name` (as spelled), not text that mentions it. */
-function holdsAttribute(html: string, raw: number[], name: string, from: number, to: number): boolean {
-	const lower = name.toLowerCase();
-	for (let at = html.indexOf(name, from); at !== -1 && at < to; at = html.indexOf(name, at + name.length)) {
-		if (!isSpace(html.charCodeAt(at - 1)) || !isAttributeEnd(html.charCodeAt(at + name.length)) || inside(raw, at)) continue;
-		const tag = readTag(html, html.lastIndexOf("<", at));
-		if (tag?.name === "template" && tag.attributes.some((a) => a.at === at && a.name === lower)) return true;
-	}
-	return false;
+	return { at: scan.deferred !== -1 ? scan.deferred : scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
 }
 
 /**
  * Where the tags go in a page the region scan did not read: before the
- * head's first deferred script, as `firstHeadScript`; before `</head>` when it has
- * none; -1 with no head. One walk over the head alone.
+ * head's first deferred script, as on a page with regions; before
+ * `</head>` when it has none; -1 with no head. One walk over the head alone.
  */
 function runtimeAt(html: string): number {
-	let open = false;
-	for (let lt = html.indexOf("<"); lt !== -1; ) {
-		const next = html.charCodeAt(lt + 1);
-		if (next === 33) {
-			lt = html.indexOf("<", html.startsWith("--", lt + 2) ? commentEnd(html, lt) : lt + 1);
-			continue;
-		}
-		if (next === 47) {
-			if (open && namedAt(html, lt + 2, "head") && isTagEnd(html.charCodeAt(lt + 6))) return lt;
-		} else if (namedAt(html, lt + 1, "body") && isTagEnd(html.charCodeAt(lt + 5))) {
-			return -1;
-		} else if (!open) {
-			open = namedAt(html, lt + 1, "head") && isTagEnd(html.charCodeAt(lt + 5));
-		} else if (isDeferredScriptAt(html, lt)) {
-			return lt;
-		} else {
-			const name = RAW_NAMES.find((raw) => namedAt(html, lt + 1, raw) && isTagEnd(html.charCodeAt(lt + 1 + raw.length)));
-			if (name) {
-				lt = html.indexOf("<", closeOf(html, name, html.indexOf(">", lt + name.length + 1)));
-				continue;
-			}
-		}
-		lt = html.indexOf("<", lt + 1);
-	}
-	return -1;
+	const markup = readMarkup(html, true);
+	return markup.deferred !== -1 ? markup.deferred : markup.head[2];
 }
 
 
@@ -804,15 +760,17 @@ export interface PageScan {
 	/** `<head`, past its `>`, `</head`, past its `>`. */
 	head: [number, number, number, number];
 	regions: Region[];
-	/** Every `<script src>` outside the head and the regions, in document order. */
+	/** Every `<script src>` a browser runs outside the head and the regions, in document order. */
 	scripts: ScriptTag[];
-	/** Comments and raw text (script, style, textarea, title): flat start/end pairs, in order. */
+	/** Text the parser reads as no tag (see `Markup.raw`): flat start/end pairs, in order. */
 	raw: number[];
+	/** The head's first script that runs after the page is parsed, or -1 (see `Markup.deferred`). */
+	deferred: number;
 }
 
 /** Why a page with regions cannot answer a part. */
 export interface PageRefusal {
-	reason: "regions" | "response" | "inline-script";
+	reason: "regions" | "response" | "inline-script" | "markup";
 	detail: string;
 }
 
@@ -820,50 +778,46 @@ export interface PageRefusal {
  * Find a page's head, regions and scripts, or say why it has none to offer.
  * Null when it has no region at all.
  *
- * Not a tokenizer: one pass finds the raw-text spans (comments, script,
- * style, textarea, title; there are few), `indexOf` finds each occurrence of
- * the attribute, which is checked to be a real attribute of a real start tag
- * outside them, and one more pass counts the region's own tag name to find
- * its end. So a `</main>` inside a JSON-LD block, a comment or a style never
- * ends a region. About 0.04 ms for a 19 KB page, 0.12 ms for 72 KB and
- * 0.42 ms for 282 KB (bench/navigate.ts); a page without the attribute costs
- * one `indexOf`.
- *
- * It reads markup as templates write it: tag and attribute names in lower
- * case, `<` in attribute values escaped.
+ * Not a tree builder: one walk reads the page as a browser's tokenizer does
+ * (`readMarkup`), noting the text that holds no tag (comments, raw text, tags
+ * whose attribute values hold a `<`) and the markup that never runs
+ * (template contents, svg and math). Then `indexOf` finds each occurrence
+ * of the attribute, which is checked to be a real attribute of a real start
+ * tag outside them, and one more pass counts the region's own tag name to
+ * find its end. So a `</main>` inside a JSON-LD block, a comment, a style or
+ * an attribute value never ends a region, and a `<script>` a browser would
+ * never run (in a template, a noscript, an svg) is never listed. About
+ * 0.08 ms for a 19 KB page, 0.25 ms for 72 KB and 0.9 ms for 282 KB
+ * (bench/navigate.ts); a page without the attribute costs one `indexOf`.
  */
 export function scanPage(html: string): PageScan | PageRefusal | null {
 	if (html.indexOf(REGION_ATTRIBUTE) === -1) return null;
-	const raw = rawRanges(html);
-
-	const headOpen = findTag(html, raw, "<head", 0);
-	const headClose = headOpen === -1 ? -1 : findTag(html, raw, "</head", headOpen);
+	const { raw, inert, unsure, head, deferred, templates } = readMarkup(html);
+	const [headOpen, , headClose, headEnd] = head;
 	if (headClose === -1) return { reason: "response", detail: "the page has no <head>…</head>" };
-	const headStart = html.indexOf(">", headOpen) + 1;
-	const headEnd = html.indexOf(">", headClose) + 1;
-	if (headEnd === 0) return { reason: "response", detail: "the page's </head> never ends" };
 
 	const regions: Region[] = [];
-	// The tag a hit sits in starts at the last `<` before it. That `<` and the
-	// tag read there are kept until a `<` comes between two hits, so text that
-	// mentions the name a thousand times costs one walk over it, not a walk
-	// back from each mention.
+	// The tag a hit sits in starts at the last `<` before it, or where the
+	// raw range holding it starts (a tag whose values hold a `<`). That `<`
+	// and the tag read there are kept until the next `<` (or the range's
+	// end), so text that mentions the name a thousand times costs one walk
+	// over it, not a walk back from each mention.
 	let lt = -1;
 	let after = 0;
 	let tag: Tag | null = null;
-	/** Whether the body mentions a shadow root at all; looked for once a region is found. */
-	let shadow: boolean | undefined;
 	for (let hit = html.indexOf(REGION_ATTRIBUTE); hit !== -1; hit = html.indexOf(REGION_ATTRIBUTE, hit + REGION_ATTRIBUTE.length)) {
 		// An attribute is preceded by whitespace and followed by `=`, `>`, `/`
 		// or whitespace; text that merely mentions the name is not.
 		if (!isSpace(html.charCodeAt(hit - 1)) || !isAttributeEnd(html.charCodeAt(hit + REGION_ATTRIBUTE.length))) continue;
-		if (inside(raw, hit)) continue;
-		if (after !== -1 && after < hit) {
-			lt = html.lastIndexOf("<", hit);
-			after = html.indexOf("<", hit);
-			tag = readTag(html, lt);
+		if (hit >= after) {
+			const r = rangeAt(raw, hit);
+			after = r !== -1 ? raw[r + 1]! : nextOrEnd(html, hit);
+			lt = r !== -1 ? raw[r]! : tagAt(html, raw, hit);
+			tag = lt === -1 ? null : readTag(html, lt);
 		}
-		if (lt === -1 || !tag || tag.end <= hit || !tag.attributes.some((a) => a.at === hit && a.name === REGION_ATTRIBUTE)) continue;
+		if (!tag || tag.end <= hit || !tag.attributes.some((a) => a.at === hit && a.name === REGION_ATTRIBUTE)) continue;
+		// In a template or an svg, the element is never one a swap can find.
+		if (inside(inert, hit)) continue;
 
 		const label = `<${tag.name}${tag.get("id") ? ` id="${tag.get("id")}"` : ""}>`;
 		if (hit < headEnd) return { reason: "regions", detail: `${label} is a region inside <head>` };
@@ -875,12 +829,11 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		if (VOID.has(tag.name) || TABLE.has(tag.name)) {
 			return { reason: "regions", detail: `${label} cannot be a region: it needs an end tag and must be valid as a child of <body>` };
 		}
-		const end = endOf(html, raw, tag.name, tag.end);
+		const end = endOf(html, raw, inert, tag.name, tag.end);
 		if (end === -1) return { reason: "regions", detail: `${label} has no end tag` };
 		// A declarative shadow root is attached by the page's parser only; parsed
 		// into a part, it stays an inert <template> and its content is gone.
-		if (shadow === undefined) shadow = SHADOW_ROOT.some((name) => html.indexOf(name, headEnd) !== -1);
-		if (shadow && SHADOW_ROOT.some((name) => holdsAttribute(html, raw, name, lt, end))) {
+		if (templates.some((at) => at > lt && at < end && readTag(html, at)?.attributes.some((a) => a.name === "shadowrootmode"))) {
 			return { reason: "regions", detail: `region #${id} holds a declarative shadow root (<template shadowrootmode>), which a swap would leave inert` };
 		}
 
@@ -902,8 +855,18 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		regions.push({ id, start: lt, end });
 	}
 	if (regions.length === 0) return null;
+	// Past the point where the walk cannot be sure it reads the page as a
+	// browser does, it cannot say which scripts run, nor where a region ends.
+	if (unsure < html.length && SCRIPT_TAG.test(html.slice(unsure))) {
+		return {
+			reason: "markup",
+			detail: `a script comes after ${html.slice(unsure, tagNameEnd(html, unsure + 1))}> inside svg or math, which a browser may read as HTML; natsu cannot be sure which scripts it runs`,
+		};
+	}
 
-	// The script list: every <script src> outside the head and the regions.
+	// The script list: every <script src> outside the head and the regions
+	// that a browser runs. One in a template, an svg or a math element never
+	// runs on a full load, so it must never run on a visit either.
 	const scripts: ScriptTag[] = [];
 	let region = 0;
 	for (let i = 0; i < raw.length; i += 2) {
@@ -911,14 +874,14 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		if (start >= headOpen && start < headEnd) continue;
 		while (region < regions.length && regions[region]!.end <= start) region++;
 		if (region < regions.length && start >= regions[region]!.start) continue;
-		if (!isScriptAt(html, start)) continue;
+		if (!isScriptAt(html, start) || inside(inert, start)) continue;
 		const tag = readTag(html, start);
 		const src = tag?.get("src");
 		if (!tag || src === undefined) continue;
 		scripts.push({ start, end: raw[i + 1]!, attributes: tag.attributes, src, nonce: tag.get("nonce") });
 	}
 
-	return { head: [headOpen, headStart, headClose, headEnd], regions, scripts, raw };
+	return { head, regions, scripts, raw, deferred };
 }
 
 /**
@@ -932,7 +895,10 @@ export function shellOf(html: string, scan: PageScan): string {
 	const pieces: string[] = [];
 	const [headOpen, headStart, headClose, headEnd] = scan.head;
 	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
-		if (isScriptAt(html, scan.raw[i]!)) pieces.push(html.slice(scan.raw[i]!, scan.raw[i + 1]!));
+		const at = scan.raw[i]!;
+		// A lazy stylesheet loader is page-specific (its chunk, its triggers),
+		// and a swap needs none of it: the link's data-natsu-later says it.
+		if (isScriptAt(html, at) && !html.startsWith(LAZY_LOADER_HEAD, tagEnd(html, at + 7))) pieces.push(html.slice(at, scan.raw[i + 1]!));
 	}
 	pieces.push("\0");
 	const segments: number[] = [0, headOpen, headEnd];
@@ -1056,10 +1022,25 @@ export function cspNonces(csp: string | null): string[] {
 	return out;
 }
 
-// --- the scanner's pieces ------------------------------------------------------------
+// --- reading markup as a browser does --------------------------------------------------
 
-/** Elements whose insides the parser reads as text, not markup. */
-const RAW_NAMES = ["script", "style", "textarea", "title"];
+/** Elements whose content the tokenizer reads as text, not markup (`noscript`: scripts run); `plaintext` has no end. */
+const RAW_TEXT = ["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"];
+/** The start tags the walk acts on outside svg and math, by the length of their name. */
+const WATCHED: string[][] = [];
+for (const name of [...RAW_TEXT, "head", "body", "template", "svg", "math"]) (WATCHED[name.length] ??= []).push(name);
+/** HTML start tags that close every open svg and math element (`font` too, with color, face or size). */
+const BREAKOUT = new Set([
+	"b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed",
+	"h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing", "menu", "meta", "nobr",
+	"ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var",
+]);
+/**
+ * Inside svg or math, the elements whose content a browser may read as HTML
+ * (the integration points), and the names HTML reads as raw text: read the
+ * same either way only while they hold nothing but text.
+ */
+const SWITCHES = new Set([...RAW_TEXT, "template", "foreignobject", "desc", "mi", "mo", "mn", "ms", "mtext", "annotation-xml"]);
 
 /** No end tag, so never a region. */
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
@@ -1089,34 +1070,193 @@ const SCRIPT_TYPES = new Set([
 	"speculationrules",
 ]);
 
+/** What a browser makes of a page's markup, as far as a scan needs to know. */
+interface Markup {
+	/**
+	 * Text the parser reads as no tag at all: comments (bogus ones too, like
+	 * `<!doctype>`), CDATA in svg or math, raw-text elements whole (script,
+	 * style, textarea, title, noscript…), and any tag whose attribute values
+	 * hold a `<`. Flat start/end pairs, in order. A `<script` starts a range
+	 * here exactly where the tokenizer starts a script element.
+	 */
+	raw: number[];
+	/**
+	 * Markup that is parsed but never runs: the contents of a `<template>`,
+	 * and svg and math elements whole (a `<script src>` there loads nothing).
+	 * Flat start/end pairs, in order.
+	 */
+	inert: number[];
+	/**
+	 * Where the walk stops being sure it reads the page as a browser builds
+	 * it: inside svg or math, an element that switches back to HTML with
+	 * markup in it (a `<foreignObject>`, a `<title>` holding tags), or an end
+	 * tag for an element outside. The page's length when it never is.
+	 */
+	unsure: number;
+	/** `<head`, past its `>`, `</head`, past its `>`; -1 for each not found. */
+	head: [number, number, number, number];
+	/** Where each `<template` start tag is, in order (a declarative shadow root is one). */
+	templates: number[];
+	/**
+	 * The head's first script that runs after the page is parsed (one with a
+	 * `src`, or a module), or -1. An inline classic script runs where it
+	 * stands, before any deferred one, so the runtime need not come before
+	 * it (and a lazy stylesheet loader must stay right after its link).
+	 */
+	deferred: number;
+}
+
 /**
- * Comments and raw-text elements, as flat start/end pairs in document order.
- * One walk from `<` to `<`, looking at the character after each: about three
- * times quicker than a regular expression over the page, and in any case, as
- * browsers read tag names.
+ * Walk a page as a browser's tokenizer reads it: one step from each `<` to
+ * the next outside a tag, comment or raw text, so a `<` inside an attribute
+ * value or a comment is never taken for a tag, and raw text ends where the
+ * browser ends it (a script's `<!--<script>` escapes included). Template
+ * contents and svg and math subtrees are tracked (as the tree builder
+ * opens and closes them) but not built. `headOnly` stops at `</head>` or
+ * `<body>`.
  */
-function rawRanges(html: string): number[] {
-	const out: number[] = [];
-	for (let lt = html.indexOf("<"); lt !== -1; ) {
-		const next = html.charCodeAt(lt + 1);
-		let end = -1;
-		if (next === 33) {
-			if (html.startsWith("--", lt + 2)) end = commentEnd(html, lt);
-		} else if ((next | 32) === 115 || (next | 32) === 116) {
-			for (const name of RAW_NAMES) {
-				if (!isTagEnd(html.charCodeAt(lt + 1 + name.length)) || !namedAt(html, lt + 1, name)) continue;
-				end = closeOf(html, name, html.indexOf(">", lt + name.length + 1));
+function readMarkup(html: string, headOnly = false): Markup {
+	const raw: number[] = [];
+	const inert: number[] = [];
+	const head: [number, number, number, number] = [-1, -1, -1, -1];
+	const starts: number[] = [];
+	let unsure = html.length;
+	let deferred = -1;
+	/** Open `<template>`s. */
+	let templates = 0;
+	/** Open svg and math elements, outermost first, by name. */
+	const foreign: string[] = [];
+	let inertFrom = -1;
+	let lt = html.indexOf("<");
+	walk: while (lt !== -1) {
+		const c = html.charCodeAt(lt + 1);
+		let end = lt + 1;
+		if (c === 33 /* ! */ || c === 63 /* ? */) {
+			if (c === 33 && html.startsWith("--", lt + 2)) end = commentEnd(html, lt);
+			else if (c === 33 && foreign.length > 0 && html.startsWith("[CDATA[", lt + 2)) end = afterText(html, "]]>", lt + 9);
+			else end = afterText(html, ">", lt + 2); // a bogus comment: <!doctype …>, <?xml …>, <![CDATA[ in HTML
+			raw.push(lt, end);
+		} else if (c === 47 /* / */) {
+			const n = html.charCodeAt(lt + 2);
+			if (n === 62) end = lt + 3; // `</>` is dropped
+			else if (!isLetter(n)) {
+				end = afterText(html, ">", lt + 2); // `</ …>` is a bogus comment
+				raw.push(lt, end);
+			} else {
+				end = tagEnd(html, lt + 2);
+				const nameEnd = tagNameEnds;
+				if (end === -1) {
+					raw.push(lt, html.length); // a tag the page ends inside is dropped, and all after it
+					break;
+				}
+				if (holdsLt) raw.push(lt, end); // an attribute value holds a `<`
+				const length = nameEnd - lt - 2;
+				if (foreign.length > 0) {
+					const name = html.slice(lt + 2, nameEnd).toLowerCase();
+					// `</p>` and `</br>` are HTML and close every svg and math
+					// element; any other end tag closes the nearest open one of
+					// its name, or, with none, an element outside them.
+					const breakout = name === "p" || name === "br";
+					const open = breakout ? 0 : foreign.lastIndexOf(name);
+					if (open === -1) unsure = Math.min(unsure, lt);
+					else {
+						foreign.length = open;
+						if (open === 0 && templates === 0) inert.push(inertFrom, breakout ? lt : end);
+					}
+				} else if (length === 8 && templates > 0 && namedAt(html, lt + 2, "template")) {
+					if (--templates === 0) inert.push(inertFrom, end);
+				} else if (length === 4 && templates === 0 && head[0] !== -1 && head[2] === -1 && namedAt(html, lt + 2, "head")) {
+					head[2] = lt;
+					head[3] = end;
+					if (headOnly) break;
+				}
+			}
+		} else if (isLetter(c)) {
+			end = tagEnd(html, lt + 1);
+			const nameEnd = tagNameEnds;
+			const closed = selfClosing;
+			if (end === -1) {
+				raw.push(lt, html.length);
 				break;
 			}
+			let to = holdsLt ? end : -1; // an attribute value holds a `<`
+			if (foreign.length > 0) {
+				const name = html.slice(lt + 1, nameEnd).toLowerCase();
+				if (BREAKOUT.has(name) || (name === "font" && readTag(html, lt)!.attributes.some((a) => a.name === "color" || a.name === "face" || a.name === "size"))) {
+					// An HTML element: it closes every open svg and math element,
+					// and is read again as HTML.
+					foreign.length = 0;
+					if (templates === 0) inert.push(inertFrom, lt);
+					continue;
+				}
+				if (closed) {
+					// `<path/>`: nothing opens.
+				} else if (SWITCHES.has(name)) {
+					const after = html.indexOf("<", end);
+					if (after !== -1 && html.charCodeAt(after + 1) === 47 && namedAt(html, after + 2, name) && isTagEnd(html.charCodeAt(after + 2 + name.length))) {
+						const close = tagEnd(html, after + 2 + name.length);
+						end = to = close === -1 ? html.length : close;
+					} else {
+						unsure = Math.min(unsure, lt);
+						foreign.push(name);
+					}
+				} else foreign.push(name);
+			} else {
+				const name = watchedAt(html, lt + 1, nameEnd - lt - 1);
+				if (name === undefined) {
+					// Most tags: nothing to do.
+				} else if (name === "head") {
+					if (templates === 0 && head[0] === -1) {
+						head[0] = lt;
+						head[1] = end;
+					}
+				} else if (name === "body") {
+					if (headOnly && templates === 0) break;
+				} else if (name === "template") {
+					starts.push(lt);
+					if (templates++ === 0) inertFrom = lt;
+				} else if (name === "svg" || name === "math") {
+					if (!closed) {
+						if (templates === 0) inertFrom = lt;
+						foreign.push(name);
+					}
+				} else {
+					const close = rawEnd(html, name, end);
+					end = to = close === -1 ? html.length : close;
+					// A script the page ends inside is never run: the parser
+					// marks it started and moves on.
+					if (close === -1 && name === "script" && templates === 0) inert.push(lt, html.length);
+					else if (name === "script" && deferred === -1 && templates === 0 && head[0] !== -1 && head[2] === -1 && isDeferredScriptAt(html, lt)) {
+						deferred = lt;
+						if (headOnly) break;
+					}
+				}
+			}
+			if (to !== -1) raw.push(lt, to);
 		}
-		if (end === -1) {
-			lt = html.indexOf("<", lt + 1);
-			continue;
-		}
-		out.push(lt, end);
 		lt = html.indexOf("<", end);
 	}
-	return out;
+	if (templates > 0 || foreign.length > 0) inert.push(inertFrom, html.length);
+	return { raw, inert, unsure, head, deferred, templates: starts };
+}
+
+/** Which of the start tags the walk acts on (`WATCHED`) is named at `at`, `length` long, in any case. */
+function watchedAt(html: string, at: number, length: number): string | undefined {
+	const names = WATCHED[length];
+	if (names === undefined) return undefined;
+	for (const name of names) if (namedAt(html, at, name)) return name;
+	return undefined;
+}
+
+function isDeferredScriptAt(html: string, at: number): boolean {
+	const tag = readTag(html, at);
+	return tag !== null && (tag.get("src") !== undefined || tag.get("type")?.trim().toLowerCase() === "module");
+}
+
+/** Past the first `text` at or after `from`; the page's length without one. */
+function afterText(html: string, text: string, from: number): number {
+	const at = html.indexOf(text, from);
+	return at === -1 ? html.length : at + text.length;
 }
 
 /** Past the end of the comment opening at `lt`: `-->`, or `--!>` as browsers also read it; `<!-->` and `<!--->` are whole. */
@@ -1138,59 +1278,178 @@ function namedAt(html: string, at: number, name: string): boolean {
 	return true;
 }
 
-/** Past the `>` of the first `</name` end tag (any case) at or after `from`; the end of the page if there is none. */
-function closeOf(html: string, name: string, from: number): number {
-	if (from === -1) return html.length;
-	for (let at = html.indexOf("</", from); at !== -1; at = html.indexOf("</", at + 2)) {
-		if (!namedAt(html, at + 2, name) || !isTagEnd(html.charCodeAt(at + 2 + name.length))) continue;
-		const gt = html.indexOf(">", at);
-		return gt === -1 ? html.length : gt + 1;
-	}
-	return html.length;
+/** Where a tag name that starts at `from` ends: at whitespace, `/` or `>`, as the tokenizer reads names. */
+function tagNameEnd(html: string, from: number): number {
+	let i = from;
+	while (i < html.length && !isTagEnd(html.charCodeAt(i))) i++;
+	return i;
 }
 
-/** The first `<name` (or `</name`) at or after `from` that is a tag outside raw text, or -1. */
-function findTag(html: string, raw: number[], needle: string, from: number): number {
-	for (let at = html.indexOf(needle, from); at !== -1; at = html.indexOf(needle, at + 1)) {
-		if (isTagEnd(html.charCodeAt(at + needle.length)) && !inside(raw, at)) return at;
+/** Set by `tagEnd`: where the tag's name ends. */
+let tagNameEnds = 0;
+/** Set by `tagEnd`: whether the tag it read ends in `/>` (svg and math honour it). */
+let selfClosing = false;
+/** Set by `tagEnd`: whether the tag it read holds a `<` (in an attribute value or name). */
+let holdsLt = false;
+
+/**
+ * Past the `>` that ends the tag whose name starts at `at` (or ends there),
+ * as the tokenizer reads it: the name runs to whitespace, `/` or `>`; a
+ * value quoted after `=` hides any `>` and `<` in it, and an `=` opens a
+ * value only after an attribute's name (one at the start of a name is part
+ * of it). -1 when the page ends first (a browser then drops the tag). One
+ * pass over the tag's characters, which is quicker than jumping with
+ * `indexOf`: values are short.
+ */
+function tagEnd(html: string, at: number): number {
+	let i = at;
+	while (i < html.length && !isTagEnd(html.charCodeAt(i))) i++;
+	tagNameEnds = i;
+	/** In an attribute's name, or after it: an `=` opens its value. */
+	let named = false;
+	let slash = false;
+	let lt = false;
+	for (; i < html.length; i++) {
+		const c = html.charCodeAt(i);
+		if (c === 62) {
+			selfClosing = slash;
+			holdsLt = lt;
+			return i + 1;
+		}
+		slash = c === 47;
+		if (slash) {
+			named = false;
+			continue;
+		}
+		if (c <= 32 && isSpace(c)) continue;
+		if (c !== 61 || !named) {
+			if (c === 60) lt = true;
+			named = true; // an attribute's name, an `=` at its start included
+			continue;
+		}
+		let j = i + 1;
+		while (j < html.length && isSpace(html.charCodeAt(j))) j++;
+		const quote = html.charCodeAt(j);
+		named = false;
+		if (quote === 34 || quote === 39) {
+			for (j++; j < html.length; j++) {
+				const v = html.charCodeAt(j);
+				if (v === quote) break;
+				if (v === 60) lt = true;
+			}
+			if (j >= html.length) return -1;
+		} else {
+			for (; j < html.length; j++) {
+				const v = html.charCodeAt(j);
+				if (v === 62 || (v <= 32 && isSpace(v))) break;
+				if (v === 60) lt = true;
+			}
+			j--;
+		}
+		i = j;
+	}
+	return -1;
+}
+
+/** Past the end tag that ends the raw text of `name` begun at `from`; -1 when the page ends first. */
+function rawEnd(html: string, name: string, from: number): number {
+	if (name === "plaintext") return -1;
+	let close = closeAt(html, name, from);
+	if (name === "script" && close !== -1) {
+		const escape = html.indexOf("<!--", from);
+		if (escape !== -1 && escape < close) close = scriptCloseAt(html, from);
+	}
+	return close === -1 ? -1 : tagEnd(html, close + 2 + name.length);
+}
+
+/** The first `</name` end tag (any case) at or after `from`, or -1. */
+function closeAt(html: string, name: string, from: number): number {
+	for (let at = html.indexOf("</", from); at !== -1; at = html.indexOf("</", at + 2)) {
+		if (namedAt(html, at + 2, name) && isTagEnd(html.charCodeAt(at + 2 + name.length))) return at;
 	}
 	return -1;
 }
 
 /**
- * Past the `>` of the end tag that closes the `name` element whose start tag
- * ends at `from`, counting the elements of the same name opened inside it;
- * -1 without one.
+ * The `</script` that ends a script's text, through the tokenizer's escape
+ * states: after `<!--`, a `<script` makes the next `</script` only leave
+ * that state, until `-->`. So `<!--<script>` in a data block runs the
+ * block on past its own end tag, as a browser runs it. -1 for none.
  */
-function endOf(html: string, raw: number[], name: string, from: number): number {
+function scriptCloseAt(html: string, from: number): number {
+	/** 0: script data; 1: escaped (after `<!--`); 2: double escaped (after `<!--<script`). */
+	let state = 0;
+	for (let at = from; ; ) {
+		const lt = html.indexOf("<", at);
+		if (state !== 0) {
+			const dashes = html.indexOf("-->", at);
+			if (dashes !== -1 && (lt === -1 || dashes < lt)) {
+				state = 0;
+				at = dashes + 3;
+				continue;
+			}
+		}
+		if (lt === -1) return -1;
+		const end = html.charCodeAt(lt + 1) === 47 && namedAt(html, lt + 2, "script") && isTagEnd(html.charCodeAt(lt + 8));
+		if (state === 0) {
+			if (end) return lt;
+			if (html.startsWith("!--", lt + 1)) {
+				state = 1;
+				at = lt + 2; // `<!-->` is over at once
+				continue;
+			}
+		} else if (state === 1) {
+			if (end) return lt;
+			if (namedAt(html, lt + 1, "script") && isTagEnd(html.charCodeAt(lt + 7))) state = 2;
+		} else if (end) state = 1;
+		at = lt + 1;
+	}
+}
+
+/** `<name` and `</name` followed by what may end a tag name, in any case, by name. */
+const TAG_PATTERNS = new Map<string, RegExp>();
+
+/**
+ * Past the `>` of the end tag that closes the `name` element whose start tag
+ * ends at `from`, counting the elements of the same name opened inside it
+ * (outside raw text, templates and svg); -1 without one.
+ */
+function endOf(html: string, raw: number[], inert: number[], name: string, from: number): number {
+	let pattern = TAG_PATTERNS.get(name);
+	if (!pattern) {
+		pattern = new RegExp(`</?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=[\\t\\n\\f\\r />])`, "gi");
+		if (TAG_PATTERNS.size < 64) TAG_PATTERNS.set(name, pattern);
+	}
+	pattern.lastIndex = from;
 	let depth = 1;
-	for (let at = html.indexOf("<", from); at !== -1; at = html.indexOf("<", at + 1)) {
-		const close = html.charCodeAt(at + 1) === 47;
-		const start = close ? at + 2 : at + 1;
-		if (!isTagEnd(html.charCodeAt(start + name.length)) || !namedAt(html, start, name) || inside(raw, at)) continue;
-		if (!close) {
+	for (let match = pattern.exec(html); match !== null; match = pattern.exec(html)) {
+		const at = match.index;
+		if (inside(raw, at) || inside(inert, at)) continue;
+		if (html.charCodeAt(at + 1) !== 47) {
 			depth++;
 			continue;
 		}
-		if (--depth === 0) {
-			const gt = html.indexOf(">", at);
-			return gt === -1 ? -1 : gt + 1;
-		}
+		if (--depth === 0) return tagEnd(html, at + 2 + name.length);
 	}
 	return -1;
 }
 
-/** Whether `at` falls inside one of the raw ranges (a binary search: they are in order). */
-function inside(raw: number[], at: number): boolean {
+/** Whether `at` falls inside one of the ranges (a binary search: they are in order). */
+function inside(ranges: number[], at: number): boolean {
+	return rangeAt(ranges, at) !== -1;
+}
+
+/** Index (even) of the range that holds `at`, or -1. */
+function rangeAt(ranges: number[], at: number): number {
 	let lo = 0;
-	let hi = (raw.length >> 1) - 1;
+	let hi = (ranges.length >> 1) - 1;
 	while (lo <= hi) {
 		const mid = (lo + hi) >> 1;
-		if (at < raw[mid * 2]!) hi = mid - 1;
-		else if (at >= raw[mid * 2 + 1]!) lo = mid + 1;
-		else return true;
+		if (at < ranges[mid * 2]!) hi = mid - 1;
+		else if (at >= ranges[mid * 2 + 1]!) lo = mid + 1;
+		else return mid * 2;
 	}
-	return false;
+	return -1;
 }
 
 /** Index (even) of the first raw range that starts at or after `at`. */
@@ -1203,6 +1462,24 @@ function firstAtOrAfter(raw: number[], at: number): number {
 		else hi = mid;
 	}
 	return lo * 2;
+}
+
+/**
+ * The `<` of the start tag that may hold `at` (an attribute there): where
+ * the raw range holding it starts (a tag whose values hold a `<`), or the
+ * last `<` before it; -1 when that `<` is in raw text, so `at` is in text.
+ */
+function tagAt(html: string, raw: number[], at: number): number {
+	const r = rangeAt(raw, at);
+	if (r !== -1) return raw[r]!;
+	const lt = html.lastIndexOf("<", at);
+	return lt === -1 || inside(raw, lt) ? -1 : lt;
+}
+
+/** The next `<` after `at`, or the page's length. */
+function nextOrEnd(html: string, at: number): number {
+	const next = html.indexOf("<", at);
+	return next === -1 ? html.length : next;
 }
 
 interface Tag {
@@ -1219,9 +1496,8 @@ interface Tag {
  * splits them, quoted values included. Null if `lt` does not start one.
  */
 function readTag(html: string, lt: number): Tag | null {
-	let i = lt + 1;
-	while (i < html.length && isNameChar(html.charCodeAt(i))) i++;
-	if (i === lt + 1) return null;
+	if (html.charCodeAt(lt) !== 60 || !isLetter(html.charCodeAt(lt + 1))) return null;
+	let i = tagNameEnd(html, lt + 1);
 	const name = html.slice(lt + 1, i).toLowerCase();
 	const attributes: Tag["attributes"] = [];
 	for (;;) {
@@ -1301,10 +1577,6 @@ function decodeEntities(value: string): string {
 		const code = dec ? Number(dec) : Number.parseInt(hex!, 16);
 		return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
 	});
-}
-
-function isNameChar(code: number): boolean {
-	return (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code === 45;
 }
 
 // --- small helpers -------------------------------------------------------------------
