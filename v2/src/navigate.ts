@@ -47,6 +47,7 @@
 import { addVary } from "./compress.ts";
 import { config } from "./config.ts";
 import type { Context, Handler } from "./context.ts";
+import { GetController } from "./controller.ts";
 import { log } from "./logger.ts";
 import type { CachedPage, Filled } from "./page-cache.ts";
 
@@ -140,6 +141,10 @@ const DOCUMENT_HEADERS = [
 
 /** A nonce differs on every response, so it is never part of a key. */
 const CSP_NONCE = /'nonce-[^']*'/gi;
+/** `shadowrootmode` as templates spell it (attribute names are not case-sensitive, but these are the spellings in use). */
+const SHADOW_ROOT = ["shadowrootmode", "shadowRootMode"];
+/** A script tag with a nonce, as a page using a nonce CSP carries (development checks only). */
+const SCRIPT_NONCE = /<script\b[^>]*\snonce\s*=/i;
 const NONCE_ATTRIBUTE = /\snonce\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi;
 /** A CSP nonce is base64 or base64url (CSP3's `base64-value`). */
 const NONCE_VALUE = /^[A-Za-z0-9+/=_-]+$/;
@@ -194,10 +199,16 @@ const navigables = new WeakMap<Handler, { prefetch: boolean }>();
  *
  *   Routes.get("/", navigable(home));
  *   Routes.get("/checkout/review", navigable(review, { prefetch: false }));
+ *   Routes.get("/shop", navigable("Shop@index"));
+ *
+ * Mark the handler the route is registered with: a wrapper put around a
+ * navigable handler hides the mark, unless it is a navigable() too. On a
+ * decorated controller, `@Navigable()` on the method does the same.
  */
-export function navigable(handler: Handler, options: { prefetch?: boolean } = {}): Handler {
+export function navigable(ref: Handler | string, options: { prefetch?: boolean } = {}): Handler {
+	const handler = typeof ref === "string" ? GetController(ref) : ref;
 	const marked: Handler = (ctx) => handler(ctx);
-	Object.defineProperty(marked, "name", { value: handler.name || "navigable" });
+	Object.defineProperty(marked, "name", { value: typeof ref === "string" ? ref : handler.name || "navigable" });
 	keepNavigable(handler, marked);
 	navigables.set(marked, { prefetch: options.prefetch !== false });
 	return marked;
@@ -220,9 +231,10 @@ const islands = new WeakSet<Handler>();
  * to slip into user content, and an island naming `/account/delete` must not
  * pull that page's form, CSRF token and all, into someone's product page.
  */
-export function island(handler: Handler): Handler {
+export function island(ref: Handler | string): Handler {
+	const handler = typeof ref === "string" ? GetController(ref) : ref;
 	const marked: Handler = (ctx) => handler(ctx);
-	Object.defineProperty(marked, "name", { value: handler.name || "island" });
+	Object.defineProperty(marked, "name", { value: typeof ref === "string" ? ref : handler.name || "island" });
 	keepNavigable(handler, marked);
 	islands.add(marked);
 	return marked;
@@ -263,7 +275,7 @@ export function refuseBeforeHandler(ctx: Context, handler: Handler): boolean {
 	if (!(nav instanceof NavRequest)) return false;
 	const flag = navigables.get(handler);
 	if (!flag) {
-		nav.decide({ kind: "reload", reason: "route", detail: "the route is not navigable(): wrap its handler to let it answer parts" });
+		nav.decide({ kind: "reload", reason: "route", detail: "the route is not navigable(): wrap the handler it is registered with in navigable() (or mark the controller method @Navigable()) to let it answer parts" });
 		return true;
 	}
 	if (nav.prefetch && !flag.prefetch) {
@@ -372,7 +384,7 @@ export class Navigation {
 	private readonly prefetch: boolean;
 	/** Development only: recent shell texts by hash, to say what changed on a mismatch. */
 	private readonly shells = new Map<string, string>();
-	/** Development only: paths already warned about, so a log is not a flood. */
+	/** Development only: what each path was already warned about, so a log is not a flood. */
 	private readonly warned = new Set<string>();
 	/** What `full` read off each kept page (see `fullFilled`). */
 	private readonly shapes = new WeakMap<CachedPage, Shape>();
@@ -519,8 +531,8 @@ export class Navigation {
 	 */
 	public full(ctx: Context, page: string): string {
 		addVary(ctx.response.headers, "Natsu-Nav");
-		const shape = shapeOf(page);
-		const tags = this.tags(ctx, shape, shape.shell, shape.hash);
+		const shape = shapeOf(page, this.inject && this.runtime !== "");
+		const tags = this.tags(ctx, shape, shape.shell, shape.hash, page);
 		return tags ? `${page.slice(0, shape.at)}${tags}${page.slice(shape.at)}` : page;
 	}
 
@@ -535,34 +547,46 @@ export class Navigation {
 		let shape = this.shapes.get(filled.page);
 		if (shape === undefined) {
 			const kept = filled.page.body;
-			shape = shapeOf(kept);
+			shape = shapeOf(kept, this.inject && this.runtime !== "");
 			if (shape.at !== -1) shape = { ...shape, before: kept.slice(0, shape.at), after: kept.slice(shape.at) };
 			this.shapes.set(filled.page, shape);
 		}
 		// A secret outside the regions (a CSRF token in a header form) makes
 		// the shell this visitor's, and its hash too.
 		const shell = shape.shell === undefined ? undefined : filled.fill(shape.shell);
-		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!));
+		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), page);
 		return tags ? filled.fill(shape.before!) + tags + filled.fill(shape.after!) : page;
 	}
 
 	/** The key and the runtime for a page of this shape; "" for none. */
-	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string): string {
-		if (shape.refusal && development() && this.warned.size < 256 && !this.warned.has(ctx.path)) {
-			this.warned.add(ctx.path);
-			log.warn(`[<yellow>navigate</yellow>] ${ctx.path}: no soft navigation from this page (${shape.refusal.reason}: ${shape.refusal.detail})`);
-		}
+	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string, page: string): string {
+		if (shape.refusal && development()) this.warnOnce(ctx, `no soft navigation from this page (${shape.refusal.reason}: ${shape.refusal.detail})`);
 		if (shape.at === -1) return "";
+		const csp = header(ctx, "content-security-policy");
 		let tags = "";
 		if (shell !== undefined) {
 			if (development()) this.remember(hash, shell);
-			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}">`;
+			const prefetch = this.prefetch ? "" : ' data-prefetch="off"';
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}"${prefetch}>`;
 		}
 		if (this.inject && this.runtime) {
-			const nonce = cspNonces(header(ctx, "content-security-policy"))[0];
+			const nonce = cspNonces(csp)[0];
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
 		}
+		// A CSP set after Assets ran (a middleware that sets it once the route
+		// has answered) is one this step never saw: the runtime's tag has no
+		// nonce and is blocked, so the page simply loads for real every time.
+		if (csp === null && development() && SCRIPT_NONCE.test(page)) {
+			this.warnOnce(ctx, "the page's scripts carry nonces but the response had no Content-Security-Policy when Assets ran, so the runtime's script gets none; set the header before calling next(), or register that middleware inside Assets");
+		}
 		return tags;
+	}
+
+	private warnOnce(ctx: Context, message: string): void {
+		const key = `${ctx.path}\0${message}`;
+		if (this.warned.size >= 256 || this.warned.has(key)) return;
+		this.warned.add(key);
+		log.warn(`[<yellow>navigate</yellow>] ${ctx.path}: ${message}`);
 	}
 
 	/** The document key: the build and the document headers, nonces left out. */
@@ -670,19 +694,72 @@ interface Shape {
 	after?: string;
 }
 
-const NO_SHAPE: Shape = { at: -1, shell: undefined, hash: "", refusal: undefined };
-
-function shapeOf(page: string): Shape {
-	if (page.indexOf(REGION_ATTRIBUTE) === -1) return NO_SHAPE;
-	const scan = scanPage(page);
-	if (scan === null) return NO_SHAPE;
-	if ("reason" in scan) {
-		// No key, so the runtime stays inert here: no soft visit from this
-		// page, but its scripts' mounts and its islands still work.
-		return { at: scan.reason === "response" ? -1 : headCloseOf(page), shell: undefined, hash: "", refusal: scan };
+/**
+ * `runtime`: whether a page with no key still gets the runtime's tag (its
+ * scripts' mounts and its islands work everywhere; only soft visits need a key).
+ */
+function shapeOf(page: string, runtime: boolean): Shape {
+	const scan = page.indexOf(REGION_ATTRIBUTE) === -1 ? null : scanPage(page);
+	if (scan === null || "reason" in scan) {
+		const refusal = scan ?? undefined;
+		const at = runtime && refusal?.reason !== "response" ? runtimeAt(page) : -1;
+		return { at, shell: undefined, hash: "", refusal };
 	}
 	const shell = shellOf(page, scan);
-	return { at: scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
+	return { at: firstHeadScript(page, scan) ?? scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
+}
+
+/** The head's first script, from the scan. */
+function firstHeadScript(html: string, scan: PageScan): number | undefined {
+	const [, headStart, headClose] = scan.head;
+	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
+		if (isScriptAt(html, scan.raw[i]!)) return scan.raw[i]!;
+	}
+	return undefined;
+}
+
+/** Whether a `<template>` between `from` and `to` has the attribute `name` (as spelled), not text that mentions it. */
+function holdsAttribute(html: string, raw: number[], name: string, from: number, to: number): boolean {
+	const lower = name.toLowerCase();
+	for (let at = html.indexOf(name, from); at !== -1 && at < to; at = html.indexOf(name, at + name.length)) {
+		if (!isSpace(html.charCodeAt(at - 1)) || !isAttributeEnd(html.charCodeAt(at + name.length)) || inside(raw, at)) continue;
+		const tag = readTag(html, html.lastIndexOf("<", at));
+		if (tag?.name === "template" && tag.attributes.some((a) => a.at === at && a.name === lower)) return true;
+	}
+	return false;
+}
+
+/**
+ * Where the tags go in a page the region scan did not read: before the
+ * head's first script, as `firstHeadScript`; before `</head>` when it has
+ * none; -1 with no head. One walk over the head alone.
+ */
+function runtimeAt(html: string): number {
+	let open = false;
+	for (let lt = html.indexOf("<"); lt !== -1; ) {
+		const next = html.charCodeAt(lt + 1);
+		if (next === 33) {
+			lt = html.indexOf("<", html.startsWith("--", lt + 2) ? commentEnd(html, lt) : lt + 1);
+			continue;
+		}
+		if (next === 47) {
+			if (open && namedAt(html, lt + 2, "head") && isTagEnd(html.charCodeAt(lt + 6))) return lt;
+		} else if (namedAt(html, lt + 1, "body") && isTagEnd(html.charCodeAt(lt + 5))) {
+			return -1;
+		} else if (!open) {
+			open = namedAt(html, lt + 1, "head") && isTagEnd(html.charCodeAt(lt + 5));
+		} else if (isScriptAt(html, lt)) {
+			return lt;
+		} else {
+			const name = RAW_NAMES.find((raw) => namedAt(html, lt + 1, raw) && isTagEnd(html.charCodeAt(lt + 1 + raw.length)));
+			if (name) {
+				lt = html.indexOf("<", closeOf(html, name, html.indexOf(">", lt + name.length + 1)));
+				continue;
+			}
+		}
+		lt = html.indexOf("<", lt + 1);
+	}
+	return -1;
 }
 
 
@@ -754,6 +831,8 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 	let lt = -1;
 	let after = 0;
 	let tag: Tag | null = null;
+	/** Whether the body mentions a shadow root at all; looked for once a region is found. */
+	let shadow: boolean | undefined;
 	for (let hit = html.indexOf(REGION_ATTRIBUTE); hit !== -1; hit = html.indexOf(REGION_ATTRIBUTE, hit + REGION_ATTRIBUTE.length)) {
 		// An attribute is preceded by whitespace and followed by `=`, `>`, `/`
 		// or whitespace; text that merely mentions the name is not.
@@ -778,6 +857,12 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		}
 		const end = endOf(html, raw, tag.name, tag.end);
 		if (end === -1) return { reason: "regions", detail: `${label} has no end tag` };
+		// A declarative shadow root is attached by the page's parser only; parsed
+		// into a part, it stays an inert <template> and its content is gone.
+		if (shadow === undefined) shadow = SHADOW_ROOT.some((name) => html.indexOf(name, headEnd) !== -1);
+		if (shadow && SHADOW_ROOT.some((name) => holdsAttribute(html, raw, name, lt, end))) {
+			return { reason: "regions", detail: `region #${id} holds a declarative shadow root (<template shadowrootmode>), which a swap would leave inert` };
+		}
 
 		// A script parsed into a swapped region never runs, so a page whose
 		// region needs one is loaded for real. A data block (JSON, JSON-LD) is
@@ -983,13 +1068,6 @@ const SCRIPT_TYPES = new Set([
 	"importmap",
 	"speculationrules",
 ]);
-
-/** Where `</head` is, outside comments and raw text; -1 without one. */
-function headCloseOf(html: string): number {
-	const raw = rawRanges(html);
-	const open = findTag(html, raw, "<head", 0);
-	return open === -1 ? -1 : findTag(html, raw, "</head", open);
-}
 
 /**
  * Comments and raw-text elements, as flat start/end pairs in document order.

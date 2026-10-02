@@ -99,7 +99,7 @@ function get(app: Application, path: string, headers: Record<string, string> = {
 	return app.handle(new Request(`${BASE}${path}`, { method, headers }));
 }
 
-const metaKey = (html: string): string => /<meta name="natsu" content="([^"]+)">/.exec(html)?.[1] ?? "";
+const metaKey = (html: string): string => /<meta name="natsu" content="([^"]+)"/.exec(html)?.[1] ?? "";
 const stylesheet = (html: string): string => /<link rel="stylesheet" href="([^"]+)"/.exec(html)?.[1] ?? "";
 
 /** The key a visitor's runtime would send from `path`. */
@@ -548,8 +548,18 @@ describe("regions", () => {
 		expect(scanPage('<body><main id="m" data-natsu-region>x</main></body>')).toMatchObject({ reason: "response" });
 		// Text and attribute values that merely mention the name are not regions.
 		expect(scanPage(shell('<p>use data-natsu-region on main</p><a title="x data-natsu-region y" href="/">z</a>'))).toBeNull();
-		// Upper-case markup is not read: no regions, so a full load and no runtime.
+		// Upper-case markup is not read: no regions, so a full load.
 		expect(scanPage(shell('<MAIN ID="m" DATA-NATSU-REGION>x</MAIN>'))).toBeNull();
+	});
+
+	test("a declarative shadow root in a region is a full load: a part would leave it inert", () => {
+		const shell = (body: string) => `<!doctype html><html><head><title>x</title></head><body>${body}</body></html>`;
+		for (const spelling of ['shadowrootmode="open"', "shadowRootMode=closed"]) {
+			expect(scanPage(shell(`<main id="m" data-natsu-region><div><template ${spelling}><p>x</p></template></div></main>`))).toMatchObject({ reason: "regions" });
+		}
+		// Outside the regions, or only mentioned, it is no reason.
+		const outside = scanPage(shell('<header><template shadowrootmode="open">x</template></header><main id="m" data-natsu-region><p>use shadowrootmode="open"</p><code title="a shadowrootmode b">x</code></main>'));
+		expect(outside === null || "reason" in outside).toBe(false);
 	});
 
 	test("nested elements of the region's own tag and attribute values with > are read right", () => {
@@ -908,21 +918,38 @@ describe("delivery", () => {
 		expect(html.indexOf("natsu-navigate")).toBeLessThan(html.indexOf("</head>"));
 	});
 
-	test("a page with a region gets the key and the runtime, with this response's nonce", async () => {
+	test("a page with a region gets the key and the runtime, with this response's nonce, before the head's first script", async () => {
 		route("/p");
-		new Router().get("/flat", navigable(() => "<!doctype html><html><head><title>x</title></head><body>no regions</body></html>"));
 		const { assets, app } = await pipeline();
 		const answer = await get(app, "/p");
 		const html = await answer.text();
 		const nonce = /'nonce-([^']+)'/.exec(answer.headers.get("content-security-policy") ?? "")?.[1];
 		const runtime = assets.url("natsu-navigate");
 		expect(runtime).toMatch(/^\/_a\/natsu-navigate\.[0-9a-f]{10}\.js$/);
-		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script></head>`);
+		// First, so a page script deferred like it runs after it and finds `natsu`.
+		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script><script nonce="${nonce}">window.boot = 1;</script></head>`);
 		expect(metaKey(html)).toMatch(/^[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/);
+	});
 
+	test("a page without a region gets the runtime and no key, so its mounts and islands work", async () => {
+		const head = '<head><title>x</title><!-- <script src="/old.js"></script> --><style>p{} /* <script> */</style><script src="/page.js" defer></script></head>';
+		new Router().get("/flat", navigable(() => `<!doctype html><html>${head}<body>no regions</body></html>`));
+		new Router().get("/bare", navigable(() => "<!doctype html><html><head><title>x</title></head><body></body></html>"));
+		new Router().get("/headless", navigable(() => "<p>a fragment</p>"));
+		const { assets, app } = await pipeline();
+		const tag = `<script src="${assets.url("natsu-navigate")}" defer></script>`;
 		const flat = await (await get(app, "/flat")).text();
 		expect(flat).not.toContain('name="natsu"');
-		expect(flat).not.toContain("natsu-navigate");
+		expect(flat).toContain(`</style>${tag}<script src="/page.js" defer></script></head>`);
+		expect(await (await get(app, "/bare")).text()).toContain(`<title>x</title>${tag}</head>`);
+		expect(await (await get(app, "/headless")).text()).toBe("<p>a fragment</p>");
+	});
+
+	test("with prefetches off the key says so, so the runtime never sends one", async () => {
+		route("/p");
+		const { app } = await pipeline({ navigate: { prefetch: false } });
+		const html = await (await get(app, "/p")).text();
+		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}" data-prefetch="off">`);
 	});
 
 	test("the runtime is a classic script served from the chunk path, immutable", async () => {
@@ -950,12 +977,15 @@ describe("delivery", () => {
 		expect(code.split("\n").length).toBeGreaterThan(100);
 	});
 
-	test("with inject off a page carries the key and no runtime", async () => {
+	test("with inject off a page carries the key and no runtime, and a page without a region is left alone", async () => {
 		route("/p");
+		const flat = "<!doctype html><html><head><title>x</title></head><body>no regions</body></html>";
+		new Router().get("/flat", navigable(() => flat));
 		const { app } = await pipeline({ navigate: { inject: false } });
 		const html = await (await get(app, "/p")).text();
 		expect(metaKey(html)).not.toBe("");
 		expect(html).not.toContain("natsu-navigate");
+		expect(await (await get(app, "/flat")).text()).toBe(flat);
 	});
 
 	test("the key and runtime are filled in after PageCache, with each visitor's nonce", async () => {
@@ -1175,6 +1205,22 @@ describe("decorated routes", () => {
 		expect((await get(app, "/deco/bell", { "natsu-island": "1" })).headers.get("natsu-island")).toBe("1");
 		expect((await get(app, "/deco/page", { "natsu-island": "1" })).status).toBe(204);
 	});
+
+	test("routes that name a controller (\"Shop@index\") opt in by name, the controller added before or after", async () => {
+		new Router().get("/shop", navigable("Shop@index"));
+		new Router().get("/shop/bell", island("Shop@bell"));
+		const shop = new Controller("Shop");
+		shop.Add("index", () => page({ main: "<p>shop</p>" }));
+		shop.Add("bell", () => "<b>2</b>");
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/shop");
+		const part = await nav(app, "/shop", key);
+		expect(part.headers.get("natsu-part")).toBe("1");
+		expect(await part.text()).toContain("<p>shop</p>");
+		const bell = await get(app, "/shop/bell", { "natsu-island": "1" });
+		expect(bell.headers.get("natsu-island")).toBe("1");
+		expect(await bell.text()).toBe("<b>2</b>");
+	});
 });
 
 describe("development", () => {
@@ -1194,6 +1240,24 @@ describe("development", () => {
 			expect(line).toContain("GET /p");
 			expect(line).toContain("maintenance at noon");
 			expect(line).toMatch(/line 1, column \d+/);
+		} finally {
+			setLogSink(() => {});
+			setLogLevel("silent");
+		}
+	});
+
+	test("a CSP set after Assets ran is named: the runtime's tag could not get its nonce", async () => {
+		const lines: string[] = [];
+		setConfig({ General: { development: true, logLevel: "info" } });
+		setLogSink((line) => lines.push(line));
+		try {
+			new Router().get("/late", navigable(() => page({ nonce: "abc" })));
+			const { app } = await pipeline();
+			await get(app, "/late");
+			await get(app, "/late");
+			const said = lines.filter((l) => l.includes("no Content-Security-Policy when Assets ran"));
+			expect(said).toHaveLength(1);
+			expect(said[0]).toContain("/late");
 		} finally {
 			setLogSink(() => {});
 			setLogLevel("silent");
