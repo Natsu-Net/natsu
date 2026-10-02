@@ -1,0 +1,24 @@
+/* The fixture's one stylesheet, in source order: Assets cuts each page's
+   chunk from it, so a later page's chunk repeats `.hidden` without the
+   header's `.md:flex` whenever its page does not use that class. */
+@font-face{font-family:Probe;src:url(/fonts/probe.ttf) format("truetype");font-display:block}
+body{margin:0;font:16px/1.4 Probe,monospace}
+main{padding-top:48px}
+.hdr{position:fixed;top:0;left:0;right:0;height:40px;background:#fff;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}
+.hdr form{margin:0}
+.menu ul{position:absolute;margin:0;background:#fff}
+.foot{opacity:.8}
+.account{display:flex}
+.side{width:12rem;padding-top:48px}
+.banner{background:#fd0}
+.flash{background:#dfd}
+.hidden{display:none}
+.tall{height:5000px}
+.text-red{color:rgb(200,0,0)}
+.probe{display:inline-block;white-space:nowrap}
+.card{border:1px solid #ccc;padding:8px;border-radius:4px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.price{font-weight:700}
+.muted{color:#666}
+@media (min-width:768px){.md\:flex{display:flex}}
+@media (min-width:1024px){.lg\:grid{display:grid}}
