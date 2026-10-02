@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
+import type { Context } from "../src/context.ts";
 import { compress } from "../src/compress.ts";
 import { PageCache } from "../src/page-cache.ts";
 import { Application } from "../src/server.ts";
@@ -602,6 +603,73 @@ describe("lazy styles", () => {
 		const pipeline = assets({ lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
 		await pipeline.build();
 		expect(pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><div class="card"></div>')).not.toContain("<script>");
+	});
+});
+
+describe("the lazy loader under a CSP", () => {
+	/** A script of the page's own that starts as the loader does, right after a stylesheet link. */
+	const lookalike = '<script>(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S="";alert(1)})()</script>';
+	const page = '<html><head><link rel="stylesheet" href="/assets/css/site.css"><script nonce="NONCE" src="/s.js"></script></head>' +
+		`<body><div class="card">x</div><link rel="stylesheet" href="/assets/css/site.css">${lookalike}<script>own()</script></body></html>`;
+	const get = async (app: Application, path: string) => await (await app.handle(new Request(`http://natsu.test${path}`))).text();
+
+	test("carries the nonce the answer's own CSP allows scripts by", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		reset();
+		const answer = (csp: string | null) => (ctx: Context) => {
+			if (csp) ctx.response.headers.set("content-security-policy", csp);
+			ctx.response.headers.set("content-type", "text/html; charset=utf-8");
+			ctx.response.body = page;
+		};
+		new Router().get("/nonce", answer("default-src 'self'; script-src 'nonce-dGVzdA==' 'strict-dynamic'"));
+		new Router().get("/none", answer(null));
+		new Router().get("/hashes", answer("script-src 'sha256-abc' 'self'"));
+		new Router().get("/odd", answer(`script-src 'nonce-a"b' 'nonce-<i>'`));
+		const app = new Application();
+		app.use(pipeline.middleware());
+
+		const nonced = await get(app, "/nonce");
+		expect(nonced).toMatch(/<link rel="stylesheet" href="\/_a\/site\.[0-9a-f]{10}\.css"><script nonce="dGVzdA==">\(\(\)=>\{let d=0,/);
+		expect(nonced.split('nonce="dGVzdA=="').length).toBe(2);
+		// Scripts of the page's own are left as they are.
+		expect(nonced).toContain(`.css">${lookalike}<script>own()</script>`);
+		expect(nonced).toContain('<script nonce="NONCE" src="/s.js">');
+		// No CSP, a CSP without a nonce, or a nonce that is not base64: no nonce.
+		for (const path of ["/none", "/hashes", "/odd"]) {
+			const plain = await get(app, path);
+			expect(plain).toMatch(/\.css"><script>\(\(\)=>\{let d=0,/);
+			expect(plain.split("nonce=").length).toBe(2);
+		}
+	});
+
+	test("on a page kept rewritten, each answer's loader carries that answer's nonce, and nothing else gets it", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const pages = new PageCache({ prepare: (html) => pipeline.rewrite(html) });
+		reset();
+		new Router().get("/page", async (ctx) => {
+			const nonce = crypto.randomUUID().replaceAll("-", "");
+			ctx.response.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
+			const kept = await pages.serve("/page", [nonce], async ([mark]) => ({ body: page.replace("NONCE", mark!), status: 200 }));
+			if (kept?.prepared) pipeline.markRewritten(ctx);
+			ctx.response.body = kept?.body ?? "";
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+
+		const answers = [await get(app, "/page"), await get(app, "/page")];
+		const nonces = answers.map((answer) => /<script nonce="([0-9a-f]{32})" src="\/s\.js">/.exec(answer)?.[1] ?? "");
+		expect(nonces[0]).toMatch(/^[0-9a-f]{32}$/);
+		expect(nonces[1]).not.toBe(nonces[0]);
+		answers.forEach((answer, i) => {
+			expect(answer).toMatch(new RegExp(`\\.css"><script nonce="${nonces[i]}">\\(\\(\\)=>\\{let d=0,`));
+			// The page's own lookalike, after the same chunk link, is not the loader: no nonce.
+			expect(answer).toContain(`.css">${lookalike}<script>own()</script>`);
+			expect(answer.split(`nonce="${nonces[i]}"`).length).toBe(3);
+		});
+		// Rewritten once for everyone: the answers differ by their nonces alone.
+		expect(answers[0]!.replaceAll(nonces[0]!, "N")).toBe(answers[1]!.replaceAll(nonces[1]!, "N"));
 	});
 });
 

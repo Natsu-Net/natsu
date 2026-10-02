@@ -232,6 +232,11 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
+		return this.rewritePage(html, undefined);
+	}
+
+	/** `rewrite`, with the nonce this answer's CSP allows inline scripts by, if any. */
+	private rewritePage(html: string, nonce: string | undefined): string {
 		// Renaming walks the whole page and reads its shape on the way. Without
 		// a rename the shape is read only when a stylesheet is narrowed for it:
 		// a page linking scripts alone, or `wholeStylesheets`, skips the walk.
@@ -274,7 +279,30 @@ export class Assets {
 				const tag = out.slice(out.lastIndexOf("<", at), end + 1);
 				if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
 			}
-			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
+			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(close + 1)}`;
+		}
+		return out;
+	}
+
+	/**
+	 * A page kept rewritten (see PageCache's `prepare`) was rewritten once for
+	 * every visitor, before any one answer's nonce existed: its lazy loaders
+	 * get this answer's nonce now. Only a script that is exactly the loader
+	 * this pipeline writes for the stylesheet link right before it is given
+	 * one, so no script of the page's own ever is.
+	 */
+	private nonceLoaders(page: string, nonce: string): string {
+		let out = page;
+		for (let at = out.indexOf(LOADER_START); at !== -1; at = out.indexOf(LOADER_START, at + 1)) {
+			if (out.charCodeAt(at - 1) !== 62 /* > */) continue;
+			const tag = out.slice(out.lastIndexOf("<", at - 1), at);
+			if (!/^<link\b/i.test(tag)) continue;
+			const href = /\shref\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
+			const lazy = href ? this.lazy.get(href[1] ?? href[2] ?? "") : undefined;
+			if (!lazy) continue;
+			const plain = lazyLoader(lazy.url, lazy.triggers, undefined);
+			if (!out.startsWith(plain, at)) continue;
+			out = `${out.slice(0, at)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(at + plain.length)}`;
 		}
 		return out;
 	}
@@ -446,12 +474,19 @@ export class Assets {
 			await next();
 
 			const body = ctx.response.body;
-			if (typeof body !== "string" || this.rewritten.has(ctx)) return;
+			if (typeof body !== "string") return;
+			// A lazy loader is the one inline script of ours, so only lazy
+			// styles need the answer's nonce.
+			if (this.rewritten.has(ctx)) {
+				const nonce = this.lazy.size > 0 ? cspNonce(ctx) : undefined;
+				if (nonce) ctx.response.body = this.nonceLoaders(body, nonce);
+				return;
+			}
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
 			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
 			if (type ? !type.includes("html") : !body.startsWith("<")) return;
-			ctx.response.body = this.rewrite(body);
+			ctx.response.body = this.rewritePage(body, this.options.lazyStyles ? cspNonce(ctx) : undefined);
 		};
 	}
 
@@ -733,11 +768,37 @@ export class Assets {
  * menu, so the menu never draws unstyled — or as soon as an element
  * carrying one of `triggers` appears, whichever is first. It sits right
  * after the eager <link> and puts the lazy one after that, so the cascade
- * keeps the order the stylesheets were written in.
+ * keeps the order the stylesheets were written in. Under a CSP that allows
+ * inline scripts by nonce it carries the answer's nonce, or it would never
+ * run and the lazy rules never load.
  */
-function lazyLoader(url: string, triggers: string[]): string {
+function lazyLoader(url: string, triggers: string[], nonce: string | undefined): string {
 	const selector = JSON.stringify(triggers.join(","));
-	return `<script>(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=${selector},c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=${JSON.stringify(url)};a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>`;
+	const open = nonce ? `<script nonce="${nonce}">` : "<script>";
+	return `${open}${LOADER_BODY}S=${selector},c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=${JSON.stringify(url)};a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>`;
+}
+
+/** How every lazy loader starts, after its opening tag. */
+const LOADER_BODY = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],';
+/** A lazy loader as `rewrite` writes it, before any answer's nonce. */
+const LOADER_START = `<script>${LOADER_BODY}`;
+
+/** A CSP nonce is base64 or base64url (CSP3's `base64-value`): nothing to escape in an attribute. */
+const NONCE_VALUE = /^[A-Za-z0-9+/=_-]+$/;
+
+/**
+ * The nonce this answer's own Content-Security-Policy allows scripts by:
+ * its first `'nonce-…'` source that is base64 or base64url. Read from the
+ * response, after the route, so it is this visitor's even on a page kept
+ * for everyone.
+ */
+function cspNonce(ctx: Context): string | undefined {
+	const csp = ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null;
+	if (!csp) return undefined;
+	for (const match of csp.matchAll(/'nonce-([^']*)'/gi)) {
+		if (NONCE_VALUE.test(match[1] ?? "")) return match[1];
+	}
+	return undefined;
 }
 
 /**
