@@ -61,14 +61,17 @@ export interface NavigateOptions {
 	 */
 	documentHeaders?: string[];
 	/**
-	 * Put the runtime's `<script>` in the head of every page with a region
-	 * (default true). Off, the page carries only the key and the app links
+	 * Put the runtime's `<script defer>` in the head of every page (default
+	 * true), before the head's first deferred script: pages with a region
+	 * swap, and on every page `natsu.mount` and islands work. Off, a page
+	 * with a region carries only the key and the app links
 	 * `assets.url("natsu-navigate")` itself.
 	 */
 	inject?: boolean;
 	/**
-	 * Answer hover and touch prefetches (default true). Off, every prefetch is
-	 * refused before any route runs; a click still swaps.
+	 * Answer hover and touch prefetches (default true). Off, the key says so
+	 * (`data-prefetch="off"`) and the runtime sends none, and any that comes
+	 * anyway is refused before a route runs; a click still swaps.
 	 */
 	prefetch?: boolean;
 }
