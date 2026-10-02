@@ -30,7 +30,8 @@
  *    shell. `/ads`: a CSP that allows another image host, checked with
  *    `ctx.nav.stale()` before anything is drawn.
  *  - The header holds a search form (GET `/catalog`) and an island,
- *    `data-natsu-island="/bell"`, filled after load from `/bell`.
+ *    `data-natsu-island="/bell"`, filled after load from `/bell`, an
+ *    `island()` route.
  *  - `/account`, `/account/orders`: the account layout, with an inline
  *    `<style nonce>` of its own in the head and the orders page one more;
  *    `account.js` runs a clock that its cleanup must stop.
@@ -47,7 +48,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Application, Assets, PageCache, Router, compress, navigable, resetConfig, setConfig } from "../../../index.ts";
+import { Application, Assets, PageCache, Router, compress, island, navigable, resetConfig, setConfig } from "../../../index.ts";
 import type { Context, Handler, Middleware } from "../../../index.ts";
 
 const HERE = import.meta.dir;
@@ -275,11 +276,12 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 	}));
 	// Followed softly only on this origin: localhost is another origin than 127.0.0.1.
 	Routes.get("/away", navigable((ctx) => ctx.response.redirect(`http://localhost:${ctx.url.port}/c`)));
-	// The island's content: a plain GET with no navigation header, drawn per visitor.
-	Routes.get("/bell", (ctx) => {
+	// The island's content, drawn per visitor: only a route made with island()
+	// answers the runtime's Natsu-Island fetch.
+	Routes.get("/bell", island((ctx) => {
 		calls.bell++;
 		return `<span id="bell-count">${calls.bell}</span> new for ${escape(csrfOf(ctx))}`;
-	});
+	}));
 	Routes.get("/plain", (ctx) => {
 		calls.plain++;
 		return layout({ nonce: secure(ctx), csrf: csrfOf(ctx), title: "Plain", main: "<h1>Plain</h1>" });

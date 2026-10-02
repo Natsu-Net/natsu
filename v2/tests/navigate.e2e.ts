@@ -309,11 +309,13 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("a hash link's entry (null state), then a visit, then Back shows the right page", async () => {
+	e2e("a hash link's entry, then a visit, then Back shows the right page", async () => {
 		const page = await open("/a");
+		const shown = await page.evaluate(() => history.state.natsu.p);
 		await page.click("#jump");
 		await page.waitForFunction(() => location.hash === "#results");
-		expect(await page.evaluate(() => history.state)).toBeNull();
+		// The browser made the entry with no state; the runtime marks it as the same page.
+		expect(await page.evaluate(() => history.state.natsu.p)).toBe(shown);
 		const y = await page.evaluate(() => scrollY);
 		expect(y).toBeGreaterThan(4000);
 		await page.click("#to-b");
@@ -481,7 +483,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("an island in the shell is filled after load, kept across soft visits, and fetched again by natsu.island()", async () => {
+	e2e("an island in the shell is filled after load, kept across soft visits, and fetched again by natsu.island(); one naming another route is refused", async () => {
 		const page = await open("/a", "alice");
 		await page.waitForFunction(() => document.getElementById("bell-count") !== null);
 		const filled = fixture.calls.bell;
@@ -498,6 +500,17 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.evaluate(() => (window as any).natsu.island(document.getElementById("bell")));
 		expect(fixture.calls.bell).toBe(filled + 1);
 		expect(await page.textContent("#bell-count")).toBe(String(filled + 1));
+		// The attribute slipped into content, naming a route that is not an
+		// island(): refused before its handler runs, and nothing is drawn.
+		const plain = fixture.calls.plain;
+		await page.evaluate(() => {
+			const el = Object.assign(document.createElement("div"), { id: "slipped", textContent: "kept" });
+			el.setAttribute("data-natsu-island", "/plain");
+			document.body.append(el);
+			return (window as any).natsu.island(el);
+		});
+		expect(fixture.calls.plain).toBe(plain);
+		expect(await page.textContent("#slipped")).toBe("kept");
 		expect(await loads(page)).toBe(1);
 		await page.context().close();
 	});
@@ -815,9 +828,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 				let swap = 0;
 				document.addEventListener("natsu:visit", () => (start = performance.now()));
 				document.addEventListener("natsu:before-swap", () => (swap = performance.now()));
-				document.addEventListener("natsu:load", (e) => {
-					if ((e.target as Element).id === "main") w.__times.push([location.pathname, swap - start, performance.now() - start]);
-				});
+				document.addEventListener("natsu:load", () => w.__times.push([location.pathname, swap - start, performance.now() - start]));
 			});
 			for (let i = 0; i < 6; i++) {
 				for (const [link, name] of [["#to-catalog", "Catalog"], ["#to-p1", "Product 1"]] as const) {
