@@ -364,7 +364,8 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		if (e.defaultPrevented || (attr("method") || "get").toLowerCase() != "get" || (target && target != "_self")) return;
 		const u = new URL(attr("action") || "", D.baseURI);
 		if (!ok(form, u) || (by && !ok(by, u))) return;
-		u.search = new URLSearchParams(new FormData(form, by) as unknown as string[][]).toString();
+		// A file goes as its name, as the browser sends it in a query.
+		u.search = new URLSearchParams([...new FormData(form, by)].map(([k, v]) => [k, (v as File).name ?? v])).toString();
 		e.preventDefault();
 		visit(u);
 	});

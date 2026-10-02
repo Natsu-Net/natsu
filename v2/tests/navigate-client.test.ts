@@ -472,6 +472,18 @@ describe("GET forms", () => {
 		expect(path(p)).toBe("/search?q=tea+cup");
 	});
 
+	test("a file field sends its file's name, as the browser does in a query", async () => {
+		const p = open({
+			html: page({ shell: `<form id="up" action="/search"><input name="q" value="x"><input type="file" name="photo"><input type="file" name="none"></form>` }),
+			routes: { "/search?q=x&photo=cat+1.jpg&none=": () => answer(part({ title: "Found" })) },
+		});
+		p.document.querySelector('input[name="photo"]').files = [new p.window.File(["meow"], "cat 1.jpg")];
+		p.submit("#up");
+		await settle();
+		expect(path(p)).toBe("/search?q=x&photo=cat+1.jpg&none=");
+		expect(p.document.title).toBe("Found");
+	});
+
 	test("a form with no action goes to the page's own URL", async () => {
 		const p = open({ html: page({ shell }), routes });
 		p.submit("#here");
