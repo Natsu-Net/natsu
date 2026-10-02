@@ -133,6 +133,8 @@ interface Open {
 	/** Stylesheet hrefs that fail, or never load. */
 	failCss?: string[];
 	holdCss?: string[];
+	/** Script srcs the runtime appends that stay loading until `release`d. */
+	holdJs?: string[];
 	/** Runs on the window before the runtime does: history state, stubs. */
 	before?: (window: W) => void;
 }
@@ -147,7 +149,7 @@ interface Opened {
 	loads: string[][];
 	/** Errors the runtime reported (a mount that threw). */
 	errors: unknown[];
-	/** Let a held stylesheet (`holdCss`) finish loading. */
+	/** Let a held stylesheet (`holdCss`) or script (`holdJs`) finish loading. */
 	release(href: string): void;
 	ready(): void;
 	/** Dispatch a click; true when the runtime took it (prevented its default). */
@@ -185,7 +187,7 @@ function open(o: Open): Opened {
 	window.reportError = (e: unknown) => void errors.push(e);
 	const document = window.document;
 	document.write(o.html);
-	const held = new Set(o.holdCss);
+	const held = new Set([...(o.holdCss ?? []), ...(o.holdJs ?? [])]);
 	const calls: Opened["calls"] = [];
 	const loads: string[][] = [];
 	Object.defineProperty(window.location, "assign", { value: (u: string) => loads.push(["assign", String(u)]) });
@@ -218,7 +220,10 @@ function open(o: Open): Opened {
 		"load",
 		(e: Event) => {
 			const t = e.target as Element;
-			if (t.localName === "script" && !t.hasAttribute("data-booted")) script(t);
+			if (t.localName === "script" && !t.hasAttribute("data-booted")) {
+				if (held.has(t.getAttribute("src") ?? "")) return e.stopImmediatePropagation();
+				script(t);
+			}
 			if (t.localName === "link") {
 				const href = t.getAttribute("href") ?? "";
 				if (o.failCss?.includes(href) || held.has(href)) {
@@ -248,7 +253,7 @@ function open(o: Open): Opened {
 		errors,
 		release(href) {
 			held.delete(href);
-			document.querySelector(`link[href="${href}"]`)?.dispatchEvent(new window.Event("load"));
+			document.querySelector(`link[href="${href}"], script[src="${href}"]`)?.dispatchEvent(new window.Event("load"));
 		},
 		ready: () => document.dispatchEvent(new window.Event("DOMContentLoaded")),
 		click(target, init = {}, native = false) {
@@ -1337,6 +1342,39 @@ describe("mounts and scripts", () => {
 		const q = open({ html: page(), routes, scripts });
 		await q.natsu.visit("/c");
 		expect([path(q), q.loads]).toEqual(["/c", []]);
+	});
+
+	test("a script a swap appended counts once it has run: Back while it still loads stays a swap; if it then never calls mount, the next visit is a real load", async () => {
+		for (const converted of [false, true]) {
+			const seen: string[] = [];
+			const p = open({
+				html: page(),
+				holdJs: ["/js/b.js"],
+				scripts: { "/js/b.js": (w) => converted && w.natsu.mount("x", () => {}) },
+				routes: {
+					"/a": () => answer(part({ title: "A", main: "<h1>Page A</h1>" })),
+					"/b": () => answer(part({ scripts: ["/js/b.js"] })),
+					"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>" })),
+				},
+				before: (w: W) => w.document.addEventListener("natsu:load", (e: W) => void seen.push(e.detail.url)),
+			});
+			p.click("#to-b");
+			await settle();
+			expect(text(p, "main h1")).toBe("Page B");
+			// Back at once, /js/b.js still loading: a swap, not a real load; B's natsu:load never comes.
+			p.window.history.back();
+			await settle();
+			expect([path(p), text(p, "main h1"), p.loads]).toEqual(["/a", "Page A", []]);
+			expect(seen).toEqual([`${ORIGIN}/a`, `${ORIGIN}/a`]);
+			// It runs now, on A. Once it has run it counts like any other.
+			p.release("/js/b.js");
+			await settle();
+			expect(p.loads).toEqual([]);
+			p.click("#to-c");
+			await settle();
+			expect(p.loads).toEqual(converted ? [] : [["assign", `${ORIGIN}/c`]]);
+			if (converted) expect(text(p, "main h1")).toBe("Page C");
+		}
 	});
 
 	test("a nomodule script, or one of a type the browser does not run (one a consent manager enables), is neither waited for nor counted", async () => {

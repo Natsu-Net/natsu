@@ -332,6 +332,31 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
+	e2e("Back pressed while the new page's script still loads stays a swap; the script counts once it has run", async () => {
+		const page = await open("/a");
+		let release!: () => void;
+		const held = new Promise<void>((y) => (release = y));
+		await page.route(/b-only/, async (r: any) => {
+			await held;
+			await r.continue();
+		});
+		await page.click("#to-b");
+		await title(page, "B");
+		await page.goBack();
+		await title(page, "A");
+		expect(await h1(page)).toBe("Page A");
+		expect(await loads(page)).toBe(1);
+		release();
+		await page.waitForFunction(() => document.body.dataset.bOnly === "ran");
+		// It called mount when it ran: the next visit is a swap too, and it is not created again.
+		await page.click("#to-b");
+		await title(page, "B");
+		expect(await h1(page)).toBe("Page B");
+		expect(await page.evaluate(() => document.querySelectorAll("script[src*=b-only]").length)).toBe(1);
+		expect(await loads(page)).toBe(1);
+		await page.context().close();
+	});
+
 	e2e("page scripts' mounts run once per visit, clean up when swapped out, and never stack", async () => {
 		const page = await open("/a");
 		const counts = () =>

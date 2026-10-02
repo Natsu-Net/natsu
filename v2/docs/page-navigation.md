@@ -94,7 +94,9 @@ natsu.mount("[data-clock]", (el, signal) => {
   keeps behaving as it always did (the console names the script). A page
   swapped in whose new script has not called it once it has run (one that
   waits for `DOMContentLoaded`, which a swap never fires again) is loaded
-  again, for real, so it works as it does on a full load. A script that
+  again, for real, so it works as it does on a full load; Back pressed
+  while it still loads stays a swap, and it counts from the next visit
+  on. A script that
   needs no mount (analytics, a tag manager, a polyfill) says so with
   `data-natsu-once`; a script that such a script adds later counts too,
   from the next visit on, so tag it where it is created. Left out: data

@@ -247,7 +247,9 @@ a later call by the stack) makes every later visit a full load, so an
 unconverted page behaves as it always did. A script a swap created that has
 not called it once it has run gets its page loaded for real: it may be
 waiting for a `DOMContentLoaded` that never comes again, and a page swapped
-in with it would stay dead. Left out are the runtime, a tag with
+in with it would stay dead. Until it has run it does not count: a visit
+that starts while it still loads (Back, pressed at once) stays a swap, and
+it counts from the next visit on. Left out are the runtime, a tag with
 `data-natsu-once`, data blocks, `nomodule` and any other type the browser
 does not run (neither counted nor waited for), and a classic head script
 that blocks the parser. A head script runs once per document, as the shell
