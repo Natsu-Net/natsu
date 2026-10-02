@@ -199,10 +199,13 @@ the time `Assets.middleware()` sees it (set by the handler, or by middleware
 registered after Assets). In development every refusal is logged with its
 reason, and a shell change with the first line that changed.
 
-**In the browser** the runtime (`src/client/navigate.ts`, about 3.3 KB
-brotli) is built by `Assets.build()` as the classic entry `natsu-navigate`,
-readable and with console lines saying why a visit was a full load when
-`General.development` is on. A page script that keeps state or listeners
+**In the browser** the runtime (`src/client/navigate.ts`, about 3.9 KB
+brotli; its types, `NatsuClient` and the event details, in
+`src/client/types.ts`) is built by `Assets.build()` as the classic entry
+`natsu-navigate`, readable and with console lines saying why a visit was a
+full load when `General.development` is on. A page without the key never
+swaps, but `natsu.mount` and islands work there too; a second copy of the
+runtime on a page stays out. A page script that keeps state or listeners
 writes them as a mount, and runs `defer`, after the runtime:
 
 ```js
@@ -214,16 +217,57 @@ natsu.mount("[data-clock]", (el, signal) => {
 ```
 
 A mount runs on every match now and on every match in a region swapped in,
-while the page shown lists the script that registered it. Any listed script
-that never calls `natsu.mount` (and whose tag lacks `data-natsu-once`)
-makes every later visit a full load, so an unconverted page behaves as it
-always did. Also on `window.natsu`: `visit(url, { history, scroll })`,
-`refresh()` (after an action), `prefetch(url)`, `island(el)`; events
-`natsu:visit` (cancelable), `natsu:before-swap`, `natsu:load`; attributes
-`data-natsu-reload` (a real load for a link, a form or everything inside),
-`data-natsu-prefetch="off"`, `data-natsu-island="<url>"`, and
-`<html data-natsu-transition>` for a view transition. While a visit takes
-longer than 300 ms, `<html>` carries `data-natsu-loading`.
+while the page shown lists the script that registered it; a swap stops it
+when its element goes, or when page code has taken the element out. Every
+script the document ran counts toward a safe swap: inline, module, `defer`
+or `async`, in the head or the body. One that never calls `natsu.mount`
+(found by `document.currentScript`, or for a module or a later call by the
+stack) makes every later visit a full load, so an unconverted page behaves
+as it always did. Left out are the runtime, a tag with `data-natsu-once`,
+data blocks, `nomodule`, and a classic head script that blocks the parser.
+A head script runs once per document, as the shell does, so its mounts
+apply on every page whatever the page lists.
+
+The runtime takes nothing from a part's markup on trust. It creates the
+page's scripts from `Natsu-Scripts` (each entry one tag's URL-encoded
+attributes, its `src` resolved against the part's URL, the boot nonce where
+the entry has a `nonce` key, `async = false` so they run in order), keeps
+in the head only the nonces `Natsu-Nonce` vouches for (a new element with
+one gets the boot nonce), and removes every `<noscript>`. A part DOMParser
+cannot read (Trusted Types) or one with a declarative shadow root is a full
+load. An island is fetched on this origin only, with `Natsu-Island: 1`, and
+filled only from a `200` `text/html` answer that says `Natsu-Island: 1`
+back, which only an `island()` route sends.
+
+Scroll is kept per history entry and saved on it at `pagehide`, so Back,
+Forward and a reload come back to it. Each page shown is numbered and every
+entry made from it carries the number, the browser's own entry for a hash
+link included, so a popstate between them is a scroll, never a fetch. Back
+or Forward ends any visit on its way, as does a newer visit, during a
+stylesheet load or a view transition alike: an overtaken visit swaps
+nothing and leaves nothing behind.
+
+A pointer resting 65 ms on a link prefetches the part (a finger too, unless
+the browser takes the touch to pan or the page scrolls), two at a time,
+never on Save-Data or 2G or when the meta says `data-prefetch="off"`
+(`navigate.prefetch: false`). A click within ten seconds uses the answer,
+yielding a frame first so the click paints at once; a prefetched redirect
+or reload is acted on as it is, and a skip stops hovers asking until then.
+A path answered with `Natsu-Reload: route` or `response` is a full load,
+never prefetched, for the rest of the document.
+
+Also on `natsu` (a global): `visit(url, { history, scroll })`, `refresh()`
+(after an action; scroll and focus kept), `prefetch(url)`, `island(el)`.
+Events on `document`: `natsu:visit` (cancelable; a cancelled Back or
+Forward loads the page for real), `natsu:before-swap`, and `natsu:load`,
+once per page shown, at boot too, with `detail: { url, regions }`.
+Attributes: `data-natsu-reload` (a real load for a link, a form or
+everything inside; on `<html>`, for every visit from that document),
+`data-natsu-prefetch` (hover prefetch below it), both on when present and
+off when `"false"` or `"off"`; `data-natsu-once`;
+`data-natsu-island="<url>"`; and `<html data-natsu-transition>` for a view
+transition. While a visit takes longer than 300 ms, `<html>` carries
+`data-natsu-loading`, which any full load clears.
 
 `bun run test:e2e` drives Chromium against a natsu app built for it
 (`tests/fixtures/navigate/app.ts`: Assets with `navigate: true`, PageCache,

@@ -984,7 +984,7 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThan(3500);
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(4000);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {

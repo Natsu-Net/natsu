@@ -8,10 +8,12 @@
  * written in the server's wire format, and `location.assign`, `replace`
  * and `reload` only record what a real load would have been.
  *
- * Page scripts are plain functions keyed by their src: the harness runs one
- * when its tag runs (at boot, or when the runtime appends it), with
- * `document.currentScript` set, which is how `natsu.mount` learns who is
- * calling. A tag with no function is a script that never calls `mount`.
+ * Page scripts are plain functions keyed by their src (an inline one by
+ * `#id`): the harness runs one when its tag runs (at boot, after the
+ * runtime, or when the runtime appends it), with `document.currentScript`
+ * set, which is how `natsu.mount` learns who is calling; a module script
+ * runs with none, as in a browser. A tag with no function is a script that
+ * never calls `mount`.
  *
  * happy-dom fires `load` on stylesheets and scripts synchronously, and has
  * no layout, fonts or view transitions: the real-browser half is
@@ -22,6 +24,7 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { brotliCompressSync, constants } from "node:zlib";
 import { Window } from "happy-dom";
 import HistoryItemList from "happy-dom/lib/history/HistoryItemList.js";
+import type { NatsuClient, NatsuLoadDetail, NatsuVisitOptions } from "../src/client/types.ts";
 
 // happy-dom's replaceState drops the entries after the current one; a
 // browser keeps them, and back/forward tests need them.
@@ -81,20 +84,36 @@ interface PartInit {
 	main?: string;
 	foot?: string;
 	regions?: string;
+	/** Natsu-Scripts entries: a bare src is a vouched `<script src defer>`; anything with `=` is sent as written. */
 	scripts?: string[];
+	/** Natsu-Nonce. */
+	nonces?: string;
 }
 
-/** A part: the page's head without scripts, its regions, then its script list (nonces removed). */
-const part = (o: PartInit = {}) =>
-	`<!doctype html><html><head><meta charset="utf-8"><title>${o.title ?? "B"}</title>` +
-	`<link rel="stylesheet" href="${o.sheet ?? "/_a/site.a.css"}">${o.head ?? ""}<meta name="natsu" content="k1.s1"></head><body>` +
-	(o.regions ??
-		`<main id="main" data-natsu-region>${o.main ?? "<h1>Page B</h1>"}</main><footer id="foot" data-natsu-region>${o.foot ?? "footer B"}</footer>`) +
-	(o.scripts ?? []).map((s) => `<script src="${s}" defer></script>`).join("") +
-	`</body></html>`;
+interface Part {
+	body: string;
+	headers: Record<string, string>;
+}
 
-const answer = (body: string, status = 200) =>
-	new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "natsu-part": "1" } });
+/** One Natsu-Scripts entry, as the server writes a `<script src defer>` carrying the response's nonce. */
+const entry = (src: string) => (src.includes("=") ? src : new URLSearchParams({ src, defer: "", nonce: "" }).toString());
+
+/** A part: the page's head without scripts and its regions; the scripts and the vouched nonces go in headers. */
+const part = (o: PartInit = {}): Part => ({
+	body:
+		`<!doctype html><html><head><meta charset="utf-8"><title>${o.title ?? "B"}</title>` +
+		`<link rel="stylesheet" href="${o.sheet ?? "/_a/site.a.css"}">${o.head ?? ""}<meta name="natsu" content="k1.s1"></head><body>` +
+		(o.regions ??
+			`<main id="main" data-natsu-region>${o.main ?? "<h1>Page B</h1>"}</main><footer id="foot" data-natsu-region>${o.foot ?? "footer B"}</footer>`) +
+		`</body></html>`,
+	headers: {
+		...(o.scripts && { "natsu-scripts": o.scripts.map(entry).join(" ") }),
+		...(o.nonces && { "natsu-nonce": o.nonces }),
+	},
+});
+
+const answer = (p: Part, status = 200) =>
+	new Response(p.body, { status, headers: { "content-type": "text/html; charset=utf-8", "natsu-part": "1", ...p.headers } });
 const control = (headers: Record<string, string>) => new Response(null, { status: 204, headers });
 
 // --- the harness ----------------------------------------------------------
@@ -114,6 +133,8 @@ interface Open {
 	/** Stylesheet hrefs that fail, or never load. */
 	failCss?: string[];
 	holdCss?: string[];
+	/** Runs on the window before the runtime does: history state, stubs. */
+	before?: (window: W) => void;
 }
 
 interface Opened {
@@ -158,7 +179,7 @@ function open(o: Open): Opened {
 	} as never);
 	windows.push(window);
 	// happy-dom outside its own VM leaves the language's builtins unset on the window.
-	for (const name of ["Map", "Set", "WeakMap", "Promise", "Date", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "TypeError", "decodeURIComponent", "reportError"])
+	for (const name of ["Map", "Set", "WeakMap", "Promise", "Date", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "TypeError", "Math", "decodeURIComponent", "reportError"])
 		if (window[name] === undefined) window[name] = (globalThis as W)[name];
 	const errors: unknown[] = [];
 	window.reportError = (e: unknown) => void errors.push(e);
@@ -189,9 +210,8 @@ function open(o: Open): Opened {
 		}
 	};
 	const script = (el: Element) => {
-		const src = el.getAttribute("src") ?? "";
-		const fn = o.scripts?.[src];
-		if (fn) runAs(el, () => fn(window, el));
+		const fn = o.scripts?.[el.getAttribute("src") ?? `#${el.id}`];
+		if (fn) runAs(el.getAttribute("type") === "module" ? null! : el, () => fn(window, el));
 	};
 	// Scripts the runtime appends: run in the capture phase of their (synchronous) load event.
 	document.addEventListener(
@@ -213,8 +233,9 @@ function open(o: Open): Opened {
 	// What the browser does after parsing: the deferred runtime, then the page's deferred scripts in order.
 	const runtime = document.querySelector('script[src="/_a/natsu.js"]');
 	if (runtime) runtime.nonce = "N0NCE";
+	o.before?.(window);
 	runAs(runtime, () => new Function("window", `with (window) {${o.dev ? DEV_CODE : CODE}}`)(window));
-	for (const s of document.body.querySelectorAll("script[src]")) script(s);
+	for (const s of document.scripts) if (s !== runtime) script(s);
 
 	const opened: Opened = {
 		window,
@@ -272,6 +293,20 @@ function open(o: Open): Opened {
 const text = (p: Opened, sel: string) => p.document.querySelector(sel)?.textContent;
 const path = (p: Opened) => p.window.location.pathname + p.window.location.search + p.window.location.hash;
 
+/**
+ * A same-page hash link, followed as a browser follows it: the jump moves
+ * the page at once, popstate comes (with no state), and the scroll event
+ * comes before it or after. happy-dom only pushes the entry.
+ */
+function jump(p: Opened, sel: string, y: number, eventFirst = false) {
+	p.click(sel, {}, true);
+	p.window.scrollTo(0, y);
+	const scrolled = () => p.window.dispatchEvent(new p.window.Event("scroll"));
+	if (eventFirst) scrolled();
+	p.window.dispatchEvent(new p.window.PopStateEvent("popstate", { state: null }));
+	if (!eventFirst) scrolled();
+}
+
 // --- tests ------------------------------------------------------------------
 
 describe("boot", () => {
@@ -287,6 +322,30 @@ describe("boot", () => {
 		expect(p.document.getElementById("hdr")).toBe(header);
 		expect(path(p)).toBe("/b");
 		expect(p.document.title).toBe("B");
+	});
+
+	test("the runtime on the page twice: the second copy stays out, and its tag does not make swaps unsafe", async () => {
+		let api: W;
+		const seen: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/natsu-again.js"] }),
+			scripts: {
+				"/js/natsu-again.js": (w) => {
+					api = w.natsu;
+					new Function("window", `with (window) {${CODE}}`)(w);
+				},
+			},
+			routes: { "/b": () => answer(part()) },
+			before: (w) => w.document.addEventListener("natsu:load", (e: W) => void seen.push(e.detail.url)),
+		});
+		expect(p.natsu).toBe(api);
+		expect(p.document.querySelectorAll("[role=status]").length).toBe(1);
+		expect(seen).toEqual([`${ORIGIN}/a`]);
+		expect(p.click("#to-b")).toBe(true);
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([]);
+		expect(text(p, "main h1")).toBe("Page B");
 	});
 
 	test("no key, or no region: inert; visit is location.assign and mount still runs", async () => {
@@ -323,19 +382,29 @@ describe("boot", () => {
 		expect(path(p)).toBe("/b");
 	});
 
-	test("natsu:load fires once at boot, from <body>", () => {
+	test("natsu:load fires once at boot, on document, with the URL and the regions", () => {
 		const p = open({ html: page(), ready: false });
-		const seen: string[] = [];
-		p.document.addEventListener("natsu:load", (e: Event) => seen.push((e.target as Element).localName));
+		const seen: unknown[] = [];
+		p.document.addEventListener("natsu:load", (e: W) => seen.push([e.target === p.document, e.detail.url, e.detail.regions.map((r: Element) => r.id)]));
 		p.ready();
 		p.window.dispatchEvent(new p.window.Event("load"));
-		expect(seen).toEqual(["body"]);
+		expect(seen).toEqual([[true, `${ORIGIN}/a`, ["main", "foot"]]]);
 	});
 
-	test("the history entry gets an id, and scroll restoration is manual", () => {
-		const p = open({ html: page() });
+	test("the entry gets an id and a page number; scroll restoration is the browser's until a swap makes the entries manual", async () => {
+		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()) } });
+		expect(p.window.history.scrollRestoration).toBe("auto");
+		const s = p.window.history.state.natsu;
+		expect([typeof s.id, typeof s.p]).toEqual(["number", "number"]);
+		p.click("#to-b");
+		await settle();
 		expect(p.window.history.scrollRestoration).toBe("manual");
-		expect(typeof p.window.history.state.natsu.id).toBe("number");
+		expect(p.window.history.state.natsu.p).not.toBe(s.p);
+		// The entry left was made manual before the push.
+		p.window.history.back();
+		await settle();
+		expect(path(p)).toBe("/a");
+		expect(p.window.history.scrollRestoration).toBe("manual");
 	});
 });
 
@@ -429,6 +498,18 @@ describe("GET forms", () => {
 		expect(path(p)).toBe("/search?q=tea+cup");
 	});
 
+	test("a file field sends its file's name, as the browser does in a query", async () => {
+		const p = open({
+			html: page({ shell: `<form id="up" action="/search"><input name="q" value="x"><input type="file" name="photo"><input type="file" name="none"></form>` }),
+			routes: { "/search?q=x&photo=cat+1.jpg&none=": () => answer(part({ title: "Found" })) },
+		});
+		p.document.querySelector('input[name="photo"]').files = [new p.window.File(["meow"], "cat 1.jpg")];
+		p.submit("#up");
+		await settle();
+		expect(path(p)).toBe("/search?q=x&photo=cat+1.jpg&none=");
+		expect(p.document.title).toBe("Found");
+	});
+
 	test("a form with no action goes to the page's own URL", async () => {
 		const p = open({ html: page({ shell }), routes });
 		p.submit("#here");
@@ -483,32 +564,56 @@ describe("head", () => {
 		expect(p.document.getElementById("third-party")).toBe(ad);
 	});
 
-	test("a nonce the server vouched for (nonce=\"\") gets the boot nonce on a new element; an unchanged one stays", async () => {
-		// A browser shows a live element's nonce as "" (it hides it); the part writes it the same way.
+	test("a nonce Natsu-Nonce vouches for gets the boot nonce on a new element; an unchanged one stays; any other nonce goes", async () => {
+		// A browser shows a live element's nonce as "" (it hides it); the part carries the real one.
 		const p = open({
 			html: page({ head: `<style nonce="">.shell{}</style>` }),
-			routes: { "/b": () => answer(part({ head: `<style nonce="">.shell{}</style><style nonce="">.b{}</style><style>.unvouched{}</style>` })) },
+			routes: {
+				"/b": () =>
+					answer(
+						part({
+							head:
+								`<style nonce="r1">.shell{}</style><style nonce="r2">.b{}</style><style>.plain{}</style>` +
+								`<style nonce="forged">.forged{}</style><style nonce="">.bare{}</style><link rel="preload" as="font" href="/f.woff2" nonce="r1">`,
+							nonces: "r1 r2",
+						}),
+					),
+				"/c": () => answer(part({ title: "C", head: `<style nonce="r1">.c{}</style>` })),
+			},
 		});
 		const shell = p.document.querySelector("head style");
 		p.click("#to-b");
 		await settle();
-		const styles = [...p.document.head.querySelectorAll("style")] as W[];
-		expect(styles.map((s) => s.textContent)).toEqual([".shell{}", ".b{}", ".unvouched{}"]);
+		let styles = [...p.document.head.querySelectorAll("style")] as W[];
+		expect(styles.map((s) => s.textContent)).toEqual([".shell{}", ".b{}", ".plain{}", ".forged{}", ".bare{}"]);
 		expect(styles[0]).toBe(shell);
-		expect(styles[1].nonce).toBe("N0NCE");
-		expect(styles[2].nonce || "").toBe("");
+		expect(styles.map((s) => [s.getAttribute("nonce"), s.nonce || ""])).toEqual([
+			["", ""],
+			["", "N0NCE"],
+			[null, ""],
+			[null, ""],
+			[null, ""],
+		]);
+		const preload = p.document.querySelector('link[rel="preload"]');
+		expect([preload.getAttribute("nonce"), preload.nonce]).toEqual(["", "N0NCE"]);
+		// No Natsu-Nonce: nothing is vouched for, whatever the markup says.
+		p.click("#to-c");
+		await settle();
+		styles = [...p.document.head.querySelectorAll("style")] as W[];
+		expect(styles.map((s) => [s.textContent, s.getAttribute("nonce"), s.nonce || ""])).toEqual([[".c{}", null, ""]]);
 	});
 
 	test("scripts in either head are never touched", async () => {
 		const p = open({
 			html: page({ head: `<script src="/js/head.js" defer></script>` }),
-			scripts: { "/js/head.js": () => {} },
+			scripts: { "/js/head.js": (w) => w.natsu.mount("x", () => {}) },
 			routes: { "/b": () => answer(part({ head: `<script src="/js/other-head.js"></script>` })) },
 		});
 		p.click("#to-b");
 		await settle();
 		const srcs = [...p.document.head.querySelectorAll("script")].map((s: W) => s.getAttribute("src"));
 		expect(srcs).toEqual(["/js/head.js", "/_a/natsu.js"]);
+		expect(p.loads).toEqual([]);
 	});
 });
 
@@ -586,11 +691,15 @@ describe("stylesheets", () => {
 		async () => {
 			const p = open({ html: page(), routes: { "/b": () => answer(part({ sheet: "/_a/site.b.css" })) }, holdCss: ["/_a/site.b.css"] });
 			p.click("#to-b");
+			await settle();
+			const link = p.document.querySelector('link[href="/_a/site.b.css"]');
 			await tick(3800);
 			expect(p.loads).toEqual([]);
 			await tick(400);
 			expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
 			expect(sheets(p)).toEqual(["/_a/site.a.css"]);
+			// Given up on, the link keeps no handler that would hold the visit.
+			expect([link.onload, link.onerror]).toEqual([null, null]);
 		},
 		{ timeout: 8000 },
 	);
@@ -602,13 +711,10 @@ describe("stylesheets", () => {
 				`href="/_a/site.a.css" data-natsu-later="/_a/site-later.a.css">`,
 			),
 			routes: {
-				"/b": () =>
-					answer(
-						part({ sheet: "/_a/site.b.css" }).replace(
-							`href="/_a/site.b.css">`,
-							`href="/_a/site.b.css" data-natsu-later="/_a/site-later.b.css">`,
-						),
-					),
+				"/b": () => {
+					const p = part({ sheet: "/_a/site.b.css" });
+					return answer({ ...p, body: p.body.replace(`href="/_a/site.b.css">`, `href="/_a/site.b.css" data-natsu-later="/_a/site-later.b.css">`) });
+				},
 			},
 			holdCss: ["/_a/site-later.b.css"],
 		});
@@ -625,6 +731,42 @@ describe("stylesheets", () => {
 		await settle();
 		expect(sheets(p)).toEqual(["/_a/site.b.css", "/_a/site-later.b.css"]);
 		expect(text(p, "main h1")).toBe("Page B");
+	});
+
+	test("once the wait settles (load or error) no handler stays on the links, and the 4 s timer is cleared", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/b": () => answer(part({ sheet: "/_a/site.b.css" })),
+				"/c": () => answer(part({ title: "C", sheet: "/_a/site.c.css" })),
+			},
+			failCss: ["/_a/site.c.css"],
+		});
+		const added: W[] = [];
+		new p.window.MutationObserver((records: W[]) => {
+			for (const r of records) for (const n of r.addedNodes) if (n.localName === "link") added.push(n);
+		}).observe(p.document.head, { childList: true });
+		const pending = new Set<unknown>();
+		const set = p.window.setTimeout;
+		const clear = p.window.clearTimeout;
+		p.window.setTimeout = (fn: () => void, ms: number) => {
+			const t = set.call(p.window, fn, ms);
+			if (ms === 4e3) pending.add(t);
+			return t;
+		};
+		p.window.clearTimeout = (t: unknown) => (pending.delete(t), clear.call(p.window, t));
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		p.click("#to-c");
+		await settle();
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
+		expect(added.map((l) => l.getAttribute("href"))).toEqual(["/_a/site.b.css", "/_a/site.c.css"]);
+		expect(added.map((l) => [l.onload, l.onerror])).toEqual([
+			[null, null],
+			[null, null],
+		]);
+		expect(pending.size).toBe(0);
 	});
 
 	test("a visit overtaken while its sheet loads leaves nothing behind", async () => {
@@ -682,6 +824,40 @@ describe("regions", () => {
 			["assign", `${ORIGIN}/c`],
 		]);
 		expect(text(p, "main h1")).toBe("Page A");
+	});
+
+	test("a declarative shadow root in a region means a real load: DOMParser would leave it an inert template", async () => {
+		const p = open({
+			html: page(),
+			routes: { "/b": () => answer(part({ main: `<h1>B</h1><x-card><template shadowrootmode="open"><slot></slot></template>hi</x-card>` })) },
+		});
+		p.click("#to-b");
+		await settle();
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		expect(text(p, "main h1")).toBe("Page A");
+	});
+
+	test("a part that cannot be read is a real load, never a dead click: DOMParser under Trusted Types, a bad script entry", async () => {
+		const p = open({
+			html: page(),
+			routes: { "/b": () => answer(part()), "/c": () => answer(part({ scripts: ["src=http%3A%2F%2F%5B"] })) },
+		});
+		const parse = p.window.DOMParser.prototype.parseFromString;
+		// What `require-trusted-types-for 'script'` does to a string handed to DOMParser.
+		p.window.DOMParser.prototype.parseFromString = () => {
+			throw new TypeError("This document requires 'TrustedHTML' assignment.");
+		};
+		expect(p.click("#to-b")).toBe(true);
+		await settle();
+		p.window.DOMParser.prototype.parseFromString = parse;
+		p.click("#to-c");
+		await settle();
+		expect(p.loads).toEqual([
+			["assign", `${ORIGIN}/b`],
+			["assign", `${ORIGIN}/c`],
+		]);
+		expect(text(p, "main h1")).toBe("Page A");
+		expect(path(p)).toBe("/a");
 	});
 
 	test("an inline script in a swapped-in region never runs", async () => {
@@ -812,6 +988,28 @@ describe("mounts and scripts", () => {
 		expect(log).toEqual(["mount shell", "mount a", "abort a", "cleanup a", "mount b"]);
 	});
 
+	test("a mount whose element page code removed is stopped at the next swap, not kept forever", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/toast.js"], shell: LINKS + `<b data-toast>t</b>` }),
+			scripts: {
+				"/js/toast.js": (w) =>
+					w.natsu.mount("[data-toast]", (_: Element, signal: AbortSignal) => {
+						signal.addEventListener("abort", () => log.push("abort"));
+						return () => log.push("cleanup");
+					}),
+			},
+			routes: { "/b": () => answer(part({ scripts: ["/js/toast.js"] })), "/c": () => answer(part({ scripts: ["/js/toast.js"] })) },
+		});
+		p.document.querySelector("[data-toast]").remove();
+		p.click("#to-b");
+		await settle();
+		expect(log).toEqual(["abort", "cleanup"]);
+		p.click("#to-c");
+		await settle();
+		expect(log).toEqual(["abort", "cleanup"]);
+	});
+
 	test("mounts are scoped to the page's script list: two scripts on one selector, only the listed one binds", async () => {
 		const log: string[] = [];
 		const binder = (name: string) => (w: W) =>
@@ -839,8 +1037,7 @@ describe("mounts and scripts", () => {
 			html: page({ scripts: ["/js/site.js"] }),
 			scripts: { "/js/site.js": (w) => w.natsu.mount("x", () => {}), "/js/b.js": (w) => w.natsu.mount("x", () => {}), "/js/c.js": (w) => w.natsu.mount("x", () => {}) },
 			routes: {
-				"/b": () =>
-					answer(part({ scripts: ["/js/site.js", "/js/b.js", "/js/c.js"] }).replace(`src="/js/b.js"`, `src="/js/b.js" data-x="1" crossorigin="anonymous"`)),
+				"/b": () => answer(part({ scripts: ["/js/site.js", "src=%2Fjs%2Fb.js&data-x=1&crossorigin=anonymous&defer=&nonce=", "/js/c.js"] })),
 			},
 		});
 		p.click("#to-b");
@@ -851,10 +1048,55 @@ describe("mounts and scripts", () => {
 			["N0NCE", false],
 			["N0NCE", false],
 		]);
+		expect([...added[0].attributes].map((a: W) => a.name)).toEqual(["src", "data-x", "crossorigin", "defer"]);
 		expect(added[0].getAttribute("data-x")).toBe("1");
 		expect(added[0].getAttribute("crossorigin")).toBe("anonymous");
 		expect(added[0].getAttribute("nonce")).toBeNull();
 		expect(p.document.querySelectorAll('script[src="/js/site.js"]').length).toBe(1);
+	});
+
+	test("scripts come only from Natsu-Scripts: a script in the part's markup is never created", async () => {
+		const p = open({
+			html: page(),
+			scripts: { "/js/b.js": (w) => w.natsu.mount("x", () => {}) },
+			routes: {
+				"/b": () => {
+					const q = part({ main: `<h1>B</h1><script src="/js/in-region.js"></script>`, scripts: ["/js/b.js"] });
+					return answer({ ...q, body: q.body.replace("</body>", `<script src="/js/evil.js" defer></script></body>`) });
+				},
+			},
+		});
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("B");
+		expect([...p.document.querySelectorAll("body > script:not([data-booted])")].map((s: W) => s.getAttribute("src"))).toEqual(["/js/b.js"]);
+		expect(p.document.querySelector('script[src="/js/evil.js"]')).toBeNull();
+	});
+
+	test("an entry without the nonce key is created without one; a src is resolved against the part's URL", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page(),
+			scripts: {
+				"rel.js": (w) => w.natsu.mount("[data-rel]", (el: Element) => void log.push(el.textContent!)),
+				"/js/plain.js": (w) => w.natsu.mount("x", () => {}),
+			},
+			routes: {
+				"/shop/b": () => answer(part({ main: `<h1>B</h1><p data-rel>b</p>`, scripts: ["src=rel.js", "src=%2Fjs%2Fplain.js&async="] })),
+				"/shop/c": () => answer(part({ main: `<h1>C</h1><p data-rel>c</p>`, scripts: ["src=rel.js"] })),
+			},
+		});
+		await p.natsu.visit("/shop/b");
+		const added = [...p.document.querySelectorAll("body > script:not([data-booted])")] as W[];
+		expect(added.map((s) => [s.getAttribute("src"), s.nonce || "", s.hasAttribute("nonce"), s.async])).toEqual([
+			["rel.js", "", false, false],
+			["/js/plain.js", "", false, false],
+		]);
+		// Listed as /shop/rel.js: its mount runs on this page and the next, and it is never created twice.
+		await p.natsu.visit("/shop/c");
+		expect(log).toEqual(["b", "c"]);
+		expect(p.document.querySelectorAll('script[src="rel.js"]').length).toBe(1);
+		expect(p.loads).toEqual([]);
 	});
 
 	test("an unconverted script makes the next click a real load; data-natsu-once does not", async () => {
@@ -874,14 +1116,87 @@ describe("mounts and scripts", () => {
 		expect(path(q)).toBe("/b");
 	});
 
-	test("a script that calls mount only later (not while it runs) still counts as unconverted", async () => {
+	/** An Error whose stack names `src` as the caller, past the runtime's own frame, as a browser's does. */
+	const stackFrom = (src: string) => (w: W) => {
+		// A plain function, which works with `new` and without (the minifier drops it).
+		w.Error = function () {
+			return { stack: `Error\n    at Object.mount (${ORIGIN}/_a/natsu.js:1:2000)\n    at ${ORIGIN}${src}:3:7` };
+		};
+	};
+
+	test("a script that calls mount later (not while it runs) is known by the stack; with no stack naming it, it is unconverted", async () => {
+		const late = { "/js/late.js": (w: W) => w.document.addEventListener("DOMContentLoaded", () => w.natsu.mount("x", () => {})) };
+		const routes = { "/b": () => answer(part()) };
+		const p = open({ html: page({ scripts: ["/js/late.js"] }), scripts: late, routes });
+		await p.natsu.visit("/b");
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		const q = open({ html: page({ scripts: ["/js/late.js"] }), scripts: late, routes, before: stackFrom("/js/late.js") });
+		await q.natsu.visit("/b");
+		expect(q.loads).toEqual([]);
+		expect(path(q)).toBe("/b");
+	});
+
+	test("every script that runs counts: head defer and async, module, inline", async () => {
+		const kinds: PageInit[] = [
+			{ head: `<script src="/js/x.js" defer></script>` },
+			{ head: `<script src="/js/x.js" async></script>` },
+			{ head: `<script type="module">import "/js/x.js";</script>` },
+			{ shell: LINKS + `<script type="module" src="/js/x.js"></script>` },
+			{ shell: LINKS + `<script>document.querySelectorAll("main a").forEach(bind);</script>` },
+			{ shell: LINKS + `<script type="text/javascript">bind();</script>` },
+		];
+		for (const kind of kinds) {
+			const p = open({ html: page(kind), routes: { "/b": () => answer(part()) } });
+			await p.natsu.visit("/b");
+			expect([kind, p.loads]).toEqual([kind, [["assign", `${ORIGIN}/b`]]]);
+		}
+	});
+
+	test("not counted: data blocks, templates, nomodule, a classic head script that blocks the parser, data-natsu-once", async () => {
 		const p = open({
-			html: page({ scripts: ["/js/late.js"] }),
-			scripts: { "/js/late.js": (w) => w.document.addEventListener("DOMContentLoaded", () => w.natsu.mount("x", () => {})) },
+			html: page({
+				head:
+					`<script>window.config = {};</script><script src="/js/blocking.js"></script><script defer>window.inline = 1;</script>` +
+					`<script type="application/ld+json">{}</script><script type="importmap">{"imports":{}}</script><script type="speculationrules">{}</script>`,
+				shell:
+					LINKS +
+					`<script type="text/x-template"><b>{{x}}</b></script><script type="application/json">{}</script>` +
+					`<script nomodule src="/js/old-browsers.js"></script><script type="module" src="/js/mod.js" data-natsu-once></script>`,
+			}),
 			routes: { "/b": () => answer(part()) },
 		});
 		await p.natsu.visit("/b");
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		expect(p.loads).toEqual([]);
+		expect(path(p)).toBe("/b");
+	});
+
+	test("an inline script that calls mount while it runs is swap-safe, and its mounts go everywhere", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ shell: LINKS + `<script id="inline">natsu.mount("h1", …)</script>` }),
+			scripts: { "#inline": (w) => w.natsu.mount("h1", (el: Element) => void log.push(el.textContent!)) },
+			routes: { "/b": () => answer(part({ scripts: ["/js/b.js"] })) },
+		});
+		await p.natsu.visit("/b");
+		expect(p.loads).toEqual([]);
+		expect(log).toEqual(["Page A", "Page B"]);
+	});
+
+	test("a module script is known by the stack: swap-safe once it mounts, its mounts scoped to the pages that list it", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ main: `<h1>A</h1><p data-m>a</p>`, shell: LINKS + `<script type="module" src="/js/mod.js"></script>` }),
+			scripts: { "/js/mod.js": (w) => w.natsu.mount("[data-m]", (el: Element) => void log.push(el.textContent!)) },
+			routes: {
+				"/b": () => answer(part({ main: `<h1>B</h1><p data-m>b</p>`, scripts: ["src=%2Fjs%2Fmod.js&type=module&nonce="] })),
+				"/c": () => answer(part({ main: `<h1>C</h1><p data-m>c</p>` })),
+			},
+			before: stackFrom("/js/mod.js"),
+		});
+		await p.natsu.visit("/b");
+		await p.natsu.visit("/c");
+		expect(p.loads).toEqual([]);
+		expect(log).toEqual(["a", "b"]);
 	});
 
 	test("a page swapped in whose new script never calls mount makes the next visit a real load", async () => {
@@ -915,7 +1230,7 @@ describe("mounts and scripts", () => {
 });
 
 describe("events and attributes", () => {
-	test("natsu:visit can cancel; natsu:before-swap comes before the swap; natsu:load bubbles from each new region after new scripts ran", async () => {
+	test("natsu:visit can cancel; natsu:before-swap comes before the swap; natsu:load comes once, on document, after new scripts ran", async () => {
 		const order: string[] = [];
 		const p = open({
 			html: page(),
@@ -924,11 +1239,71 @@ describe("events and attributes", () => {
 		});
 		p.document.addEventListener("natsu:visit", (e: W) => e.detail.url.endsWith("/c") && e.preventDefault());
 		p.document.addEventListener("natsu:before-swap", () => order.push(`before-swap ${text(p, "main h1")}`));
-		p.document.addEventListener("natsu:load", (e: Event) => order.push(`load ${(e.target as Element).id}`));
+		p.document.addEventListener("natsu:load", (e: W) =>
+			order.push(`load ${e.target === p.document} ${e.detail.url} ${e.detail.regions.map((r: Element) => r.id).join(" ")} ${e.detail.regions[0].isConnected}`),
+		);
 		await p.natsu.visit("/c");
 		expect(p.calls).toEqual([]);
+		await p.natsu.visit("/b#x");
+		expect(order).toEqual(["before-swap Page A", "b.js ran", `load true ${ORIGIN}/b#x main foot true`]);
+	});
+
+	test("a cancelled natsu:visit: a click or visit() does nothing; a back/forward, whose URL already changed, reloads", async () => {
+		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()) } });
 		await p.natsu.visit("/b");
-		expect(order).toEqual(["before-swap Page A", "b.js ran", "load main", "load foot"]);
+		p.document.addEventListener("natsu:visit", (e: Event) => e.preventDefault());
+		expect(p.click("#to-c")).toBe(true);
+		await settle();
+		p.window.history.back();
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([["reload"]]);
+	});
+
+	test("<html data-natsu-reload> makes every visit a real load: links, forms, back/forward, visit, refresh, and no prefetch", async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<form id="f" action="/search"><input name="q" value="1"></form>` }),
+			routes: { "/a": () => answer(part({ title: "A" })), "/b": () => answer(part()), "/c": () => answer(part()) },
+		});
+		await p.natsu.visit("/b");
+		// An ad unit just showed: this document must never be swapped again.
+		p.document.documentElement.setAttribute("data-natsu-reload", "");
+		expect(p.click("#to-c")).toBe(false);
+		expect(p.submit("#f")).toBe(false);
+		p.natsu.prefetch("/c");
+		await p.natsu.visit("/c");
+		await p.natsu.refresh();
+		p.window.history.back();
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`], ["replace", `${ORIGIN}/b`], ["reload"]]);
+		// Turned off again ("false" or "off"), the document swaps.
+		p.document.documentElement.setAttribute("data-natsu-reload", "off");
+		expect(p.click("#to-c")).toBe(true);
+		await settle();
+		expect(path(p)).toBe("/c");
+	});
+
+	test("data-natsu-reload and data-natsu-prefetch: present is on, \"false\" and \"off\" are off, the nearest wins", async () => {
+		const p = open({
+			html: page({
+				shell:
+					LINKS +
+					`<div data-natsu-reload="true"><a id="r1" href="/b">x</a><p data-natsu-reload="off"><a id="r2" href="/b">x</a></p></div>` +
+					`<div data-natsu-prefetch="false"><a id="p1" href="/b">x</a><p data-natsu-prefetch><a id="p2" href="/c">x</a></p></div>` +
+					`<a id="p3" href="/d" data-natsu-prefetch="off">x</a>`,
+			}),
+			routes: { "/b": () => answer(part()), "/c": () => answer(part()), "/d": () => answer(part()) },
+		});
+		const hover = (sel: string) =>
+			p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
+		for (const sel of ["#p1", "#p2", "#p3"]) {
+			hover(sel);
+			await tick(90);
+		}
+		expect(p.calls.map((c) => c.url)).toEqual(["/c"]);
+		expect(p.click("#r1")).toBe(false);
+		expect(p.click("#r2")).toBe(true);
 	});
 
 	test("html[data-natsu-loading] appears after 300 ms and goes at the swap", async () => {
@@ -945,22 +1320,37 @@ describe("events and attributes", () => {
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
 	});
 
-	test("a pageshow from the back/forward cache clears the mark, and a loading timer frozen with the page", async () => {
+	test("a real load leaves no mark and no timer: one that does not leave the page (a download, a 204) must not stay marked", async () => {
 		const p = open({ html: page(), routes: { "/b": () => control({ "natsu-reload": "route" }), "/c": () => tick(400).then(() => control({ "natsu-reload": "route" })) } });
 		const html = p.document.documentElement;
-		// happy-dom's PageTransitionEvent has no `persisted`.
-		const show = () => p.window.dispatchEvent(Object.assign(new p.window.Event("pageshow"), { persisted: true }));
-		// Slow: marked, then a real load; back from the cache, the mark goes.
+		// Slow: marked while it waits, unmarked by the real load.
 		p.click("#to-c");
-		await tick(450);
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
+		await tick(350);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
-		show();
+		await tick(100);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`]]);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
-		// Fast: a real load before 300 ms; the timer, still pending on the way back, never fires.
+		// Fast: a real load before 300 ms; its timer never fires.
 		p.click("#to-b");
 		await settle();
 		expect(p.loads.length).toBe(2);
+		await tick(350);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+	});
+
+	test("a pageshow from the back/forward cache clears the mark, and a loading timer frozen with the page", async () => {
+		// A visit still waiting when the visitor left by other means: the page was frozen with it.
+		const p = open({ html: page(), routes: { "/b": () => new Promise(() => {}), "/c": () => new Promise(() => {}) } });
+		const html = p.document.documentElement;
+		// happy-dom's PageTransitionEvent has no `persisted`.
+		const show = () => p.window.dispatchEvent(Object.assign(new p.window.Event("pageshow"), { persisted: true }));
+		p.click("#to-c");
+		await tick(350);
+		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
+		show();
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+		p.click("#to-b");
+		await settle();
 		show();
 		await tick(350);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
@@ -1005,6 +1395,61 @@ describe("events and attributes", () => {
 		expect(p.document.title).toBe("C");
 	});
 
+	test("a visit overtaken during the transition's first frame (a second visit, a Back) swaps nothing, mounts nothing, creates no script", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/site.js"] }),
+			scripts: {
+				"/js/site.js": (w) => w.natsu.mount("h1", (el: Element) => void log.push(`${el.textContent} ${el.isConnected}`)),
+				"/js/b.js": (w) => w.natsu.mount("x", () => {}),
+			},
+			routes: {
+				"/b": () => answer(part({ sheet: "/_a/site.b.css", scripts: ["/js/site.js", "/js/b.js"] })),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>", scripts: ["/js/site.js"] })),
+			},
+		});
+		p.document.documentElement.setAttribute("data-natsu-transition", "");
+		// The browser calls back a frame later, once it has the old state.
+		const frames: (() => void)[] = [];
+		p.document.startViewTransition = (fn: () => void) => {
+			let done!: () => void;
+			const updateCallbackDone = new Promise<void>((y) => (done = y));
+			frames.push(() => (fn(), done()));
+			return { updateCallbackDone };
+		};
+		const added = () => [...p.document.querySelectorAll("body > script:not([data-booted])")].map((s: W) => s.getAttribute("src"));
+		const sheets = () => [...p.document.querySelectorAll('link[rel="stylesheet"]')].map((l: W) => l.getAttribute("href"));
+		p.click("#to-b");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		for (const frame of frames.splice(0)) frame();
+		await settle();
+		expect([p.document.title, path(p), text(p, "main h1")]).toEqual(["C", "/c", "Page C"]);
+		expect(added()).toEqual([]);
+		expect(sheets()).toEqual(["/_a/site.a.css"]);
+		expect(log).toEqual(["Page A true", "Page C true"]);
+
+		// Back to this page's own entry before the frame: the visit to B is over.
+		const q = open({
+			html: page({ main: `<h1>Page A</h1><a id="jump" href="#x">x</a><p id="x">x</p>` }),
+			routes: { "/b": () => answer(part({ scripts: ["/js/b.js"] })) },
+			scripts: { "/js/b.js": (w) => w.natsu.mount("x", () => {}) },
+		});
+		q.document.documentElement.setAttribute("data-natsu-transition", "");
+		q.document.startViewTransition = p.document.startViewTransition;
+		jump(q, "#jump", 500);
+		q.click("#to-b");
+		await settle();
+		q.window.history.back();
+		await settle();
+		expect(frames.length).toBe(1);
+		for (const frame of frames.splice(0)) frame();
+		await settle();
+		expect([path(q), text(q, "main h1"), q.document.title]).toEqual(["/a", "Page A", "A"]);
+		expect([...q.document.querySelectorAll("body > script:not([data-booted])")].length).toBe(0);
+	});
+
 	test("refresh replaces the entry, keeps scroll and focus, and skips the prefetch cache", async () => {
 		let n = 0;
 		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: `A${++n}` })) } });
@@ -1019,6 +1464,21 @@ describe("events and attributes", () => {
 		expect(p.document.activeElement).toBe(focused);
 		await p.natsu.refresh();
 		expect(p.document.title).toBe("A2");
+	});
+
+	test("refresh puts focus back on the element of the same id in the new region", async () => {
+		const p = open({
+			html: page({ main: `<h1>A</h1><input id="qty" value="1"><button id="go">go</button>` }),
+			routes: { "/a": () => answer(part({ title: "A", main: `<h1>A</h1><input id="qty" value="2"><button id="go">go</button>` })) },
+		});
+		const old = p.document.getElementById("qty");
+		old.focus();
+		let scrolled = 0;
+		p.window.HTMLElement.prototype.scrollIntoView = () => scrolled++;
+		await p.natsu.refresh();
+		const now = p.document.activeElement;
+		expect(now).not.toBe(old);
+		expect([now.id, now.value, scrolled]).toEqual(["qty", "2", 0]);
 	});
 });
 
@@ -1043,15 +1503,19 @@ describe("history", () => {
 		expect(p.loads).toEqual([]);
 	});
 
-	test("a hash link's entry (null state) followed by Back shows the right page", async () => {
+	const anchors = `<h1>Page A</h1><a id="jump" href="#results">results</a><div class="tall"></div><div id="results">r</div>`;
+
+	test("a hash link's entry (no state) is given an id and this page's number; Back to it from another page shows the right page", async () => {
 		const p = open({
-			html: page({ main: `<h1>Page A</h1><a id="jump" href="#results">results</a><div id="results">r</div>` }),
+			html: page({ main: anchors }),
 			routes: { "/a": () => answer(part({ title: "A", main: `<h1>Page A again</h1><div id="results">r</div>` })), "/b": () => answer(part()) },
 		});
-		p.click("#jump", {}, true);
-		await settle();
+		const first = p.window.history.state.natsu;
+		jump(p, "#jump", 4000);
 		expect(path(p)).toBe("/a#results");
-		expect(p.window.history.state).toBeNull();
+		const hashed = p.window.history.state.natsu;
+		expect(hashed.id).not.toBe(first.id);
+		expect(hashed.p).toBe(first.p);
 		expect(p.calls).toEqual([]);
 		p.click("#to-b");
 		await settle();
@@ -1060,19 +1524,72 @@ describe("history", () => {
 		await settle();
 		expect(path(p)).toBe("/a#results");
 		expect(text(p, "main h1")).toBe("Page A again");
+		expect(p.window.scrollY).toBe(4000);
 		p.window.history.forward();
 		await settle();
 		expect(text(p, "main h1")).toBe("Page B");
 	});
 
-	test("a hash change (same path and query) is the browser's: no visit", async () => {
-		const p = open({ html: page({ main: `<h1>Page A</h1><a id="jump" href="#x">x</a>` }) });
-		p.click("#jump", {}, true);
-		await settle();
+	test("Back and Forward across a hash link restore each entry's scroll, whether the jump's scroll event comes before popstate or after", async () => {
+		for (const eventFirst of [true, false]) {
+			const p = open({ html: page({ main: anchors }) });
+			// What layout would do with the target.
+			p.document.getElementById("results").scrollIntoView = () => p.window.scrollTo(0, 4000);
+			p.scroll(300);
+			jump(p, "#jump", 4000, eventFirst);
+			p.scroll(4100);
+			p.window.history.back();
+			await settle();
+			expect([eventFirst, path(p), p.window.scrollY]).toEqual([eventFirst, "/a", 300]);
+			p.window.history.forward();
+			await settle();
+			expect([eventFirst, path(p), p.window.scrollY]).toEqual([eventFirst, "/a#results", 4100]);
+			expect(p.calls).toEqual([]);
+		}
+	});
+
+	test("a new hash entry with no scroll of its own goes to its target; with no target, it stays", async () => {
+		const p = open({ html: page({ main: anchors + `<a id="nowhere" href="#gone">x</a>` }) });
+		let aimed = 0;
+		p.document.getElementById("results").scrollIntoView = () => aimed++;
+		p.scroll(200);
+		jump(p, "#jump", 4000);
+		expect(aimed).toBe(1);
+		p.click("#nowhere", {}, true);
+		p.window.dispatchEvent(new p.window.PopStateEvent("popstate", { state: null }));
+		expect([aimed, p.window.scrollY]).toEqual([1, 4000]);
+	});
+
+	test("Back to this page's own entry while a visit is pending cancels the visit and its loading mark", async () => {
+		let release!: () => void;
+		const p = open({ html: page({ main: anchors }), routes: { "/b": () => new Promise((y) => (release = () => y(answer(part())))) } });
+		jump(p, "#jump", 4000);
+		p.click("#to-b");
+		await tick(350);
+		expect(p.document.documentElement.hasAttribute("data-natsu-loading")).toBe(true);
 		p.window.history.back();
 		await settle();
+		expect(p.document.documentElement.hasAttribute("data-natsu-loading")).toBe(false);
+		release();
+		await settle();
 		expect(path(p)).toBe("/a");
+		expect(text(p, "main h1")).toBe("Page A");
+		expect(p.loads).toEqual([]);
+	});
+
+	test("an entry a script rewrote with its state kept is still this page: its hash links, Back and Forward fetch nothing", async () => {
+		const p = open({ html: page({ main: anchors }) });
+		// What a tab strip does: the query changes, the page does not.
+		p.window.history.replaceState(p.window.history.state, "", "/a?tab=2");
+		jump(p, "#jump", 4000);
+		expect(path(p)).toBe("/a?tab=2#results");
+		p.window.history.back();
+		await settle();
+		expect(path(p)).toBe("/a?tab=2");
+		p.window.history.forward();
+		await settle();
 		expect(p.calls).toEqual([]);
+		expect(p.loads).toEqual([]);
 	});
 
 	test("an entry with no state that a script pushed is visited and given an id", async () => {
@@ -1124,18 +1641,39 @@ describe("history", () => {
 		expect(p.loads).toEqual([["reload"]]);
 	});
 
-	test("pagehide writes the scroll into the entry on screen; a later load of it scrolls back", async () => {
+	test("pagehide writes the scroll into the entry on screen", () => {
 		const p = open({ html: page() });
 		p.scroll(450);
 		p.window.dispatchEvent(new p.window.Event("pagehide"));
 		expect(p.window.history.state.natsu.y).toBe(450);
-		const state = p.window.history.state;
-		// The same entry loaded again (a reload): the runtime restores it.
-		const q = open({ html: page(), ready: false });
-		q.window.history.replaceState(state, "");
-		q.window.scrollTo(0, 0);
-		new Function("window", `with (window) {${CODE}}`)(q.window);
-		expect(q.window.scrollY).toBe(450);
+	});
+
+	test("a reload of an entry a swap made (manual) scrolls back to its y, and again at load unless the visitor scrolled", () => {
+		// Before load the page is shorter than it will be: a scroll stops at 300.
+		let max = 300;
+		const before = (w: W) => {
+			w.history.replaceState({ natsu: { id: 1, p: 2, y: 450 } }, "");
+			w.history.scrollRestoration = "manual";
+			const to = w.scrollTo.bind(w);
+			w.scrollTo = (x: number, y: number) => to(x, Math.min(y, max));
+		};
+		const p = open({ html: page(), ready: false, before });
+		expect(p.window.scrollY).toBe(300);
+		max = 5000;
+		p.window.dispatchEvent(new p.window.Event("load"));
+		expect(p.window.scrollY).toBe(450);
+		max = 300;
+		const q = open({ html: page(), ready: false, before });
+		q.scroll(120);
+		max = 5000;
+		q.window.dispatchEvent(new q.window.Event("load"));
+		expect(q.window.scrollY).toBe(120);
+	});
+
+	test("a reload of an entry the browser restores (auto) is left to the browser", () => {
+		const p = open({ html: page(), before: (w) => w.history.replaceState({ natsu: { id: 1, p: 2, y: 450 } }, "") });
+		expect(p.window.scrollY).toBe(0);
+		expect(p.window.history.state.natsu).toMatchObject({ id: 1, y: 450 });
 	});
 });
 
@@ -1144,7 +1682,6 @@ describe("prefetch", () => {
 		p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
 	const leave = (p: Opened, sel: string) =>
 		p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerout", { bubbles: true, pointerType: "mouse", relatedTarget: p.document.body }));
-	const touch = (p: Opened, sel: string) => p.document.querySelector(sel).dispatchEvent(new p.window.Event("touchstart", { bubbles: true }));
 
 	test("a 65 ms hover prefetches, marked Natsu-Prefetch, and the click uses it", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
@@ -1159,16 +1696,55 @@ describe("prefetch", () => {
 		expect(text(p, "main h1")).toBe("Page B");
 	});
 
-	test("leaving the link before 65 ms cancels; a touch prefetches at once", async () => {
-		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part()) } });
+	test("with the answer in hand, the swap does not run in the click's task: it yields first (scheduler.yield, else a frame)", async () => {
+		const microtasks = async () => {
+			for (let i = 0; i < 50; i++) await null;
+		};
+		for (const yields of [false, true]) {
+			const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
+			let used = 0;
+			if (yields) p.window.scheduler = { yield: () => (used++, new Promise((y) => setTimeout(y, 5))) };
+			p.natsu.prefetch("/b");
+			await settle();
+			p.click("#to-b");
+			await microtasks();
+			expect([yields, text(p, "main h1")]).toEqual([yields, "Page A"]);
+			await settle();
+			expect([yields, text(p, "main h1"), used]).toEqual([yields, "Page B", yields ? 1 : 0]);
+		}
+	});
+
+	test("leaving the link before 65 ms cancels", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
 		hover(p, "#to-b");
 		await tick(20);
 		leave(p, "#to-b");
 		await tick(80);
 		expect(p.calls).toEqual([]);
-		touch(p, "#to-c");
-		await tick(5);
-		expect(p.calls.map((c) => c.url)).toEqual(["/c"]);
+	});
+
+	test("a touch prefetches after 65 ms, as a mouse does; a touch the browser takes to pan, or a scroll, cancels it", async () => {
+		const routes: Record<string, Route> = {};
+		for (const x of "bcd") routes[`/${x}`] = () => answer(part());
+		const shell = LINKS + `<a id="to-d" href="/d">D</a>`;
+		const p = open({ html: page({ shell }), routes });
+		const finger = (type: string, sel: string) =>
+			p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent(type, { bubbles: true, pointerType: "touch" }));
+		// A tap.
+		finger("pointerover", "#to-b");
+		await tick(30);
+		expect(p.calls).toEqual([]);
+		await tick(50);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		// A flick: the browser pans, and says so.
+		finger("pointerover", "#to-c");
+		finger("pointercancel", "#to-c");
+		await tick(90);
+		// Momentum: the page scrolls.
+		finger("pointerover", "#to-d");
+		p.window.dispatchEvent(new p.window.Event("scroll"));
+		await tick(90);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
 	});
 
 	test("a click before the dwell is over cancels the hover's prefetch: one request, the visit's", async () => {
@@ -1180,6 +1756,18 @@ describe("prefetch", () => {
 		await tick(150);
 		expect(p.calls).toEqual([{ url: "/b", headers: { "Natsu-Nav": "k1.s1" } }]);
 		expect(text(p, "main h1")).toBe("Page B");
+	});
+
+	test("a visit lets go of the hovered link: hovering it again on the new page prefetches again", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part({ title: "C" })) } });
+		hover(p, "#to-c");
+		await tick(90);
+		await p.natsu.visit("/b");
+		// Empty the prefetch cache, so a second prefetch of /c shows as a request.
+		p.window.dispatchEvent(new p.window.Event("pagehide"));
+		hover(p, "#to-c");
+		await tick(90);
+		expect(p.calls.map((c) => c.url)).toEqual(["/c", "/b", "/c"]);
 	});
 
 	test("skipped: Save-Data, 2g, data-natsu-prefetch=off, the current URL, an unsafe page", async () => {
@@ -1202,7 +1790,7 @@ describe("prefetch", () => {
 		expect(q.calls).toEqual([]);
 	});
 
-	test("only 200 parts are kept: a skip, a 404 part and a reload are fetched again by the click", async () => {
+	test("a skip and a 404 part are fetched again by the click; a skip is remembered for 10 s, so hovers stop asking", async () => {
 		const p = open({
 			html: page(),
 			routes: {
@@ -1213,10 +1801,62 @@ describe("prefetch", () => {
 		p.natsu.prefetch("/b");
 		p.natsu.prefetch("/c");
 		await settle();
+		p.natsu.prefetch("/b");
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c"]);
 		await p.natsu.visit("/b");
 		await p.natsu.visit("/c");
 		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c", "/b", "/c"]);
 		expect(p.document.title).toBe("C");
+	});
+
+	test("a prefetched reload or redirect is kept, and the click acts on it without asking again", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/r": () => control({ "natsu-reload": "shell" }),
+				"/old": () => control({ "natsu-location": "/new" }),
+				"/new": () => answer(part({ title: "New" })),
+			},
+		});
+		p.natsu.prefetch("/r");
+		p.natsu.prefetch("/old");
+		await settle();
+		await p.natsu.visit("/r");
+		await p.natsu.visit("/old");
+		expect(p.calls.map((c) => c.url)).toEqual(["/r", "/old", "/new"]);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/r`]]);
+		expect([path(p), p.document.title]).toEqual(["/new", "New"]);
+	});
+
+	test("a path that answered Natsu-Reload: route or response is a real load from then on, and never prefetched", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/admin?x=1": () => control({ "natsu-reload": "route" }),
+				"/feed": () => control({ "natsu-reload": "response" }),
+				"/shell": () => control({ "natsu-reload": "shell" }),
+			},
+		});
+		for (const to of ["/admin?x=1", "/feed", "/shell"]) await p.natsu.visit(to);
+		for (const to of ["/admin?x=2", "/feed", "/shell"]) p.natsu.prefetch(to);
+		await settle();
+		for (const to of ["/admin?x=3", "/feed", "/shell"]) await p.natsu.visit(to);
+		// Asked once each (any query); /shell, refused for another reason, is prefetched again, and the click uses that.
+		expect(p.calls.map((c) => c.url)).toEqual(["/admin?x=1", "/feed", "/shell", "/shell"]);
+		expect(p.loads.length).toBe(6);
+	});
+
+	test("<meta name=natsu data-prefetch=off> (prefetch off on the server): no prefetch at all; a click still swaps", async () => {
+		const p = open({ html: page().replace(`content="k1.s1">`, `content="k1.s1" data-prefetch="off">`), routes: { "/b": () => answer(part()) } });
+		p.natsu.prefetch("/b");
+		p.document.querySelector("#to-b").dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
+		await tick(90);
+		expect(p.calls).toEqual([]);
+		p.click("#to-b");
+		await settle();
+		expect(p.calls.map((c) => [c.url, c.headers["Natsu-Prefetch"]])).toEqual([["/b", undefined]]);
+		expect(text(p, "main h1")).toBe("Page B");
 	});
 
 	test("at most two in flight", async () => {
@@ -1270,6 +1910,9 @@ describe("prefetch", () => {
 });
 
 describe("islands", () => {
+	const isle = (body: string, headers: Record<string, string> = {}) =>
+		new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "natsu-island": "1", ...headers } });
+
 	test("fetched after load into the element, mounted, fetched again by natsu.island; a non-200 leaves it be", async () => {
 		let n = 0;
 		let status = 200;
@@ -1278,13 +1921,11 @@ describe("islands", () => {
 			html: page({ shell: LINKS + `<div id="bell" data-natsu-island="/api/bell">…</div>`, scripts: ["/js/site.js"] }),
 			scripts: { "/js/site.js": (w) => w.natsu.mount("[data-row]", (el: Element) => void log.push(el.textContent!)) },
 			routes: {
-				"/api/bell": () =>
-					status === 200
-						? new Response(`<p data-row>row ${++n}</p>`, { headers: { "content-type": "text/html; charset=utf-8" } })
-						: new Response("no", { status }),
+				"/api/bell": () => (status === 200 ? isle(`<p data-row>row ${++n}</p>`) : new Response("no", { status, headers: { "natsu-island": "1" } })),
 			},
 		});
 		await settle();
+		expect(p.calls).toEqual([{ url: "/api/bell", headers: { "Natsu-Island": "1" } }]);
 		expect(text(p, "#bell")).toBe("row 1");
 		expect(log).toEqual(["row 1"]);
 		await p.natsu.island(p.document.getElementById("bell"));
@@ -1295,6 +1936,26 @@ describe("islands", () => {
 		expect(text(p, "#bell")).toBe("row 2");
 	});
 
+	test("only an answer that says Natsu-Island: 1 is taken, and only from this origin", async () => {
+		const p = open({
+			html: page({
+				shell:
+					LINKS +
+					`<div id="page" data-natsu-island="/account/delete">a</div><div id="text" data-natsu-island="/api/text">b</div>` +
+					`<div id="far" data-natsu-island="https://else.test/x">c</div><div id="rel" data-natsu-island="api/rel">d</div>`,
+			}),
+			routes: {
+				// A whole page, or a route that is not an island: no Natsu-Island back.
+				"/account/delete": () => new Response("<h1>deleted</h1>", { headers: { "content-type": "text/html" } }),
+				"/api/text": () => isle("plain", { "content-type": "text/plain" }),
+				"/api/rel": () => isle("<b>rel</b>"),
+			},
+		});
+		await settle();
+		expect([text(p, "#page"), text(p, "#text"), text(p, "#far"), text(p, "#rel")]).toEqual(["a", "b", "c", "rel"]);
+		expect(p.calls.map((c) => c.url).sort()).toEqual(["/account/delete", "/api/rel", "/api/text"]);
+	});
+
 	test("an island in a region swapped in is fetched; one swapped out is aborted", async () => {
 		const signals: AbortSignal[] = [];
 		const p = open({
@@ -1302,7 +1963,7 @@ describe("islands", () => {
 			routes: {
 				"/b": () => answer(part({ main: `<h1>B</h1><div id="box" data-natsu-island="/api/box">…</div>` })),
 				"/c": () => answer(part({ title: "C" })),
-				"/api/box": () => new Response("<b>box</b>", { headers: { "content-type": "text/html" } }),
+				"/api/box": () => isle("<b>box</b>"),
 			},
 		});
 		const fetch = p.window.fetch;
@@ -1328,7 +1989,13 @@ describe("development build", () => {
 		const q = open({ html: page(), dev: true, routes: { "/b": () => control({ "natsu-reload": "shell" }) } });
 		q.window.console.info = (...a: unknown[]) => void said.push(a);
 		await q.natsu.visit("/b");
-		expect(said[0]).toEqual(["natsu: real load,", "these scripts never called natsu.mount:", [`${ORIGIN}/js/legacy.js`]]);
+		// The scripts are logged as elements (an inline one has no src); compared here by their src.
+		const [lead, bad, line] = said[0] as [string, W[], string];
+		expect([lead, bad.map((s) => s.src), line]).toEqual([
+			"natsu: real load,",
+			[`${ORIGIN}/js/legacy.js`],
+			"never called natsu.mount (call it at the top level of the script, or tag it data-natsu-once)",
+		]);
 		expect(said[1]).toEqual(["natsu: real load,", "shell", `${ORIGIN}/b`]);
 	});
 
@@ -1338,9 +2005,33 @@ describe("development build", () => {
 	});
 });
 
+describe("types", () => {
+	test("natsu is a global, mount is generic, and the natsu: events are typed on document", () => {
+		// Checked by tsc (`bunx tsc --noEmit -p v2`), never run: a wrong type fails the typecheck.
+		const typed = () => {
+			natsu.mount<HTMLFormElement>("form[data-upload]", (form, signal) => {
+				form.requestSubmit();
+				signal.throwIfAborted();
+			});
+			natsu.mount("[data-menu]", (el) => el.focus());
+			// @ts-expect-error an input is not a form
+			natsu.mount<HTMLInputElement>("input", (input) => input.requestSubmit());
+			document.addEventListener("natsu:visit", (e) => e.detail.url.startsWith("/admin") && e.preventDefault());
+			document.addEventListener("natsu:before-swap", (e) => e.detail.url);
+			document.addEventListener("natsu:load", (e) => e.detail.regions.map((r) => r.id + e.detail.url));
+			// @ts-expect-error regions are elements
+			document.addEventListener("natsu:load", (e) => e.detail.regions[0]!.toUpperCase());
+			const load: NatsuLoadDetail = { url: "/", regions: [] };
+			const how: NatsuVisitOptions = { history: "replace", scroll: "keep" };
+			return [load, window.natsu.visit("/b", how)];
+		};
+		expect(typeof typed).toBe("function");
+	});
+});
+
 describe("size", () => {
-	test("the minified runtime stays within 3.5 KB of brotli (target 3.0 KB)", () => {
+	test("the minified runtime stays within 4.0 KB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(3500);
+		expect(br).toBeLessThanOrEqual(4000);
 	});
 });
