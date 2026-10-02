@@ -720,6 +720,21 @@ describe("answers", () => {
 		expect((await nav(app, "/full", key)).headers.get("natsu-location")).toBe("/moved");
 	});
 
+	test("a redirect to anything but http(s) is a full load, never a location for the runtime to assign", async () => {
+		route("/from");
+		let target = "javascript:alert(document.cookie)";
+		new Router().get("/next", navigable((ctx) => ctx.response.redirect(target)));
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/from");
+		for (const bad of ["javascript:alert(document.cookie)", "data:text/html,<script>alert(1)</script>", "http://[bad"]) {
+			target = bad;
+			const answer = await nav(app, "/next", key);
+			expect(answer.status).toBe(204);
+			expect(answer.headers.get("natsu-location")).toBeNull();
+			expect(answer.headers.get("natsu-reload")).toBe("response");
+		}
+	});
+
 	test("ctx.nav.reload() is a full load whatever the handler then draws", async () => {
 		route("/from");
 		new Router().get("/p", navigable((ctx) => {

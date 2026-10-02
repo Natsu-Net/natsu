@@ -104,11 +104,13 @@ export interface Nav {
 	 */
 	stale(headers: Headers): boolean;
 	/**
-	 * Run `fn` only if this answer is a page the visitor will see: at once on
-	 * a request that is not a navigation, and on a navigation only once the
-	 * answer is known to be a part. For one-shot state, such as clearing a
-	 * flash message that this page shows: a refused answer, followed by the
-	 * real load, must not clear it first.
+	 * Run `fn` only if this answer is a page: at once on a request that is not
+	 * a navigation, and on a navigation only once the answer is known to be a
+	 * part. For one-shot state, such as clearing a flash message that this
+	 * page shows: a refused answer, followed by the real load, must not clear
+	 * it first. A prefetch that answers a part runs it too, and the visitor
+	 * may never open that part, so state that must not be used up unseen
+	 * refuses prefetches first: `if (flashed && ctx.nav.skip()) return;`.
 	 */
 	shown(fn: () => void): void;
 }
@@ -378,7 +380,7 @@ export class Navigation {
 			return this.control(
 				ctx,
 				target === null
-					? { kind: "reload", reason: "response", detail: `a redirect to ${location}, which is not a URL` }
+					? { kind: "reload", reason: "response", detail: `a redirect to ${location}, which is not an http(s) URL` }
 					: { kind: "location", url: target, detail: `a ${status} redirect` },
 			);
 		}
@@ -491,7 +493,10 @@ export class Navigation {
 	 * Where a redirect goes, for the runtime. A target on this site is sent
 	 * as a path: behind a proxy that ends TLS, the request's own URL says
 	 * `http:` where the visitor is on `https:`, and an absolute URL built from
-	 * it would read as another origin and cost a full load.
+	 * it would read as another origin and cost a full load. Null for anything
+	 * but http(s): a browser never follows a redirect to `javascript:` or
+	 * `data:`, and handing one to a script that would is how an open redirect
+	 * becomes a script running on the page.
 	 */
 	private resolve(ctx: Context, location: string): string | null {
 		let url: URL;
@@ -500,7 +505,7 @@ export class Navigation {
 		} catch {
 			return null;
 		}
-		if (url.protocol !== "http:" && url.protocol !== "https:") return url.href;
+		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
 		return url.origin === ctx.url.origin ? `${url.pathname}${url.search}${url.hash}` : url.href;
 	}
 
