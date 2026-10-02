@@ -1703,7 +1703,7 @@ describe("prefetch", () => {
 		expect(q.calls).toEqual([]);
 	});
 
-	test("only 200 parts are kept: a skip, a 404 part and a reload are fetched again by the click", async () => {
+	test("a skip and a 404 part are fetched again by the click; a skip is remembered for 10 s, so hovers stop asking", async () => {
 		const p = open({
 			html: page(),
 			routes: {
@@ -1714,10 +1714,62 @@ describe("prefetch", () => {
 		p.natsu.prefetch("/b");
 		p.natsu.prefetch("/c");
 		await settle();
+		p.natsu.prefetch("/b");
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c"]);
 		await p.natsu.visit("/b");
 		await p.natsu.visit("/c");
 		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c", "/b", "/c"]);
 		expect(p.document.title).toBe("C");
+	});
+
+	test("a prefetched reload or redirect is kept, and the click acts on it without asking again", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/r": () => control({ "natsu-reload": "shell" }),
+				"/old": () => control({ "natsu-location": "/new" }),
+				"/new": () => answer(part({ title: "New" })),
+			},
+		});
+		p.natsu.prefetch("/r");
+		p.natsu.prefetch("/old");
+		await settle();
+		await p.natsu.visit("/r");
+		await p.natsu.visit("/old");
+		expect(p.calls.map((c) => c.url)).toEqual(["/r", "/old", "/new"]);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/r`]]);
+		expect([path(p), p.document.title]).toEqual(["/new", "New"]);
+	});
+
+	test("a path that answered Natsu-Reload: route or response is a real load from then on, and never prefetched", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/admin?x=1": () => control({ "natsu-reload": "route" }),
+				"/feed": () => control({ "natsu-reload": "response" }),
+				"/shell": () => control({ "natsu-reload": "shell" }),
+			},
+		});
+		for (const to of ["/admin?x=1", "/feed", "/shell"]) await p.natsu.visit(to);
+		for (const to of ["/admin?x=2", "/feed", "/shell"]) p.natsu.prefetch(to);
+		await settle();
+		for (const to of ["/admin?x=3", "/feed", "/shell"]) await p.natsu.visit(to);
+		// Asked once each (any query); /shell, refused for another reason, is prefetched again, and the click uses that.
+		expect(p.calls.map((c) => c.url)).toEqual(["/admin?x=1", "/feed", "/shell", "/shell"]);
+		expect(p.loads.length).toBe(6);
+	});
+
+	test("<meta name=natsu data-prefetch=off> (prefetch off on the server): no prefetch at all; a click still swaps", async () => {
+		const p = open({ html: page().replace(`content="k1.s1">`, `content="k1.s1" data-prefetch="off">`), routes: { "/b": () => answer(part()) } });
+		p.natsu.prefetch("/b");
+		p.document.querySelector("#to-b").dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
+		await tick(90);
+		expect(p.calls).toEqual([]);
+		p.click("#to-b");
+		await settle();
+		expect(p.calls.map((c) => [c.url, c.headers["Natsu-Prefetch"]])).toEqual([["/b", undefined]]);
+		expect(text(p, "main h1")).toBe("Page B");
 	});
 
 	test("at most two in flight", async () => {

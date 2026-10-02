@@ -150,7 +150,9 @@ const L = location;
 const HI = history;
 const me = D.currentScript as HTMLScriptElement | null;
 const NONCE = me?.nonce ?? "";
-const KEY = D.querySelector<HTMLMetaElement>('meta[name="natsu"]')?.content;
+const META = D.querySelector<HTMLMetaElement>('meta[name="natsu"]');
+const KEY = META?.content;
+const OFF = /^(false|off)$/;
 const REGION = "[data-natsu-region][id]";
 const LOADING = "data-natsu-loading";
 const SHEET = "link[rel=stylesheet]";
@@ -173,7 +175,7 @@ const fire = (name: string, target: EventTarget, detail?: unknown) =>
 /** The nearest `data-natsu-<name>` at or above `el`: present is on, "false" and "off" are off; undefined if none. */
 const flag = (el: Element, name: string) => {
 	const v = el.closest(`[data-natsu-${name}]`)?.getAttribute("data-natsu-" + name);
-	return v == null ? v : !/^(false|off)$/.test(v);
+	return v == null ? v : !OFF.test(v);
 };
 
 const mountIn = (root: Element, only?: Reg) => {
@@ -415,10 +417,15 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	// --- prefetch -------------------------------------------------------
 	const cache = new Map<string, { t: number; p: Promise<Answer | undefined> }>();
 	let flying = 0;
+	/** Paths whose route is not navigable, or that are no page: a real load from now on, never prefetched. */
+	const refused = new Set<string>();
+	/** The server's `navigate.prefetch: false`. */
+	const quiet = OFF.test(META!.getAttribute("data-prefetch")!);
 	const get = (u: URL, pre?: 1) =>
-		fetch(bare(u), { headers: { "Natsu-Nav": KEY!, ...(pre && { "Natsu-Prefetch": "1" }) } }).then(
-			async (r): Promise<Answer> => [r, await r.text()],
-		);
+		fetch(bare(u), { headers: { "Natsu-Nav": KEY!, ...(pre && { "Natsu-Prefetch": "1" }) } }).then(async (r): Promise<Answer> => {
+			if (/^(route|response)$/.test(r.headers.get("natsu-reload")!)) refused.add(u.pathname);
+			return [r, await r.text()];
+		});
 	/** A cached answer young enough to use, taken out of the cache. */
 	const fresh = (k: string) => {
 		const hit = cache.get(k);
@@ -431,13 +438,21 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		const hit = fresh(k);
 		const c = (navigator as { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
 		if (hit) return void cache.set(k, hit); // now the most recently used
-		if (unsafe() || c?.saveData || /2g/.test(c?.effectiveType!) || flying > 1 || k == bare(L) || u.origin != L.origin) return;
+		if (quiet || unsafe() || c?.saveData || /2g/.test(c?.effectiveType!) || flying > 1 || k == bare(L) || u.origin != L.origin || refused.has(u.pathname))
+			return;
 		flying++;
 		const drop = (): undefined => void cache.delete(k);
 		cache.set(k, {
 			t: Date.now(),
+			// Kept: a 200 part, or a 204 that says reload or go elsewhere, which
+			// the click acts on as it is. A skip stays as no answer, so hovers stop
+			// asking and the click fetches; anything else goes.
 			p: get(u, 1)
-				.then((a) => (a[0].status == 200 && a[0].headers.has("natsu-part") ? a : drop()), drop)
+				.then((a) => {
+					const x = a[0].headers;
+					if (x.has("natsu-part") ? a[0].status == 200 : x.has("natsu-reload") || x.has("natsu-location")) return a;
+					if (!x.has("natsu-prefetch")) drop();
+				}, drop)
 				.finally(() => flying--),
 		});
 		if (cache.size > 5) cache.delete(cache.keys().next().value!);
@@ -484,7 +499,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			if (DEV && h == "none") why("natsu:visit was cancelled", u.href);
 			return h == "none" ? full(u, h) : undefined;
 		}
-		if (unsafe() || u.origin != L.origin) return full(u, h);
+		if (unsafe() || u.origin != L.origin || refused.has(u.pathname)) return full(u, h);
 		// The page already shown: the browser too replaces rather than pushes.
 		if (!h && u.href == L.href) h = "replace";
 		const n = ++seq;
