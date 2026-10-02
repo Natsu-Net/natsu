@@ -287,9 +287,14 @@ export class Assets {
 	/**
 	 * A page kept rewritten (see PageCache's `prepare`) was rewritten once for
 	 * every visitor, before any one answer's nonce existed: its lazy loaders
-	 * get this answer's nonce now. Only a script that is exactly the loader
-	 * this pipeline writes for the stylesheet link right before it is given
-	 * one, so no script of the page's own ever is.
+	 * get this answer's nonce now. Only a script that is byte for byte a
+	 * loader `rewrite` writes, right after the link to the chunk it is for,
+	 * is given one, so no script of the page's own ever is: the loader this
+	 * pipeline remembers writing for that chunk, or, once its shape has been
+	 * forgotten (`maxPageShapes`) while the page is still kept, a loader for
+	 * that chunk's lazy half whose selector holds no `<`. A selector is the
+	 * one part a page could choose, and without a `<` it can neither end the
+	 * script early nor (`<!--<script>`) make it run on past its own end.
 	 */
 	private nonceLoaders(page: string, nonce: string): string {
 		let out = page;
@@ -297,14 +302,31 @@ export class Assets {
 			if (out.charCodeAt(at - 1) !== 62 /* > */) continue;
 			const tag = out.slice(out.lastIndexOf("<", at - 1), at);
 			if (!/^<link\b/i.test(tag)) continue;
+			const loader = readLoader(out, at);
+			if (!loader) continue;
 			const href = /\shref\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
-			const lazy = href ? this.lazy.get(href[1] ?? href[2] ?? "") : undefined;
-			if (!lazy) continue;
-			const plain = lazyLoader(lazy.url, lazy.triggers, undefined);
-			if (!out.startsWith(plain, at)) continue;
-			out = `${out.slice(0, at)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(at + plain.length)}`;
+			const chunk = href?.[1] ?? href?.[2] ?? "";
+			const known = this.lazy.get(chunk);
+			const ours = (known !== undefined && known.url === loader.url && known.triggers.join(",") === loader.selector) ||
+				(!`${loader.selector}${loader.url}`.includes("<") && this.isLazyHalf(chunk, loader.url));
+			if (!ours) continue;
+			out = `${out.slice(0, at)}${lazyLoader(loader.url, [loader.selector], nonce)}${out.slice(loader.end)}`;
 		}
 		return out;
+	}
+
+	/**
+	 * Whether `later` is the name this pipeline gives the lazy half of the
+	 * stylesheet chunk at `eager`: `<name>-later.<hash>.css` beside
+	 * `<name>.<hash>.css`, under `publicPath`, for a stylesheet it builds.
+	 */
+	private isLazyHalf(eager: string, later: string): boolean {
+		const prefix = `${this.options.publicPath}/`;
+		if (!eager.startsWith(prefix) || !later.startsWith(prefix)) return false;
+		const name = /^(.+)\.[0-9a-f]{10}\.css$/.exec(eager.slice(prefix.length))?.[1];
+		if (name === undefined || !this.sources.has(name)) return false;
+		const rest = later.slice(prefix.length);
+		return rest.startsWith(`${name}-later.`) && /^[0-9a-f]{10}\.css$/.test(rest.slice(name.length + "-later.".length));
 	}
 
 	/**
@@ -478,7 +500,7 @@ export class Assets {
 			// A lazy loader is the one inline script of ours, so only lazy
 			// styles need the answer's nonce.
 			if (this.rewritten.has(ctx)) {
-				const nonce = this.lazy.size > 0 ? cspNonce(ctx) : undefined;
+				const nonce = this.options.lazyStyles ? cspNonce(ctx) : undefined;
 				if (nonce) ctx.response.body = this.nonceLoaders(body, nonce);
 				return;
 			}
@@ -773,30 +795,86 @@ export class Assets {
  * run and the lazy rules never load.
  */
 function lazyLoader(url: string, triggers: string[], nonce: string | undefined): string {
-	const selector = JSON.stringify(triggers.join(","));
 	const open = nonce ? `<script nonce="${nonce}">` : "<script>";
-	return `${open}${LOADER_BODY}S=${selector},c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=${JSON.stringify(url)};a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>`;
+	return `${open}${LOADER_HEAD}${JSON.stringify(triggers.join(","))}${LOADER_MIDDLE}${JSON.stringify(url)}${LOADER_TAIL}`;
 }
 
-/** How every lazy loader starts, after its opening tag. */
-const LOADER_BODY = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],';
+/** A lazy loader's text after its opening tag and up to its selector. */
+const LOADER_HEAD = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=';
+/** Its text between the selector and the lazy stylesheet's URL. */
+const LOADER_MIDDLE = ',c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=';
+/** Its text after the URL. */
+const LOADER_TAIL = ';a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>';
 /** A lazy loader as `rewrite` writes it, before any answer's nonce. */
-const LOADER_START = `<script>${LOADER_BODY}`;
-
-/** A CSP nonce is base64 or base64url (CSP3's `base64-value`): nothing to escape in an attribute. */
-const NONCE_VALUE = /^[A-Za-z0-9+/=_-]+$/;
+const LOADER_START = `<script>${LOADER_HEAD}`;
 
 /**
- * The nonce this answer's own Content-Security-Policy allows scripts by:
- * its first `'nonce-…'` source that is base64 or base64url. Read from the
- * response, after the route, so it is this visitor's even on a page kept
- * for everyone.
+ * The loader without a nonce that starts at `at`, read back: its selector,
+ * the URL it loads, and where it ends. Nothing unless every byte of it is
+ * what `lazyLoader` writes for those two, each spelled as JSON.stringify
+ * spells it.
+ */
+function readLoader(text: string, at: number): { selector: string; url: string; end: number } | undefined {
+	let next = at + LOADER_START.length;
+	const selector = jsonStringAt(text, next);
+	if (selector === undefined) return undefined;
+	next += selector.length;
+	if (!text.startsWith(LOADER_MIDDLE, next)) return undefined;
+	next += LOADER_MIDDLE.length;
+	const url = jsonStringAt(text, next);
+	if (url === undefined) return undefined;
+	next += url.length;
+	if (!text.startsWith(LOADER_TAIL, next)) return undefined;
+	return { selector: selector.value, url: url.value, end: next + LOADER_TAIL.length };
+}
+
+/** A string in double quotes, escapes and all. */
+const JSON_STRING = /"(?:[^"\\]|\\.)*"/y;
+
+/** The JSON string at `at`, if JSON.stringify would spell its value just so: its value and length. */
+function jsonStringAt(text: string, at: number): { value: string; length: number } | undefined {
+	JSON_STRING.lastIndex = at;
+	const literal = JSON_STRING.exec(text)?.[0];
+	if (literal === undefined) return undefined;
+	try {
+		const value: unknown = JSON.parse(literal);
+		return typeof value === "string" && JSON.stringify(value) === literal ? { value, length: literal.length } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** A nonce source as CSP3 writes it: `'nonce-` and a base64 or base64url value, nothing to escape in an attribute. */
+const NONCE_SOURCE = /^'nonce-([A-Za-z0-9+/_-]+={0,2})'$/i;
+
+/**
+ * The nonce this answer's own Content-Security-Policy allows inline
+ * scripts by. Read from the response, after the route, so it is this
+ * visitor's even on a page kept for everyone.
+ *
+ * A <script> is held to a policy's `script-src-elem`, or its `script-src`
+ * when it has none, or its `default-src`; the first directive of a name
+ * counts and later ones are ignored, as a browser parses them. A nonce
+ * another directive names (`style-src`) would not let the loader run. The
+ * header may hold several policies, joined by commas, each enforced on its
+ * own; a script carries one nonce, the first that any of them allows
+ * scripts by.
  */
 function cspNonce(ctx: Context): string | undefined {
-	const csp = ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null;
-	if (!csp) return undefined;
-	for (const match of csp.matchAll(/'nonce-([^']*)'/gi)) {
-		if (NONCE_VALUE.test(match[1] ?? "")) return match[1];
+	const header = ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null;
+	if (!header) return undefined;
+	for (const policy of header.split(",")) {
+		const directives = new Map<string, string[]>();
+		for (const directive of policy.split(";")) {
+			const [name, ...sources] = directive.trim().split(/[\t\n\f\r ]+/);
+			const key = name?.toLowerCase();
+			if (key && !directives.has(key)) directives.set(key, sources);
+		}
+		const sources = directives.get("script-src-elem") ?? directives.get("script-src") ?? directives.get("default-src") ?? [];
+		for (const source of sources) {
+			const nonce = NONCE_SOURCE.exec(source)?.[1];
+			if (nonce !== undefined) return nonce;
+		}
 	}
 	return undefined;
 }
