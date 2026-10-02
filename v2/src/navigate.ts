@@ -680,6 +680,14 @@ export function shellOf(html: string, scan: PageScan): string {
  * listed scripts itself, and under `'strict-dynamic'` a script it creates
  * runs whatever its host, so markup that slipped into the page cannot become
  * a script by riding along.
+ *
+ * A nonce on anything else in the head (an inline `<style>`, a preload) is
+ * written as `nonce=""` when it is this response's, and dropped when it is
+ * not. That is how the browser shows the same element on the page already
+ * there (it hides a nonce once the element is in a document with a CSP), so
+ * the runtime's merge by `outerHTML` sees an unchanged element as unchanged;
+ * and an element that is new gets the document's own nonce from the runtime,
+ * the only one its CSP accepts, only if the server had vouched for it.
  */
 export function partOf(html: string, scan: PageScan, key: string, nonces: readonly string[], runtime = ""): string {
 	const [, headStart, headClose] = scan.head;
@@ -692,6 +700,7 @@ export function partOf(html: string, scan: PageScan, key: string, nonces: readon
 		from = scan.raw[i + 1]!;
 	}
 	head += html.slice(from, headClose);
+	head = head.replace(NONCE_ATTRIBUTE, (attribute) => (nonces.includes(nonceValue(attribute)) ? ' nonce=""' : ""));
 	let regions = "";
 	for (const region of scan.regions) regions += html.slice(region.start, region.end);
 	let scripts = "";
@@ -701,6 +710,12 @@ export function partOf(html: string, scan: PageScan, key: string, nonces: readon
 		scripts += `${tag.open.replace(NONCE_ATTRIBUTE, "")}</script>`;
 	}
 	return `<!doctype html><html><head>${head}<meta name="natsu" content="${key}"></head><body>${regions}${scripts}</body></html>`;
+}
+
+/** The value of a `nonce=…` attribute as NONCE_ATTRIBUTE matched it, quotes taken off. */
+function nonceValue(attribute: string): string {
+	const value = attribute.slice(attribute.indexOf("=") + 1).trim();
+	return value.startsWith('"') || value.startsWith("'") ? value.slice(1, -1) : value;
 }
 
 /** Every nonce a CSP header allows, in order. */

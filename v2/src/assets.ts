@@ -640,9 +640,9 @@ export class Assets {
 	 * plain `<script defer>` in the head), and the build id that goes into
 	 * every page's document key: a hash of the manifest, so a deploy that
 	 * changes any entry makes the next navigation a real load. In development
-	 * the runtime is built unminified with its console diagnostics
-	 * (`__NATSU_DEV__`); otherwise minified, whatever `minify` says, because
-	 * every visitor downloads it.
+	 * the runtime is built unminified with its console diagnostics (the
+	 * `NATSU_DEV` define the runtime reads); otherwise minified, whatever
+	 * `minify` says, because every visitor downloads it.
 	 */
 	private async buildNavigation(): Promise<void> {
 		const navigation = this.navigation;
@@ -656,7 +656,7 @@ export class Assets {
 			splitting: false,
 			minify: !dev,
 			define: {
-				__NATSU_DEV__: dev ? "true" : "false",
+				NATSU_DEV: dev ? "true" : "false",
 				"process.env.NODE_ENV": JSON.stringify(dev ? "development" : "production"),
 			},
 		});

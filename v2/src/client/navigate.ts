@@ -42,10 +42,12 @@
  * answers:
  *
  *  - a **part**: the page's own status, `Natsu-Part: 1`, and a small HTML
- *    document: the page's head (no scripts), its regions in order, then its
- *    `<script src>` list;
- *  - `204` with `Natsu-Location: <url>`: the page redirected; a same-origin
- *    target is visited (five hops at most), any other is a real load;
+ *    document: the page's head (no scripts; a nonce the server vouched for
+ *    written `nonce=""`, as the browser shows it on a live element), its
+ *    regions in order, then its `<script src>` list;
+ *  - `204` with `Natsu-Location: <url>`: the page redirected (a path for a
+ *    target on this site); a same-origin target is visited (five hops at
+ *    most), any other is a real load;
  *  - `204` with `Natsu-Reload: <reason>`: load this page for real;
  *  - `204` with `Natsu-Prefetch: skip`: a hover was refused (a click still
  *    swaps).
@@ -69,7 +71,9 @@
  *  4. In one synchronous step (inside a view transition only when
  *     `<html data-natsu-transition>` opts in): `natsu:before-swap`, history,
  *     the head merged by `outerHTML` (only what the server sent: scripts,
- *     nodes a third party added and `<html>` attributes are never touched),
+ *     nodes a third party added and `<html>` attributes are never touched;
+ *     a new element with `nonce=""` gets the boot nonce, so a page's own
+ *     inline `<style>` applies under a nonce `style-src`),
  *     the old stylesheets out, each region unmounted and replaced, scroll,
  *     focus, and the title read out through a `role=status` element.
  *  5. The mounts already registered run on the new regions. The listed
@@ -487,7 +491,11 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 				e.remove();
 				owned.delete(e);
 			}
-			for (const e of [...adds, ...incoming.values()]) owned.add(e);
+			for (const e of [...adds, ...incoming.values()]) {
+				owned.add(e);
+				// The server writes `nonce=""` on what it vouched for; the CSP takes only the boot nonce.
+				if (e.hasAttribute("nonce")) (e as HTMLElement).nonce = NONCE;
+			}
 			D.head.append(...incoming.values());
 			now.forEach((el, i) => {
 				unmount(el);

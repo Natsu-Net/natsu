@@ -483,6 +483,22 @@ describe("head", () => {
 		expect(p.document.getElementById("third-party")).toBe(ad);
 	});
 
+	test("a nonce the server vouched for (nonce=\"\") gets the boot nonce on a new element; an unchanged one stays", async () => {
+		// A browser shows a live element's nonce as "" (it hides it); the part writes it the same way.
+		const p = open({
+			html: page({ head: `<style nonce="">.shell{}</style>` }),
+			routes: { "/b": () => answer(part({ head: `<style nonce="">.shell{}</style><style nonce="">.b{}</style><style>.unvouched{}</style>` })) },
+		});
+		const shell = p.document.querySelector("head style");
+		p.click("#to-b");
+		await settle();
+		const styles = [...p.document.head.querySelectorAll("style")] as W[];
+		expect(styles.map((s) => s.textContent)).toEqual([".shell{}", ".b{}", ".unvouched{}"]);
+		expect(styles[0]).toBe(shell);
+		expect(styles[1].nonce).toBe("N0NCE");
+		expect(styles[2].nonce || "").toBe("");
+	});
+
 	test("scripts in either head are never touched", async () => {
 		const p = open({
 			html: page({ head: `<script src="/js/head.js" defer></script>` }),

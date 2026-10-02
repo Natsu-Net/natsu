@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { brotliDecompressSync } from "node:zlib";
+import { brotliCompressSync, brotliDecompressSync } from "node:zlib";
 import { Assets, type AssetsOptions } from "../src/assets.ts";
 import { compress } from "../src/compress.ts";
 import { setConfig } from "../src/config.ts";
@@ -546,6 +546,20 @@ describe("the script list", () => {
 		if (scan === null || "reason" in scan) throw new Error("no scan");
 		expect(partOf(html, scan, "k.k", [])).toEndWith('<script src="/a.js"></script><script src="/b.js"></script></body></html>');
 	});
+
+	test("a nonce elsewhere in the head is written nonce=\"\" when it is this response's, and dropped when not", async () => {
+		route("/from");
+		route("/b", (ctx) => {
+			const nonce = /'nonce-([^']+)'/.exec(ctx.response.headers.get("content-security-policy") ?? "")?.[1] ?? "";
+			return { head: `<style nonce="${nonce}">.b{}</style><link rel="preload" href="/f.woff2" as="font" nonce='stale'><style nonce=${nonce}>.c{}</style>` };
+		});
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/from");
+		const part = await (await nav(app, "/b", key)).text();
+		// As the browser shows a live element once it hides its nonce, so a merge by outerHTML matches it.
+		expect(part).toContain('<style nonce="">.b{}</style><link rel="preload" href="/f.woff2" as="font"><style nonce="">.c{}</style>');
+		expect(part).not.toContain("stale");
+	});
 });
 
 describe("the key", () => {
@@ -775,7 +789,21 @@ describe("delivery", () => {
 		expect(answer.headers.get("cache-control")).toContain("immutable");
 		const code = await answer.text();
 		expect(code).not.toMatch(/\bexport\b|\bimport\b/);
-		expect(code.length).toBeGreaterThan(0);
+		// The client runtime itself, speaking this wire format, minified and without its console lines.
+		for (const word of ["Natsu-Nav", "Natsu-Prefetch", "natsu-part", "natsu-location", 'meta[name="natsu"]', "data-natsu-region", "data-natsu-later"]) {
+			expect(code).toContain(word);
+		}
+		expect(code).not.toContain("real load");
+		expect(code.split("\n").length).toBeLessThan(5);
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThan(3500);
+	});
+
+	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {
+		setConfig({ General: { development: true, logLevel: "silent" } });
+		const { assets, app } = await pipeline();
+		const code = await (await get(app, assets.url("natsu-navigate"))).text();
+		expect(code).toContain("natsu: real load,");
+		expect(code.split("\n").length).toBeGreaterThan(100);
 	});
 
 	test("with inject off a page carries the key and no runtime", async () => {
