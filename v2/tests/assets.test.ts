@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Assets } from "../src/assets.ts";
+import type { Context } from "../src/context.ts";
 import { compress } from "../src/compress.ts";
 import { PageCache } from "../src/page-cache.ts";
 import { Application } from "../src/server.ts";
@@ -469,6 +470,19 @@ describe("page shapes", () => {
 		const html = '<html><head><link rel="stylesheet" href="/site.css"></head><body class="card"></body></html>';
 		expect(pipeline.rewrite(html)).toContain(pipeline.url("site"));
 	});
+
+	test("after another build, a shape seen before is cut from the sheet that build read", async () => {
+		const pipeline = assets();
+		await pipeline.build();
+		const html = '<body><div class="card">x</div></body>';
+		const first = pipeline.pageStyle("site", html);
+		writeFileSync(join(dir, "site.css"), CSS.replace(".card { border: 1px solid; }", ".card { border: 2px dashed; }"));
+		await pipeline.build();
+		const second = pipeline.pageStyle("site", html);
+		expect(second).not.toBe(first);
+		const body = (heldFiles(pipeline).get(second.slice("/_a/".length)) as { body: string }).body;
+		expect(body).toContain("dashed");
+	});
 });
 
 describe("minification", () => {
@@ -589,6 +603,192 @@ describe("lazy styles", () => {
 		const pipeline = assets({ lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
 		await pipeline.build();
 		expect(pipeline.rewrite('<link rel="stylesheet" href="/assets/css/site.css"><div class="card"></div>')).not.toContain("<script>");
+	});
+});
+
+describe("the lazy loader under a CSP", () => {
+	/** A script of the page's own that starts as the loader does, right after a stylesheet link. */
+	const lookalike = '<script>(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S="";alert(1)})()</script>';
+	const page = '<html><head><link rel="stylesheet" href="/assets/css/site.css"><script nonce="NONCE" src="/s.js"></script></head>' +
+		`<body><div class="card">x</div><link rel="stylesheet" href="/assets/css/site.css">${lookalike}<script>own()</script></body></html>`;
+	const get = async (app: Application, path: string) => await (await app.handle(new Request(`http://natsu.test${path}`))).text();
+
+	test("carries the nonce the answer's own CSP allows scripts by", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		reset();
+		const answer = (csp: string | null) => (ctx: Context) => {
+			if (csp) ctx.response.headers.set("content-security-policy", csp);
+			ctx.response.headers.set("content-type", "text/html; charset=utf-8");
+			ctx.response.body = page;
+		};
+		new Router().get("/nonce", answer("default-src 'self'; script-src 'nonce-dGVzdA==' 'strict-dynamic'"));
+		new Router().get("/none", answer(null));
+		new Router().get("/hashes", answer("script-src 'sha256-abc' 'self'"));
+		new Router().get("/odd", answer(`script-src 'nonce-a"b' 'nonce-<i>'`));
+		const app = new Application();
+		app.use(pipeline.middleware());
+
+		const nonced = await get(app, "/nonce");
+		expect(nonced).toMatch(/<link rel="stylesheet" href="\/_a\/site\.[0-9a-f]{10}\.css"><script nonce="dGVzdA==">\(\(\)=>\{let d=0,/);
+		expect(nonced.split('nonce="dGVzdA=="').length).toBe(2);
+		// Scripts of the page's own are left as they are.
+		expect(nonced).toContain(`.css">${lookalike}<script>own()</script>`);
+		expect(nonced).toContain('<script nonce="NONCE" src="/s.js">');
+		// No CSP, a CSP without a nonce, or a nonce that is not base64: no nonce.
+		for (const path of ["/none", "/hashes", "/odd"]) {
+			const plain = await get(app, path);
+			expect(plain).toMatch(/\.css"><script>\(\(\)=>\{let d=0,/);
+			expect(plain.split("nonce=").length).toBe(2);
+		}
+	});
+
+	test("on a page kept rewritten, each answer's loader carries that answer's nonce, and nothing else gets it", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const pages = new PageCache({ prepare: (html) => pipeline.rewrite(html) });
+		reset();
+		new Router().get("/page", async (ctx) => {
+			const nonce = crypto.randomUUID().replaceAll("-", "");
+			ctx.response.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
+			const kept = await pages.serve("/page", [nonce], async ([mark]) => ({ body: page.replace("NONCE", mark!), status: 200 }));
+			if (kept?.prepared) pipeline.markRewritten(ctx);
+			ctx.response.body = kept?.body ?? "";
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+
+		const answers = [await get(app, "/page"), await get(app, "/page")];
+		const nonces = answers.map((answer) => /<script nonce="([0-9a-f]{32})" src="\/s\.js">/.exec(answer)?.[1] ?? "");
+		expect(nonces[0]).toMatch(/^[0-9a-f]{32}$/);
+		expect(nonces[1]).not.toBe(nonces[0]);
+		answers.forEach((answer, i) => {
+			expect(answer).toMatch(new RegExp(`\\.css"><script nonce="${nonces[i]}">\\(\\(\\)=>\\{let d=0,`));
+			// The page's own lookalike, after the same chunk link, is not the loader: no nonce.
+			expect(answer).toContain(`.css">${lookalike}<script>own()</script>`);
+			expect(answer.split(`nonce="${nonces[i]}"`).length).toBe(3);
+		});
+		// Rewritten once for everyone: the answers differ by their nonces alone.
+		expect(answers[0]!.replaceAll(nonces[0]!, "N")).toBe(answers[1]!.replaceAll(nonces[1]!, "N"));
+	});
+
+	test("takes the nonce inline scripts are allowed by, not one another directive names", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		reset();
+		// Policy -> the nonce the loader should carry. A <script> is checked
+		// against script-src-elem, else script-src, else default-src; the first
+		// directive of a name counts; several policies each have their say.
+		const policies: Array<[string, string | null]> = [
+			["style-src 'nonce-c3R5bGU='; script-src 'self' 'nonce-c2NyaXB0'", "c2NyaXB0"],
+			["default-src 'nonce-ZGVm'", "ZGVm"],
+			["default-src 'nonce-ZGVm'; script-src 'nonce-c2NyaXB0'; script-src-elem 'nonce-ZWxlbQ'", "ZWxlbQ"],
+			["SCRIPT-SRC 'NONCE-dXBwZXI='", "dXBwZXI="],
+			["script-src 'nonce-Zmlyc3Q'; script-src 'nonce-c2Vjb25k'", "Zmlyc3Q"],
+			["script-src 'self' 'unsafe-inline', script-src 'nonce-dHdv'", "dHdv"],
+			["script-src 'self'; style-src 'nonce-c3R5bGU='", null],
+			["default-src 'nonce-ZGVm'; script-src 'self'", null],
+		];
+		policies.forEach(([csp], i) => {
+			new Router().get(`/p${i}`, (ctx) => {
+				ctx.response.headers.set("content-security-policy", csp);
+				ctx.response.headers.set("content-type", "text/html; charset=utf-8");
+				ctx.response.body = page;
+			});
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		for (const [i, [csp, want]] of policies.entries()) {
+			const body = await get(app, `/p${i}`);
+			const loader = /<link rel="stylesheet" href="\/_a\/site\.[0-9a-f]{10}\.css"><script(?: nonce="([^"]*)")?>\(\(\)=>\{let d=0,/.exec(body);
+			expect(loader).not.toBeNull();
+			expect({ csp, nonce: loader?.[1] ?? null }).toEqual({ csp, nonce: want });
+		}
+	});
+
+	test("a page kept rewritten still gets a nonce on its loader once its shape is forgotten", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, maxPageShapes: 1, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const pages = new PageCache({ prepare: (html) => pipeline.rewrite(html) });
+		reset();
+		new Router().get("/page", async (ctx) => {
+			const nonce = crypto.randomUUID().replaceAll("-", "");
+			ctx.response.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
+			const kept = await pages.serve("/page", [nonce], async ([mark]) => ({ body: page.replace("NONCE", mark!), status: 200 }));
+			if (kept?.prepared) pipeline.markRewritten(ctx);
+			ctx.response.body = kept?.body ?? "";
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+
+		const first = await get(app, "/page");
+		const chunk = /<link rel="stylesheet" href="(\/_a\/site\.[0-9a-f]{10}\.css)"><script nonce="[0-9a-f]{32}">/.exec(first)?.[1];
+		expect(chunk).toBeDefined();
+		// Pages of other shapes push this one's out of the pipeline, while the
+		// cache still holds the page rewritten for it.
+		for (const name of ["card__title", "is-open"]) pipeline.rewrite(`<link rel="stylesheet" href="/assets/css/site.css"><p class="${name}"></p>`);
+		expect((pipeline as unknown as { lazy: Map<string, unknown> }).lazy.has(chunk!)).toBe(false);
+
+		const second = await get(app, "/page");
+		const nonce = /<script nonce="([0-9a-f]{32})" src="\/s\.js">/.exec(second)?.[1];
+		expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+		expect(second).toContain(`href="${chunk}"><script nonce="${nonce}">(()=>{let d=0,`);
+		expect(second).toContain(`.css">${lookalike}<script>own()</script>`);
+		expect(second.split(`nonce="${nonce}"`).length).toBe(3);
+	});
+
+	test("a page's own copy of the loader that is not one this pipeline wrote gets no nonce", async () => {
+		const pipeline = assets({ safelist: ["admin-table"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const kept = pipeline.rewrite(page);
+		const loader = /<script>\(\(\)=>\{let d=0,[\s\S]*?<\/script>/.exec(kept)![0];
+		const later = /l\.href="([^"]+)"/.exec(loader)![1]!;
+		const eager = /href="(\/_a\/site\.[0-9a-f]{10}\.css)"/.exec(kept)![1]!;
+		// The page's own copies of the loader: after a link elsewhere, loading
+		// a sheet from elsewhere, after the right link for another sheet, or
+		// with a selector that would carry the script on past its end.
+		const copies = [
+			`<link rel="stylesheet" href="https://elsewhere.test/site.0123456789.css">${loader}`,
+			`<link rel="stylesheet" href="${eager}">${loader.replace(later, "https://elsewhere.test/x.css")}`,
+			`<link rel="stylesheet" href="${eager}">${loader.replace(later, later.replace("site-later", "other-later"))}`,
+			`<link rel="stylesheet" href="${eager}">${loader.replace(/S="[^"]*"/, 'S="<!--<script>"')}x/;own()//</script>-->`,
+		];
+		reset();
+		new Router().get("/page", (ctx) => {
+			ctx.response.headers.set("content-security-policy", "script-src 'nonce-dGVzdA=='");
+			ctx.response.body = kept.replace("</body>", `${copies.join("")}</body>`);
+			pipeline.markRewritten(ctx);
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		// While the pipeline remembers the chunk, and once it has forgotten it.
+		for (const _round of [1, 2]) {
+			const answer = await get(app, "/page");
+			expect(answer).toContain(`href="${eager}"><script nonce="dGVzdA==">(()=>{let d=0,`);
+			expect(answer.split('nonce="dGVzdA=="').length).toBe(2);
+			for (const copy of copies) expect(answer).toContain(copy);
+			(pipeline as unknown as { lazy: Map<string, unknown> }).lazy.clear();
+		}
+	});
+
+	test("a loader whose selector holds a < gets the nonce while the pipeline remembers writing it", async () => {
+		writeFileSync(join(dir, "site.css"), `${CSS}\n.a\\<b { color: red; }`);
+		const pipeline = assets({ safelist: ["admin-table", "a<b"], lazyStyles: true, rewrite: { "/assets/css/site.css": "site" } });
+		await pipeline.build();
+		const kept = pipeline.rewrite(page);
+		expect(kept).toContain(String.raw`S=".admin-table,.a\\<b"`);
+		reset();
+		new Router().get("/page", (ctx) => {
+			ctx.response.headers.set("content-security-policy", "script-src 'nonce-dGVzdA=='");
+			ctx.response.body = kept;
+			pipeline.markRewritten(ctx);
+		});
+		const app = new Application();
+		app.use(pipeline.middleware());
+		expect(await get(app, "/page")).toContain('.css"><script nonce="dGVzdA==">(()=>{let d=0,');
+		// Forgotten, it cannot be told from a page's own copy with a < put in.
+		(pipeline as unknown as { lazy: Map<string, unknown> }).lazy.clear();
+		expect(await get(app, "/page")).toBe(kept);
 	});
 });
 

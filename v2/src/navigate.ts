@@ -48,6 +48,7 @@ import { addVary } from "./compress.ts";
 import { config } from "./config.ts";
 import type { Context, Handler } from "./context.ts";
 import { GetController } from "./controller.ts";
+import { scriptNonce } from "./csp.ts";
 import { log } from "./logger.ts";
 import type { CachedPage, Filled } from "./page-cache.ts";
 
@@ -541,8 +542,10 @@ export class Navigation {
 	 * rewritten. The kept page is read once, not on every answer, and the
 	 * answer is built from its pieces: cutting `page` itself would copy it a
 	 * second time, which costs about as much as the rest of a hit.
+	 * `transform` is what the answer still needs per request (the lazy
+	 * stylesheet loaders' nonce), applied to the kept page's pieces.
 	 */
-	public fullFilled(ctx: Context, page: string, filled: Filled): string {
+	public fullFilled(ctx: Context, page: string, filled: Filled, transform?: (text: string) => string): string {
 		addVary(ctx.response.headers, "Natsu-Nav");
 		let shape = this.shapes.get(filled.page);
 		if (shape === undefined) {
@@ -555,7 +558,10 @@ export class Navigation {
 		// the shell this visitor's, and its hash too.
 		const shell = shape.shell === undefined ? undefined : filled.fill(shape.shell);
 		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), page);
-		return tags ? filled.fill(shape.before!) + tags + filled.fill(shape.after!) : page;
+		if (!tags) return transform ? transform(page) : page;
+		const before = transform ? transform(shape.before!) : shape.before!;
+		const after = transform ? transform(shape.after!) : shape.after!;
+		return filled.fill(before) + tags + filled.fill(after);
 	}
 
 	/** The key and the runtime for a page of this shape; "" for none. */
@@ -570,7 +576,7 @@ export class Navigation {
 			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}"${prefetch}>`;
 		}
 		if (this.inject && this.runtime) {
-			const nonce = cspNonces(csp)[0];
+			const nonce = scriptNonce(csp);
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
 		}
 		// A CSP set after Assets ran (a middleware that sets it once the route
@@ -709,13 +715,24 @@ function shapeOf(page: string, runtime: boolean): Shape {
 	return { at: firstHeadScript(page, scan) ?? scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
 }
 
-/** The head's first script, from the scan. */
+/**
+ * The head's first script that runs after the page is parsed (one with a
+ * `src`, or a module), from the scan. An inline classic script runs where it
+ * stands, before any deferred one, so the runtime need not come before it
+ * (and a lazy stylesheet loader must stay right after its link).
+ */
 function firstHeadScript(html: string, scan: PageScan): number | undefined {
 	const [, headStart, headClose] = scan.head;
 	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
-		if (isScriptAt(html, scan.raw[i]!)) return scan.raw[i]!;
+		if (isDeferredScriptAt(html, scan.raw[i]!)) return scan.raw[i]!;
 	}
 	return undefined;
+}
+
+function isDeferredScriptAt(html: string, at: number): boolean {
+	if (!isScriptAt(html, at)) return false;
+	const tag = readTag(html, at);
+	return tag !== null && (tag.get("src") !== undefined || tag.get("type")?.trim().toLowerCase() === "module");
 }
 
 /** Whether a `<template>` between `from` and `to` has the attribute `name` (as spelled), not text that mentions it. */
@@ -731,7 +748,7 @@ function holdsAttribute(html: string, raw: number[], name: string, from: number,
 
 /**
  * Where the tags go in a page the region scan did not read: before the
- * head's first script, as `firstHeadScript`; before `</head>` when it has
+ * head's first deferred script, as `firstHeadScript`; before `</head>` when it has
  * none; -1 with no head. One walk over the head alone.
  */
 function runtimeAt(html: string): number {
@@ -748,7 +765,7 @@ function runtimeAt(html: string): number {
 			return -1;
 		} else if (!open) {
 			open = namedAt(html, lt + 1, "head") && isTagEnd(html.charCodeAt(lt + 5));
-		} else if (isScriptAt(html, lt)) {
+		} else if (isDeferredScriptAt(html, lt)) {
 			return lt;
 		} else {
 			const name = RAW_NAMES.find((raw) => namedAt(html, lt + 1, raw) && isTagEnd(html.charCodeAt(lt + 1 + raw.length)));

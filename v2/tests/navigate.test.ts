@@ -918,17 +918,35 @@ describe("delivery", () => {
 		expect(html.indexOf("natsu-navigate")).toBeLessThan(html.indexOf("</head>"));
 	});
 
-	test("a page with a region gets the key and the runtime, with this response's nonce, before the head's first script", async () => {
+	test("a page with a region gets the key and the runtime, with this response's script nonce, before the head's first deferred script", async () => {
 		route("/p");
+		route("/deferred", { head: '<script src="/assets/head.js" defer></script><script type="module">import "/m.js";</script>' });
+		route("/module", { head: '<script type="module">import "/m.js";</script>' });
 		const { assets, app } = await pipeline();
 		const answer = await get(app, "/p");
 		const html = await answer.text();
 		const nonce = /'nonce-([^']+)'/.exec(answer.headers.get("content-security-policy") ?? "")?.[1];
 		const runtime = assets.url("natsu-navigate");
 		expect(runtime).toMatch(/^\/_a\/natsu-navigate\.[0-9a-f]{10}\.js$/);
-		// First, so a page script deferred like it runs after it and finds `natsu`.
-		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script><script nonce="${nonce}">window.boot = 1;</script></head>`);
+		const tags = `<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script>`;
+		// An inline script runs where it stands, before any deferred one.
+		expect(html).toContain(`<script nonce="${nonce}">window.boot = 1;</script>${tags}</head>`);
 		expect(metaKey(html)).toMatch(/^[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/);
+		// First among the deferred ones, so a page script deferred like it runs after it and finds `natsu`.
+		const deferred = await (await get(app, "/deferred")).text();
+		expect(deferred.indexOf(runtime)).toBeLessThan(deferred.indexOf('<script src="/assets/head.js" defer>'));
+		const module = await (await get(app, "/module")).text();
+		expect(module.indexOf(runtime)).toBeLessThan(module.indexOf('<script type="module">'));
+	});
+
+	test("the runtime's nonce is the one the CSP lets scripts run by", async () => {
+		new Router().get("/two", navigable((ctx) => {
+			ctx.response.headers.set("content-security-policy", "style-src 'nonce-styles1'; script-src 'nonce-scripts1' 'strict-dynamic'");
+			return page({ nonce: "scripts1" });
+		}));
+		const { assets, app } = await pipeline();
+		const html = await (await get(app, "/two")).text();
+		expect(html).toContain(`<script src="${assets.url("natsu-navigate")}" nonce="scripts1" defer></script>`);
 	});
 
 	test("a page without a region gets the runtime and no key, so its mounts and islands work", async () => {
@@ -1008,8 +1026,11 @@ describe("delivery", () => {
 		expect(pages.counts.fresh).toBe(1);
 	});
 
-	test("a kept page's answers are the fresh render's, byte for byte, secrets in the shell included", async () => {
-		const { assets, app } = await pipeline();
+	test.each<[string, Partial<AssetsOptions>]>([
+		["", {}],
+		[", lazy stylesheet loaders included", { safelist: ["big"], lazyStyles: true }],
+	])("a kept page's answers are the fresh render's, byte for byte, secrets in the shell included%s", async (_, options) => {
+		const { assets, app } = await pipeline({ assets: options });
 		const pages = new PageCache({ prepare: (html) => assets.rewrite(html) });
 		const secrets = (ctx: Context) => [ctx.request.headers.get("x-nonce") ?? "", ctx.request.headers.get("x-visitor") ?? ""];
 		const draw = ([nonce, csrf]: readonly string[]) => page({ nonce, csrf, main: `<p class="card" data-n="${nonce}">${csrf}</p>` });
@@ -1039,6 +1060,7 @@ describe("delivery", () => {
 			expect(kept).toContain(`nonce="${headers["x-nonce"]}" defer></script>`);
 			const changed = await (await get(app, "/changed", headers)).text();
 			expect(changed).toBe(fresh.replace("<h1", "<h1 data-changed"));
+			if (options.lazyStyles) expect(kept).toContain(`<script nonce="${headers["x-nonce"]}">(()=>{`);
 		}
 		expect(pages.counts.rendered).toBe(1);
 	});

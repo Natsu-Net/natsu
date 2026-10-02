@@ -49,8 +49,10 @@ import { addVary, negotiate } from "./compress.ts";
 import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
+import { scriptNonce } from "./csp.ts";
 import { type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
 import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
+import { type PageShape, PageShapes } from "./page-shape.ts";
 
 export interface AssetsOptions {
 	/** Where built chunks are written. Created if it is not there. */
@@ -211,6 +213,8 @@ export class Assets {
 	private readonly filled = new WeakMap<Context, { body: string; filled: Filled }>();
 	/** Page navigation, when the `navigate` option turns it on. */
 	private readonly navigation: Navigation | undefined;
+	/** Reads a page's shape from the class attribute values it has seen before. */
+	private shapes = new PageShapes(new Map(), new Map());
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -225,6 +229,7 @@ export class Assets {
 		this.safelist = [...(this.options.safelist ?? [])];
 		await this.planClasses();
 		await this.buildStyles();
+		this.shapes = new PageShapes(this.names, this.classes);
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
@@ -251,23 +256,33 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
-		// Renaming walks the whole page and profiles it on the way. Without a
-		// rename the page is profiled only when a stylesheet is narrowed for
-		// it: a page linking scripts alone, or `wholeStylesheets`, skips the
-		// walk, which costs several times the render.
+		return this.rewritePage(html, undefined);
+	}
+
+	/** `rewrite`, with the nonce this answer's CSP allows inline scripts by, if any. */
+	private rewritePage(html: string, nonce: string | undefined): string {
+		// Renaming walks the whole page and reads its shape on the way. Without
+		// a rename the shape is read only when a stylesheet is narrowed for it:
+		// a page linking scripts alone, or `wholeStylesheets`, skips the walk.
 		let page = html;
-		let profile: DocumentProfile | undefined;
-		if (this.classes.size > 0) ({ html: page, profile } = renameAndProfile(html, this.classes));
+		let shape: PageShape | undefined;
+		const renaming = this.classes.size > 0;
+		if (renaming) ({ html: page, shape } = this.shapes.renameAndRead(html));
 		const pattern = this.rewritePattern();
 		if (!pattern) return page;
+		// A shape not seen yet has its chunk cut from the whole profile, read
+		// just as it was before shapes were read from kept values.
+		let profile: DocumentProfile | undefined;
+		const profiled = (): DocumentProfile =>
+			(profile ??= renaming ? renameAndProfile(html, this.classes).profile : profileDocument(page));
 		const resolved = new Map<string, string>();
 		const resolve = (from: string): string => {
 			let url = resolved.get(from);
 			if (url === undefined) {
 				const name = this.options.rewrite?.[from] ?? "";
 				if (this.sources.has(name) && !this.options.wholeStylesheets) {
-					profile ??= profileDocument(page);
-					url = this.pageStyle(name, page, profile);
+					shape ??= this.shapes.read(page);
+					url = this.styleFor(name, shape, profiled);
 				} else {
 					url = this.url(name);
 				}
@@ -293,9 +308,54 @@ export class Assets {
 			// carries no inline script, so this is how the runtime learns it.
 			const attribute = this.navigation ? ` data-natsu-later="${lazy.url}"` : "";
 			const tagEnd = out[close - 1] === "/" ? close - 1 : close;
-			out = `${out.slice(0, tagEnd)}${attribute}${out.slice(tagEnd, close + 1)}${lazyLoader(lazy.url, lazy.triggers)}${out.slice(close + 1)}`;
+			out = `${out.slice(0, tagEnd)}${attribute}${out.slice(tagEnd, close + 1)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(close + 1)}`;
 		}
 		return out;
+	}
+
+	/**
+	 * A page kept rewritten (see PageCache's `prepare`) was rewritten once for
+	 * every visitor, before any one answer's nonce existed: its lazy loaders
+	 * get this answer's nonce now. Only a script that is byte for byte a
+	 * loader `rewrite` writes, right after the link to the chunk it is for,
+	 * is given one, so no script of the page's own ever is: the loader this
+	 * pipeline remembers writing for that chunk, or, once its shape has been
+	 * forgotten (`maxPageShapes`) while the page is still kept, a loader for
+	 * that chunk's lazy half whose selector holds no `<`. A selector is the
+	 * one part a page could choose, and without a `<` it can neither end the
+	 * script early nor (`<!--<script>`) make it run on past its own end.
+	 */
+	private nonceLoaders(page: string, nonce: string): string {
+		let out = page;
+		for (let at = out.indexOf(LOADER_START); at !== -1; at = out.indexOf(LOADER_START, at + 1)) {
+			if (out.charCodeAt(at - 1) !== 62 /* > */) continue;
+			const tag = out.slice(out.lastIndexOf("<", at - 1), at);
+			if (!/^<link\b/i.test(tag)) continue;
+			const loader = readLoader(out, at);
+			if (!loader) continue;
+			const href = /\shref\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
+			const chunk = href?.[1] ?? href?.[2] ?? "";
+			const known = this.lazy.get(chunk);
+			const ours = (known !== undefined && known.url === loader.url && known.triggers.join(",") === loader.selector) ||
+				(!`${loader.selector}${loader.url}`.includes("<") && this.isLazyHalf(chunk, loader.url));
+			if (!ours) continue;
+			out = `${out.slice(0, at)}${lazyLoader(loader.url, [loader.selector], nonce)}${out.slice(loader.end)}`;
+		}
+		return out;
+	}
+
+	/**
+	 * Whether `later` is the name this pipeline gives the lazy half of the
+	 * stylesheet chunk at `eager`: `<name>-later.<hash>.css` beside
+	 * `<name>.<hash>.css`, under `publicPath`, for a stylesheet it builds.
+	 */
+	private isLazyHalf(eager: string, later: string): boolean {
+		const prefix = `${this.options.publicPath}/`;
+		if (!eager.startsWith(prefix) || !later.startsWith(prefix)) return false;
+		const name = /^(.+)\.[0-9a-f]{10}\.css$/.exec(eager.slice(prefix.length))?.[1];
+		if (name === undefined || !this.sources.has(name)) return false;
+		const rest = later.slice(prefix.length);
+		return rest.startsWith(`${name}-later.`) && /^[0-9a-f]{10}\.css$/.test(rest.slice(name.length + "-later.".length));
 	}
 
 	/**
@@ -327,32 +387,30 @@ export class Assets {
 	 * of this shape is seen.
 	 */
 	public pageStyle(name: string, html: string, profiled?: DocumentProfile): string {
+		if (!this.sources.has(name)) return this.url(name);
+		const shape = profiled ? this.shapes.fromProfile(profiled) : this.shapes.read(html);
+		return this.styleFor(name, shape, () => profiled ?? profileDocument(html));
+	}
+
+	/**
+	 * `pageStyle` for a page whose shape is read already. The key is the
+	 * page's shape, not its content (see PageShapes' `key`): two pages listing
+	 * different anime have the same classes and share a chunk. A shape not
+	 * seen yet is cut from `profileOf()`, the page's whole profile.
+	 */
+	private styleFor(name: string, shape: PageShape, profileOf: () => DocumentProfile): string {
 		const source = this.sources.get(name);
 		if (source === undefined) return this.url(name);
 
-		const profile = profiled ?? profileDocument(html);
-		// The key is the page's shape, not its content: two pages listing
-		// different anime have the same classes and share a chunk. Only the
-		// classes and ids the sheet's rules name count (tags never do), so a
-		// page's own `id="review-81"` does not make it a shape of its own.
-		// Bun.hash, not sha256: the key never leaves this process.
-		const names = this.names.get(name);
-		const named = (found: Set<string>, known: Set<string> | undefined): string => {
-			const list: string[] = [];
-			for (const item of found) if (!known || known.has(item)) list.push(item);
-			// A space, which no class or id can hold: `a,b` and `a`+`b` stay apart.
-			return list.sort().join(" ");
-		};
-		const shape = Bun.hash(
-			`${name}\n${named(profile.classes, names?.classes)}\n${named(profile.ids, names?.ids)}`,
-		).toString(36);
-		const known = this.pages.get(shape);
+		const key = this.shapes.key(name, shape);
+		const known = this.pages.get(key);
 		if (known) {
 			// Most recently used last, so the oldest shape is the one forgotten.
-			this.pages.delete(shape);
-			this.pages.set(shape, known);
+			this.pages.delete(key);
+			this.pages.set(key, known);
 			return known.url;
 		}
+		const profile = profileOf();
 
 		// A slice of an already minified sheet is minified; shaking it is a
 		// third of the work of shaking the source and minifying the result.
@@ -360,7 +418,7 @@ export class Assets {
 		if (!this.options.lazyStyles) {
 			const body = minify(shakeCSS(source, profile, { safelist: this.safelist }).css);
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
-			this.remember(shape, url, [basename(url)]);
+			this.remember(key, url, [basename(url)]);
 			return url;
 		}
 
@@ -379,7 +437,7 @@ export class Assets {
 			this.lazy.set(url, { url: laterUrl, triggers: split.triggers });
 			files.push(basename(laterUrl));
 		}
-		this.remember(shape, url, files);
+		this.remember(key, url, files);
 		return url;
 	}
 
@@ -494,14 +552,19 @@ export class Assets {
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
 			if (typeof body !== "string" || !isDocument(ctx, body)) return;
-			const page = this.rewritten.has(ctx) ? body : this.rewrite(body);
-			if (!navigation) {
-				ctx.response.body = page;
+			// A lazy loader is the one inline script of ours, so only lazy
+			// styles need the answer's nonce. A page kept rewritten was
+			// rewritten before any answer's nonce existed: its loaders get it now.
+			const nonce = this.options.lazyStyles ? cspNonce(ctx) : undefined;
+			const loaders = nonce ? (page: string) => this.nonceLoaders(page, nonce) : undefined;
+			const kept = this.filled.get(ctx);
+			// Still the body PageCache gave (the same string, so this reads none of it)?
+			if (navigation && kept?.body === body) {
+				ctx.response.body = navigation.fullFilled(ctx, body, kept.filled, loaders);
 				return;
 			}
-			// Still the body PageCache gave (the same string, so this reads none of it)?
-			const kept = this.filled.get(ctx);
-			ctx.response.body = kept?.body === body ? navigation.fullFilled(ctx, page, kept.filled) : navigation.full(ctx, page);
+			const page = !this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body;
+			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
 		};
 	}
 
@@ -821,11 +884,63 @@ export class Assets {
  * menu, so the menu never draws unstyled — or as soon as an element
  * carrying one of `triggers` appears, whichever is first. It sits right
  * after the eager <link> and puts the lazy one after that, so the cascade
- * keeps the order the stylesheets were written in.
+ * keeps the order the stylesheets were written in. Under a CSP that allows
+ * inline scripts by nonce it carries the answer's nonce, or it would never
+ * run and the lazy rules never load.
  */
-function lazyLoader(url: string, triggers: string[]): string {
-	const selector = JSON.stringify(triggers.join(","));
-	return `<script>(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=${selector},c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=${JSON.stringify(url)};a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>`;
+function lazyLoader(url: string, triggers: string[], nonce: string | undefined): string {
+	const open = nonce ? `<script nonce="${nonce}">` : "<script>";
+	return `${open}${LOADER_HEAD}${JSON.stringify(triggers.join(","))}${LOADER_MIDDLE}${JSON.stringify(url)}${LOADER_TAIL}`;
+}
+
+/** A lazy loader's text after its opening tag and up to its selector. */
+const LOADER_HEAD = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=';
+/** Its text between the selector and the lazy stylesheet's URL. */
+const LOADER_MIDDLE = ',c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=';
+/** Its text after the URL. */
+const LOADER_TAIL = ';a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>';
+/** A lazy loader as `rewrite` writes it, before any answer's nonce. */
+const LOADER_START = `<script>${LOADER_HEAD}`;
+
+/**
+ * The loader without a nonce that starts at `at`, read back: its selector,
+ * the URL it loads, and where it ends. Nothing unless every byte of it is
+ * what `lazyLoader` writes for those two, each spelled as JSON.stringify
+ * spells it.
+ */
+function readLoader(text: string, at: number): { selector: string; url: string; end: number } | undefined {
+	let next = at + LOADER_START.length;
+	const selector = jsonStringAt(text, next);
+	if (selector === undefined) return undefined;
+	next += selector.length;
+	if (!text.startsWith(LOADER_MIDDLE, next)) return undefined;
+	next += LOADER_MIDDLE.length;
+	const url = jsonStringAt(text, next);
+	if (url === undefined) return undefined;
+	next += url.length;
+	if (!text.startsWith(LOADER_TAIL, next)) return undefined;
+	return { selector: selector.value, url: url.value, end: next + LOADER_TAIL.length };
+}
+
+/** A string in double quotes, escapes and all. */
+const JSON_STRING = /"(?:[^"\\]|\\.)*"/y;
+
+/** The JSON string at `at`, if JSON.stringify would spell its value just so: its value and length. */
+function jsonStringAt(text: string, at: number): { value: string; length: number } | undefined {
+	JSON_STRING.lastIndex = at;
+	const literal = JSON_STRING.exec(text)?.[0];
+	if (literal === undefined) return undefined;
+	try {
+		const value: unknown = JSON.parse(literal);
+		return typeof value === "string" && JSON.stringify(value) === literal ? { value, length: literal.length } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The nonce this answer's own Content-Security-Policy allows inline scripts by (see `scriptNonce`). */
+function cspNonce(ctx: Context): string | undefined {
+	return scriptNonce(ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null);
 }
 
 /**
