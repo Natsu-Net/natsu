@@ -324,6 +324,30 @@ describe("boot", () => {
 		expect(p.document.title).toBe("B");
 	});
 
+	test("the runtime on the page twice: the second copy stays out, and its tag does not make swaps unsafe", async () => {
+		let api: W;
+		const seen: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/natsu-again.js"] }),
+			scripts: {
+				"/js/natsu-again.js": (w) => {
+					api = w.natsu;
+					new Function("window", `with (window) {${CODE}}`)(w);
+				},
+			},
+			routes: { "/b": () => answer(part()) },
+			before: (w) => w.document.addEventListener("natsu:load", (e: W) => void seen.push(e.detail.url)),
+		});
+		expect(p.natsu).toBe(api);
+		expect(p.document.querySelectorAll("[role=status]").length).toBe(1);
+		expect(seen).toEqual([`${ORIGIN}/a`]);
+		expect(p.click("#to-b")).toBe(true);
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
+		expect(p.loads).toEqual([]);
+		expect(text(p, "main h1")).toBe("Page B");
+	});
+
 	test("no key, or no region: inert; visit is location.assign and mount still runs", async () => {
 		const mounted: string[] = [];
 		const p = open({

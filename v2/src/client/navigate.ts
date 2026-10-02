@@ -208,10 +208,18 @@ const island = async (el: Element, signal?: AbortSignal) => {
 		mountIn(el);
 	}
 };
+/**
+ * The runtime is on the page twice (the server's tag and one written by
+ * hand): this copy stays out, and mounts through the first, so that its own
+ * tag is not a script that never called mount.
+ */
+const first = window.natsu as NatsuClient | undefined;
+first?.mount(":not(*)", () => {});
+
 // Built in, so it is tagged with no script and runs everywhere.
 regs.push(["[data-natsu-island]", (el, signal) => island(el, signal).catch(() => {}), ""]);
 
-const api: NatsuClient = (window.natsu = {
+const api: NatsuClient = {
 	mount(selector, fn) {
 		let s = D.currentScript as HTMLScriptElement | null;
 		if (!s) {
@@ -230,7 +238,8 @@ const api: NatsuClient = (window.natsu = {
 	refresh: async () => L.reload(),
 	prefetch() {},
 	island,
-});
+};
+if (!first) window.natsu = api;
 
 /** Every script this document ran or started. */
 const loaded = new Set([...D.scripts].map((s) => s.src));
@@ -268,13 +277,15 @@ const boot = () => {
 	// One natsu:load per page shown, this one included: a page-view hook counts each once.
 	fire("load", { url: L.href, regions: regions(D) });
 };
-if (D.readyState == "complete") boot();
-else {
-	D.addEventListener("DOMContentLoaded", boot);
-	on("load", boot);
+if (!first) {
+	if (D.readyState == "complete") boot();
+	else {
+		D.addEventListener("DOMContentLoaded", boot);
+		on("load", boot);
+	}
 }
 
-if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
+if (!first && KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 	status = D.createElement("p");
 	status.setAttribute("role", "status");
 	status.style.cssText = "position:fixed;clip-path:inset(50%)";
