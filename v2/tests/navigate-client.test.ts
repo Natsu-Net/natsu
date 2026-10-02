@@ -1650,6 +1650,24 @@ describe("prefetch", () => {
 		expect(text(p, "main h1")).toBe("Page B");
 	});
 
+	test("with the answer in hand, the swap does not run in the click's task: it yields first (scheduler.yield, else a frame)", async () => {
+		const microtasks = async () => {
+			for (let i = 0; i < 50; i++) await null;
+		};
+		for (const yields of [false, true]) {
+			const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
+			let used = 0;
+			if (yields) p.window.scheduler = { yield: () => (used++, new Promise((y) => setTimeout(y, 5))) };
+			p.natsu.prefetch("/b");
+			await settle();
+			p.click("#to-b");
+			await microtasks();
+			expect([yields, text(p, "main h1")]).toEqual([yields, "Page A"]);
+			await settle();
+			expect([yields, text(p, "main h1"), used]).toEqual([yields, "Page B", yields ? 1 : 0]);
+		}
+	});
+
 	test("leaving the link before 65 ms cancels; a touch prefetches at once", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part()) } });
 		hover(p, "#to-b");

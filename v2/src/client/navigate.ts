@@ -512,7 +512,14 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		timer = setTimeout(() => H.setAttribute(LOADING, ""), 300);
 		let a: Answer | undefined;
 		try {
-			a = (o.scroll != "keep" && (await fresh(bare(u))?.p)) || (await get(u));
+			if (o.scroll != "keep") a = await fresh(bare(u))?.p;
+			// In hand already (prefetched): the swap would run in the click's own
+			// task and hold its frame back, so it yields first.
+			if (a)
+				await new Promise(
+					(y) => (window as { scheduler?: { yield?(): Promise<void> } }).scheduler?.yield?.().then(y) ?? requestAnimationFrame(() => setTimeout(y)),
+				);
+			else a = await get(u);
 		} catch {}
 		if (n != seq) return;
 		if (!a) {
