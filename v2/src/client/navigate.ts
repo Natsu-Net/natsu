@@ -557,6 +557,9 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			const keep = want.flatMap((l) => [href(l), l.getAttribute(LATER)]);
 
 			const swap = () => {
+				// Overtaken during the view transition's first frame (another visit,
+				// a Back): this one is over, and leaves nothing behind.
+				if (n != seq) return adds.forEach((l) => l.remove());
 				begun = 1;
 				fire("before-swap", D, { url: f.href });
 				// From here the runtime restores this document's scroll, so the
@@ -615,6 +618,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 			)
 				await D.startViewTransition(swap).updateCallbackDone;
 			else swap();
+			if (n != seq) return;
 			idle();
 
 			// Mounts allowed here, then the scripts this document has not run, in order.

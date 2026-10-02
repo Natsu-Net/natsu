@@ -1201,6 +1201,61 @@ describe("events and attributes", () => {
 		expect(p.document.title).toBe("C");
 	});
 
+	test("a visit overtaken during the transition's first frame (a second visit, a Back) swaps nothing, mounts nothing, creates no script", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/site.js"] }),
+			scripts: {
+				"/js/site.js": (w) => w.natsu.mount("h1", (el: Element) => void log.push(`${el.textContent} ${el.isConnected}`)),
+				"/js/b.js": (w) => w.natsu.mount("x", () => {}),
+			},
+			routes: {
+				"/b": () => answer(part({ sheet: "/_a/site.b.css", scripts: ["/js/site.js", "/js/b.js"] })),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>", scripts: ["/js/site.js"] })),
+			},
+		});
+		p.document.documentElement.setAttribute("data-natsu-transition", "");
+		// The browser calls back a frame later, once it has the old state.
+		const frames: (() => void)[] = [];
+		p.document.startViewTransition = (fn: () => void) => {
+			let done!: () => void;
+			const updateCallbackDone = new Promise<void>((y) => (done = y));
+			frames.push(() => (fn(), done()));
+			return { updateCallbackDone };
+		};
+		const added = () => [...p.document.querySelectorAll("body > script:not([data-booted])")].map((s: W) => s.getAttribute("src"));
+		const sheets = () => [...p.document.querySelectorAll('link[rel="stylesheet"]')].map((l: W) => l.getAttribute("href"));
+		p.click("#to-b");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		for (const frame of frames.splice(0)) frame();
+		await settle();
+		expect([p.document.title, path(p), text(p, "main h1")]).toEqual(["C", "/c", "Page C"]);
+		expect(added()).toEqual([]);
+		expect(sheets()).toEqual(["/_a/site.a.css"]);
+		expect(log).toEqual(["Page A true", "Page C true"]);
+
+		// Back to this page's own entry before the frame: the visit to B is over.
+		const q = open({
+			html: page({ main: `<h1>Page A</h1><a id="jump" href="#x">x</a><p id="x">x</p>` }),
+			routes: { "/b": () => answer(part({ scripts: ["/js/b.js"] })) },
+			scripts: { "/js/b.js": (w) => w.natsu.mount("x", () => {}) },
+		});
+		q.document.documentElement.setAttribute("data-natsu-transition", "");
+		q.document.startViewTransition = p.document.startViewTransition;
+		jump(q, "#jump", 500);
+		q.click("#to-b");
+		await settle();
+		q.window.history.back();
+		await settle();
+		expect(frames.length).toBe(1);
+		for (const frame of frames.splice(0)) frame();
+		await settle();
+		expect([path(q), text(q, "main h1"), q.document.title]).toEqual(["/a", "Page A", "A"]);
+		expect([...q.document.querySelectorAll("body > script:not([data-booted])")].length).toBe(0);
+	});
+
 	test("refresh replaces the entry, keeps scroll and focus, and skips the prefetch cache", async () => {
 		let n = 0;
 		const p = open({ html: page(), routes: { "/a": () => answer(part({ title: `A${++n}` })) } });
