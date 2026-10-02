@@ -19,9 +19,10 @@ import { compress } from "../src/compress.ts";
 import { setConfig } from "../src/config.ts";
 import type { Context, Handler } from "../src/context.ts";
 import { setLogLevel, setLogSink } from "../src/logger.ts";
-import { inertNav, navigable, partOf, scanPage, shellOf } from "../src/navigate.ts";
+import { Controller } from "../src/controller.ts";
+import { inertNav, island, navigable, partOf, scanPage, shellOf } from "../src/navigate.ts";
 import { PageCache } from "../src/page-cache.ts";
-import { Router } from "../src/router.ts";
+import { Get, Island, Navigable, Router } from "../src/router.ts";
 import { Application } from "../src/server.ts";
 import * as natsu from "../index.ts";
 import { reset } from "./helpers.ts";
@@ -332,7 +333,10 @@ describe("the part", () => {
 		expect(part).not.toContain("natsu-navigate");
 		expect(part).toContain('<main id="main" data-natsu-region><p class="big">B</p></main>');
 		expect(part).toContain('<footer id="site-footer" data-natsu-region class="foot">(c)</footer>');
-		expect(part).toEndWith('<script src="/assets/site.js" defer></script></body></html>');
+		expect(part).toEndWith('<footer id="site-footer" data-natsu-region class="foot">(c)</footer></body></html>');
+		// The script list travels in a header that only the server writes.
+		expect(part).not.toContain("<script");
+		expect(answer.headers.get("natsu-scripts")).toBe("src=%2Fassets%2Fsite.js&defer=&nonce=");
 		// The shell is not sent.
 		expect(part).not.toContain("<header");
 		expect(part).not.toContain('name="csrf"');
@@ -475,7 +479,7 @@ describe("the part", () => {
 			expect(answer.headers.get("x-app")).toBe("kept");
 		}
 		// The part still lists the scripts this response's nonce vouched for.
-		expect(await part.text()).toContain('<script src="/assets/site.js" defer></script>');
+		expect(part.headers.get("natsu-scripts")).toBe("src=%2Fassets%2Fsite.js&defer=&nonce=");
 	});
 
 	test("an answer that is not a page is a full load, cookies kept", async () => {
@@ -558,8 +562,36 @@ describe("regions", () => {
 	});
 });
 
+describe("the scanner, as a browser reads the page", () => {
+	test("a script in a region is found in any case", () => {
+		const shell = (body: string) => `<!doctype html><html><head></head><body>${body}</body></html>`;
+		expect(scanPage(shell('<main id="m" data-natsu-region><SCRIPT>go()</SCRIPT></main>'))).toMatchObject({ reason: "inline-script" });
+		expect(scanPage(shell('<main id="m" data-natsu-region><Script src="/x.js"></Script></main>'))).toMatchObject({ reason: "inline-script" });
+		// Raw text ends at its end tag in any case: the region after it is found.
+		const html = shell('<style>.a{}</STYLE><main id="m" data-natsu-region>x</main>');
+		expect(scanPage(html)).toMatchObject({ regions: [{ id: "m" }] });
+	});
+
+	test("a comment ends at --!> as well as -->", () => {
+		const html = '<!doctype html><html><head></head><body><!-- a --!><main id="m" data-natsu-region><script>go()</script></main><!-- b --></body></html>';
+		// Read as the browser reads it, the region holds a live script.
+		expect(scanPage(html)).toMatchObject({ reason: "inline-script" });
+	});
+
+	test("text that mentions the attribute many times costs one walk over it", () => {
+		const mentions = " data-natsu-region".repeat(20_000);
+		const html = `<!doctype html><html><head></head><body><p title="${mentions}">${mentions}</p><main id="m" data-natsu-region>x</main></body></html>`;
+		const started = performance.now();
+		const scan = scanPage(html);
+		const took = performance.now() - started;
+		expect(scan).toMatchObject({ regions: [{ id: "m" }] });
+		// Quadratic, this was seconds; linear it is a few milliseconds.
+		expect(took).toBeLessThan(200);
+	});
+});
+
 describe("the script list", () => {
-	test("a script without this response's nonce is dropped; with no nonce in the CSP all are kept", async () => {
+	test("under 'strict-dynamic' a script without this response's nonce is dropped; with no nonce in the CSP all are kept", async () => {
 		route("/from");
 		route("/b", (ctx) => {
 			const nonce = /'nonce-([^']+)'/.exec(ctx.response.headers.get("content-security-policy") ?? "")?.[1] ?? "";
@@ -571,18 +603,28 @@ describe("the script list", () => {
 		});
 		const { app } = await pipeline();
 		const key = await keyOf(app, "/from");
-		const part = await (await nav(app, "/b", key)).text();
-		expect(part).toEndWith('<script src="/assets/site.js" defer></script><script src="/assets/page.js"></script></body></html>');
-		expect(part).not.toContain("evil.test");
-		expect(part).not.toContain("old.js");
+		const answer = await nav(app, "/b", key);
+		expect(answer.headers.get("natsu-scripts")).toBe("src=%2Fassets%2Fsite.js&defer=&nonce= src=%2Fassets%2Fpage.js&nonce=");
+		expect(await answer.text()).not.toContain("<script");
 
-		const html = page({ scripts: '<script src="/a.js"></script><script src="/b.js" nonce="x"></script>' });
+		const html = page({ scripts: '<script src="/a.js?x=1&amp;y=2"></script><script src="/b.js" nonce="x" data-natsu-once></script>' });
 		const scan = scanPage(html);
 		if (scan === null || "reason" in scan) throw new Error("no scan");
-		expect(partOf(html, scan, "k.k", [])).toEndWith('<script src="/a.js"></script><script src="/b.js"></script></body></html>');
+		// Values as the browser reads them; no nonce key without a nonce in the CSP.
+		expect(partOf(html, scan, "k.k", []).scripts).toBe("src=%2Fa.js%3Fx%3D1%26y%3D2 src=%2Fb.js&data-natsu-once=");
 	});
 
-	test("a nonce elsewhere in the head is written nonce=\"\" when it is this response's, and dropped when not", async () => {
+	test("without 'strict-dynamic' a script without this response's nonce is listed without the nonce key: the CSP's host list decides, as on a full load", () => {
+		const html = page({ scripts: '<script src="/a.js" nonce="n1"></script><script src="/b.js"></script><script src="/c.js" nonce="old"></script>' });
+		const scan = scanPage(html);
+		if (scan === null || "reason" in scan) throw new Error("no scan");
+		expect(partOf(html, scan, "k.k", ["n1"], "", false).scripts).toBe("src=%2Fa.js&nonce= src=%2Fb.js src=%2Fc.js");
+		expect(partOf(html, scan, "k.k", ["n1"], "", true).scripts).toBe("src=%2Fa.js&nonce=");
+		// The runtime's own tag is never listed.
+		expect(partOf(html, scan, "k.k", ["n1"], "/a.js", true).scripts).toBe("");
+	});
+
+	test("a nonce elsewhere in the head keeps its value when it is this response's (named in Natsu-Nonce), and is dropped when not", async () => {
 		route("/from");
 		route("/b", (ctx) => {
 			const nonce = /'nonce-([^']+)'/.exec(ctx.response.headers.get("content-security-policy") ?? "")?.[1] ?? "";
@@ -590,10 +632,27 @@ describe("the script list", () => {
 		});
 		const { app } = await pipeline();
 		const key = await keyOf(app, "/from");
-		const part = await (await nav(app, "/b", key)).text();
-		// As the browser shows a live element once it hides its nonce, so a merge by outerHTML matches it.
-		expect(part).toContain('<style nonce="">.b{}</style><link rel="preload" href="/f.woff2" as="font"><style nonce="">.c{}</style>');
+		const answer = await nav(app, "/b", key);
+		const nonce = answer.headers.get("natsu-nonce") ?? "";
+		expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+		const part = await answer.text();
+		expect(part).toContain(`<style nonce="${nonce}">.b{}</style><link rel="preload" href="/f.woff2" as="font"><style nonce=${nonce}>.c{}</style>`);
 		expect(part).not.toContain("stale");
+	});
+
+	test("a bare nonce, or one in the title's text, never passes for this response's", () => {
+		const html = page({
+			title: 'Say nonce="n1" here',
+			head: '<style nonce>.a{}</style><style NONCE="">.b{}</style><!-- <style nonce="n1"> --><meta name="x" content=\'nonce="n1"\'>',
+		});
+		const scan = scanPage(html);
+		if (scan === null || "reason" in scan) throw new Error("no scan");
+		const part = partOf(html, scan, "k.k", ["n1"]).html;
+		expect(part).toContain('<style>.a{}</style><style>.b{}</style>');
+		// Text is text: the title, a comment and an attribute value are left as written.
+		expect(part).toContain('<title>Say nonce="n1" here</title>');
+		expect(part).toContain('<!-- <style nonce="n1"> -->');
+		expect(part).toContain(`<meta name="x" content='nonce="n1"'>`);
 	});
 });
 
@@ -675,6 +734,26 @@ describe("the key", () => {
 		expect((await nav(app, "/p", key)).headers.get("natsu-reload")).toBe("document");
 	});
 
+	test("a different script in the head is a different shell: it would never run after a swap", async () => {
+		route("/a");
+		route("/b", { head: '<script src="/assets/charts.js" defer></script>' });
+		route("/c", { head: '<script src="/assets/charts.js" nonce="other" defer></script>' });
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/a");
+		expect((await nav(app, "/b", key)).headers.get("natsu-reload")).toBe("shell");
+		// The same head scripts with other nonces are the same shell.
+		expect(await keyOf(app, "/b")).toBe(await keyOf(app, "/c"));
+	});
+
+	test("markup moved from one side of a region to the other is a different shell", () => {
+		const before = '<!doctype html><html><head></head><body><div id="a" data-natsu-region>1</div><aside>x</aside><div id="b" data-natsu-region>2</div></body></html>';
+		const after = '<!doctype html><html><head></head><body><div id="a" data-natsu-region>1</div><div id="b" data-natsu-region>2</div><aside>x</aside></body></html>';
+		const one = scanPage(before);
+		const two = scanPage(after);
+		if (!one || "reason" in one || !two || "reason" in two) throw new Error("no scan");
+		expect(shellOf(before, one)).not.toBe(shellOf(after, two));
+	});
+
 	test("shellOf leaves out the head, the regions, the script list and nonces", () => {
 		const one = page({ nonce: "a", main: "one", title: "One", scripts: '<script src="/x.js" nonce="a"></script>' });
 		const two = page({ nonce: "b", main: "two", title: "Two", scripts: '<script src="/y.js" nonce="b"></script>' });
@@ -683,7 +762,8 @@ describe("the key", () => {
 		if (!scanOne || "reason" in scanOne || !scanTwo || "reason" in scanTwo) throw new Error("no scan");
 		expect(shellOf(one, scanOne)).toBe(shellOf(two, scanTwo));
 		expect(shellOf(one, scanOne)).not.toContain("<head>");
-		expect(shellOf(one, scanOne)).toEndWith("\0main\0site-footer");
+		expect(shellOf(one, scanOne)).toContain("\0main\0");
+		expect(shellOf(one, scanOne)).toContain("\0site-footer\0");
 	});
 });
 
@@ -784,6 +864,26 @@ describe("answers", () => {
 		}
 	});
 
+	test("a same-site redirect whose path starts with // stays a path on this site, never another host", async () => {
+		route("/from");
+		let target = "";
+		new Router().get("/next", navigable((ctx) => ctx.response.redirect(target)));
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/from");
+		for (const [to, sent] of [
+			[`${BASE}//evil.test/x?y=1`, "/.//evil.test/x?y=1"],
+			[`${BASE}/\\evil.test/x`, "/.//evil.test/x"],
+			["/ok/path", "/ok/path"],
+		] as const) {
+			target = to;
+			const answer = await nav(app, "/next", key);
+			const location = answer.headers.get("natsu-location") ?? "";
+			expect(location).toBe(sent);
+			// What the runtime does with it: resolve against the page, then compare origins.
+			expect(new URL(location, `${BASE}/from`).origin).toBe(BASE);
+		}
+	});
+
 	test("ctx.nav.reload() is a full load whatever the handler then draws", async () => {
 		route("/from");
 		new Router().get("/p", navigable((ctx) => {
@@ -799,6 +899,15 @@ describe("answers", () => {
 });
 
 describe("delivery", () => {
+	test("a page whose regions cannot be swapped still gets the runtime, without a key: mounts and islands work, visits are real loads", async () => {
+		route("/inline", { main: "<script>go()</script>" });
+		const { app } = await pipeline();
+		const html = await (await get(app, "/inline")).text();
+		expect(html).not.toContain('<meta name="natsu"');
+		expect(html).toContain("natsu-navigate");
+		expect(html.indexOf("natsu-navigate")).toBeLessThan(html.indexOf("</head>"));
+	});
+
 	test("a page with a region gets the key and the runtime, with this response's nonce", async () => {
 		route("/p");
 		new Router().get("/flat", navigable(() => "<!doctype html><html><head><title>x</title></head><body>no regions</body></html>"));
@@ -931,6 +1040,105 @@ describe("delivery", () => {
 		const { app } = await pipeline({ assets: { safelist: ["big"], lazyStyles: true } });
 		const html = await (await get(app, "/p")).text();
 		expect(html).toMatch(/<link rel="stylesheet" href="\/_a\/site\.[0-9a-f]+\.css" data-natsu-later="\/_a\/site-later\.[0-9a-f]+\.css">/);
+	});
+});
+
+describe("islands", () => {
+	test("island() is public; a fetch it answers says Natsu-Island and runs once, with no key and no runtime", async () => {
+		expect(natsu.island).toBe(island);
+		let ran = 0;
+		let seen: string | null = "unset";
+		new Router().get("/bell", island((ctx) => {
+			ran++;
+			seen = ctx.request.headers.get("natsu-island");
+			ctx.response.headers.set("cache-control", "private, no-store");
+			return '<div class="card">3 new</div>';
+		}));
+		const { app } = await pipeline();
+		const answer = await get(app, "/bell", { "natsu-island": "1" });
+		expect(answer.status).toBe(200);
+		expect(answer.headers.get("natsu-island")).toBe("1");
+		expect(answer.headers.get("vary")).toContain("Natsu-Island");
+		expect(ran).toBe(1);
+		expect(seen).toBeNull();
+		const text = await answer.text();
+		expect(text).not.toContain("natsu-navigate");
+		expect(text).not.toContain('name="natsu"');
+	});
+
+	test("any other route is refused before its handler runs: an island named in user content cannot pull in a page", async () => {
+		let ran = 0;
+		new Router().get("/account/delete", navigable(() => {
+			ran++;
+			return page({ main: '<form method="post"><input name="csrf" value="secret"></form>' });
+		}));
+		new Router().get("/plain", () => {
+			ran++;
+			return "<p>plain</p>";
+		});
+		const { app } = await pipeline();
+		for (const path of ["/account/delete", "/plain", "/no-such-path"]) {
+			const answer = await get(app, path, { "natsu-island": "1" });
+			expect(answer.status).toBe(204);
+			expect(answer.headers.get("natsu-island")).toBeNull();
+			expect(answer.headers.get("cache-control")).toBe("private, no-store");
+			expect(await answer.text()).toBe("");
+		}
+		expect(ran).toBe(0);
+		// Without the header the page is the page.
+		expect((await get(app, "/account/delete")).status).toBe(200);
+		expect(ran).toBe(1);
+	});
+
+	test("the header is ignored on anything but a GET fetch", async () => {
+		let ran = 0;
+		new Router().get("/plain", () => {
+			ran++;
+			return "<p>plain</p>";
+		});
+		const { app } = await pipeline();
+		const answer = await get(app, "/plain", { "natsu-island": "1", "sec-fetch-mode": "navigate" });
+		expect(answer.status).toBe(200);
+		expect(ran).toBe(1);
+	});
+});
+
+describe("decorated routes", () => {
+	test("@Navigable() and @Island() mark a method in either order with its @Get", async () => {
+		@Controller("/deco")
+		class Deco {
+			@Navigable()
+			@Get("/page")
+			page(): string {
+				return page({ main: "<p>deco</p>" });
+			}
+
+			@Get("/quiet")
+			@Navigable({ prefetch: false })
+			quiet(): string {
+				return page({ main: "<p>quiet</p>" });
+			}
+
+			@Island()
+			@Get("/bell")
+			bell(): string {
+				return "<b>1</b>";
+			}
+
+			@Get("/plain")
+			plain(): string {
+				return page();
+			}
+		}
+		void Deco;
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/deco/page");
+		expect((await nav(app, "/deco/page", key)).headers.get("natsu-part")).toBe("1");
+		expect((await nav(app, "/deco/quiet", key)).headers.get("natsu-part")).toBe("1");
+		expect((await nav(app, "/deco/quiet", key, { "natsu-prefetch": "1" })).headers.get("natsu-prefetch")).toBe("skip");
+		expect((await nav(app, "/deco/plain", key)).headers.get("natsu-reload")).toBe("route");
+		expect((await get(app, "/deco/bell", { "natsu-island": "1" })).headers.get("natsu-island")).toBe("1");
+		expect((await get(app, "/deco/page", { "natsu-island": "1" })).status).toBe(204);
 	});
 });
 

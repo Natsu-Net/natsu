@@ -163,6 +163,9 @@ const ENTITY_HEADERS = [
 	"refresh",
 ];
 
+/** The longest `Natsu-Scripts` sent; past it the page is a real load (proxies cap a header near 8 KB). */
+const SCRIPTS_HEADER_LIMIT = 6144;
+
 /** Control answers and parts are never stored: not by a CDN, not by the browser's cache. */
 const NO_STORE = "private, no-store";
 
@@ -194,26 +197,67 @@ const navigables = new WeakMap<Handler, { prefetch: boolean }>();
 export function navigable(handler: Handler, options: { prefetch?: boolean } = {}): Handler {
 	const marked: Handler = (ctx) => handler(ctx);
 	Object.defineProperty(marked, "name", { value: handler.name || "navigable" });
+	keepNavigable(handler, marked);
 	navigables.set(marked, { prefetch: options.prefetch !== false });
 	return marked;
 }
 
+/** Handlers that answer `data-natsu-island` fetches. */
+const islands = new WeakSet<Handler>();
+
 /**
- * Carry a handler's navigable flag over to one that wraps it. The router's
- * guards wrap a route's handler at compile time, and a wrapped route must
- * answer navigations exactly as the bare one would.
+ * Let a route fill an island: an element with `data-natsu-island="<url>"`,
+ * which the runtime fills from that URL after the page loads (a
+ * notification bell, an account menu: what differs per visitor on a page
+ * that is otherwise the same for everyone, and so cacheable).
+ *
+ *   Routes.get("/bell", island(bell));
+ *
+ * The runtime asks with `Natsu-Island: 1` and takes the answer only when it
+ * says `Natsu-Island: 1` back, which only a route made with `island()` does.
+ * Any other route is refused before its handler runs: an attribute is easy
+ * to slip into user content, and an island naming `/account/delete` must not
+ * pull that page's form, CSRF token and all, into someone's product page.
+ */
+export function island(handler: Handler): Handler {
+	const marked: Handler = (ctx) => handler(ctx);
+	Object.defineProperty(marked, "name", { value: handler.name || "island" });
+	keepNavigable(handler, marked);
+	islands.add(marked);
+	return marked;
+}
+
+/** Island fetches in flight: refused before any route that is not an `island()`. */
+const islandRequests = new WeakSet<Context>();
+
+/** Whether this request is the runtime filling an island. */
+export function isIslandRequest(ctx: Context): boolean {
+	return islandRequests.has(ctx);
+}
+
+/**
+ * Carry a handler's navigable and island flags over to one that wraps it.
+ * The router's guards wrap a route's handler at compile time, and a wrapped
+ * route must answer navigations exactly as the bare one would.
  */
 export function keepNavigable(from: Handler, to: Handler): void {
 	const flag = navigables.get(from);
 	if (flag) navigables.set(to, flag);
+	if (islands.has(from)) islands.add(to);
 }
 
 /**
  * Refuse a navigation before `handler` runs, when its route did not opt in or
- * the request is a prefetch the route does not take. True when refused: the
- * caller returns without running the handler.
+ * the request is a prefetch the route does not take; and an island fetch,
+ * when the route is not an `island()`. True when refused: the caller returns
+ * without running the handler.
  */
 export function refuseBeforeHandler(ctx: Context, handler: Handler): boolean {
+	if (islandRequests.has(ctx)) {
+		if (islands.has(handler)) return false;
+		refuseIsland(ctx);
+		return true;
+	}
 	const nav = ctx.nav;
 	if (!(nav instanceof NavRequest)) return false;
 	const flag = navigables.get(handler);
@@ -233,10 +277,24 @@ export function refuseBeforeHandler(ctx: Context, handler: Handler): boolean {
  * 404. Neither is a page drawn in the shell the visitor is on.
  */
 export function refuseWithoutRoute(ctx: Context): boolean {
+	if (islandRequests.has(ctx)) {
+		refuseIsland(ctx);
+		return true;
+	}
 	const nav = ctx.nav;
 	if (!(nav instanceof NavRequest)) return false;
 	nav.decide({ kind: "reload", reason: "response", detail: "no route answers this path" });
 	return true;
+}
+
+/** An empty answer the runtime leaves the island alone on. */
+function refuseIsland(ctx: Context): void {
+	const response = ctx.response;
+	response.status = 204;
+	response.body = null;
+	response.headers.set("cache-control", NO_STORE);
+	addVary(response.headers, "Natsu-Island");
+	if (development()) log.info(`[<magenta>navigate</magenta>] GET ${ctx.path}: island refused: the route is not island()`);
 }
 
 // --- the request -------------------------------------------------------------
@@ -332,6 +390,11 @@ export class Navigation {
 	 */
 	public begin(ctx: Context): boolean {
 		const headers = ctx.request.headers;
+		const isle = headers.get("natsu-island");
+		if (isle !== null) {
+			headers.delete("natsu-island");
+			if (isle === "1" && ctx.method === "GET" && headers.get("sec-fetch-mode") !== "navigate") islandRequests.add(ctx);
+		}
 		const value = headers.get("natsu-nav");
 		// Deleted whatever they hold, before anything else runs: a handler that
 		// could see them could draw a different page, and that page could be
@@ -409,10 +472,16 @@ export class Navigation {
 			return this.control(ctx, { kind: "reload", reason: "shell", detail: this.shellChange(nav.shell, shellText) });
 		}
 
+		const csp = header(ctx, "content-security-policy");
+		const nonces = cspNonces(csp);
+		const part = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime, csp !== null && /'strict-dynamic'/i.test(csp));
+		if (part.scripts.length > SCRIPTS_HEADER_LIMIT) {
+			return this.control(ctx, { kind: "reload", reason: "response", detail: `the page lists more scripts than a header carries (${part.scripts.length} bytes)` });
+		}
+
 		// It is a part: what waited for a page the visitor sees runs now, and
 		// may still add headers (a cookie that clears a flash).
 		nav.flush();
-		const nonces = cspNonces(header(ctx, "content-security-policy"));
 		const headers = response.headers;
 		for (const name of ["content-length", "content-encoding", "etag", "last-modified", "expires", "location", "refresh"]) {
 			headers.delete(name);
@@ -421,8 +490,22 @@ export class Navigation {
 		headers.set("content-type", "text/html; charset=utf-8");
 		headers.set("cache-control", NO_STORE);
 		headers.set("natsu-part", "1");
+		if (part.scripts) headers.set("natsu-scripts", part.scripts);
+		if (nonces.length > 0) headers.set("natsu-nonce", nonces.join(" "));
 		addVary(headers, "Natsu-Nav");
-		response.body = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime);
+		response.body = part.html;
+	}
+
+	/**
+	 * After the route, on an island fetch that an `island()` route answered:
+	 * the answer says it is one, which is what the runtime checks before it
+	 * fills an element with it.
+	 */
+	public island(ctx: Context): void {
+		if (!islandRequests.has(ctx)) return;
+		const headers = ctx.response.headers;
+		addVary(headers, "Natsu-Island");
+		if (ctx.response.status !== 204) headers.set("natsu-island", "1");
 	}
 
 	/**
@@ -436,24 +519,28 @@ export class Navigation {
 		if (page.indexOf(REGION_ATTRIBUTE) === -1) return page;
 		const scan = scanPage(page);
 		if (scan === null) return page;
+		let tags = "";
 		if ("reason" in scan) {
 			if (development() && this.warned.size < 256 && !this.warned.has(ctx.path)) {
 				this.warned.add(ctx.path);
 				log.warn(`[<yellow>navigate</yellow>] ${ctx.path}: no soft navigation from this page (${scan.reason}: ${scan.detail})`);
 			}
-			return page;
+			// No key, so the runtime stays inert here: no soft visit from this
+			// page, but its scripts' mounts and its islands still work.
+			if (scan.reason === "response") return page;
+		} else {
+			const shellText = shellOf(page, scan);
+			const shell = hashOf(shellText);
+			if (development()) this.remember(shell, shellText);
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${shell}">`;
 		}
-		const shellText = shellOf(page, scan);
-		const shell = hashOf(shellText);
-		if (development()) this.remember(shell, shellText);
-		const key = `${this.docHash((name) => header(ctx, name))}.${shell}`;
-		let tags = `<meta name="natsu" content="${key}">`;
 		if (this.inject && this.runtime) {
 			const nonce = cspNonces(header(ctx, "content-security-policy"))[0];
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
 		}
-		const at = scan.head[2];
-		return `${page.slice(0, at)}${tags}${page.slice(at)}`;
+		if (!tags) return page;
+		const at = "reason" in scan ? headCloseOf(page) : scan.head[2];
+		return at === -1 ? page : `${page.slice(0, at)}${tags}${page.slice(at)}`;
 	}
 
 	/** The document key: the build and the document headers, nonces left out. */
@@ -523,7 +610,12 @@ export class Navigation {
 			return null;
 		}
 		if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-		return url.origin === ctx.url.origin ? `${url.pathname}${url.search}${url.hash}` : url.href;
+		if (url.origin !== ctx.url.origin) return url.href;
+		// A path that starts with `//` (or `/\`, which URLs read the same way)
+		// would be read as another host: `/.` in front keeps it a path here,
+		// and resolving drops the dot.
+		const path = /^\/[/\\]/.test(url.pathname) ? `/.${url.pathname}` : url.pathname;
+		return `${path}${url.search}${url.hash}`;
 	}
 
 	private remember(shell: string, text: string): void {
@@ -552,8 +644,8 @@ interface Region {
 interface ScriptTag {
 	start: number;
 	end: number;
-	/** The start tag as written. */
-	open: string;
+	/** The start tag's attributes, as written. */
+	attributes: Tag["attributes"];
 	src: string;
 	nonce: string | undefined;
 }
@@ -603,14 +695,25 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 	if (headEnd === 0) return { reason: "response", detail: "the page's </head> never ends" };
 
 	const regions: Region[] = [];
+	// The last `<` before the hit, found walking forward from the last one, and
+	// the tag read there: text that mentions the name a thousand times costs
+	// one walk over it, not a walk back from each mention.
+	let lt = -1;
+	let after = html.indexOf("<");
+	let tag: Tag | null = null;
 	for (let hit = html.indexOf(REGION_ATTRIBUTE); hit !== -1; hit = html.indexOf(REGION_ATTRIBUTE, hit + REGION_ATTRIBUTE.length)) {
 		// An attribute is preceded by whitespace and followed by `=`, `>`, `/`
 		// or whitespace; text that merely mentions the name is not.
 		if (!isSpace(html.charCodeAt(hit - 1)) || !isAttributeEnd(html.charCodeAt(hit + REGION_ATTRIBUTE.length))) continue;
 		if (inside(raw, hit)) continue;
-		const lt = html.lastIndexOf("<", hit);
-		const tag = lt === -1 ? null : readTag(html, lt);
-		if (!tag || tag.end <= hit || !tag.attributes.some((a) => a.at === hit && a.name === REGION_ATTRIBUTE)) continue;
+		if (after !== -1 && after < hit) {
+			while (after !== -1 && after < hit) {
+				lt = after;
+				after = html.indexOf("<", lt + 1);
+			}
+			tag = readTag(html, lt);
+		}
+		if (lt === -1 || !tag || tag.end <= hit || !tag.attributes.some((a) => a.at === hit && a.name === REGION_ATTRIBUTE)) continue;
 
 		const label = `<${tag.name}${tag.get("id") ? ` id="${tag.get("id")}"` : ""}>`;
 		if (hit < headEnd) return { reason: "regions", detail: `${label} is a region inside <head>` };
@@ -629,7 +732,7 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		// region needs one is loaded for real. A data block (JSON, JSON-LD) is
 		// not a script that runs, and travels with its region.
 		for (let i = firstAtOrAfter(raw, lt); i < raw.length && raw[i]! < end; i += 2) {
-			if (!html.startsWith("<script", raw[i]!)) continue;
+			if (!isScriptAt(html, raw[i]!)) continue;
 			const script = readTag(html, raw[i]!);
 			if (script && runs(script)) {
 				return {
@@ -652,29 +755,38 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
 		if (start >= headOpen && start < headEnd) continue;
 		while (region < regions.length && regions[region]!.end <= start) region++;
 		if (region < regions.length && start >= regions[region]!.start) continue;
-		if (!html.startsWith("<script", start)) continue;
+		if (!isScriptAt(html, start)) continue;
 		const tag = readTag(html, start);
 		const src = tag?.get("src");
 		if (!tag || src === undefined) continue;
-		scripts.push({ start, end: raw[i + 1]!, open: html.slice(start, tag.end), src, nonce: tag.get("nonce") });
+		scripts.push({ start, end: raw[i + 1]!, attributes: tag.attributes, src, nonce: tag.get("nonce") });
 	}
 
 	return { head: [headOpen, headStart, headClose, headEnd], regions, scripts, raw };
 }
 
 /**
- * What a swap leaves in place, as text: every byte outside the head and the
- * regions, less the script list and nonces, then the region ids in order. A
- * different text is a different shell.
+ * What a swap leaves in place, as text: the head's scripts (a page-specific
+ * one would never run after a swap, so a different one is a different
+ * shell), then every byte outside the head and the regions less the script
+ * list, with each region's id where it sits, nonces taken out. A different
+ * text is a different shell.
  */
 export function shellOf(html: string, scan: PageScan): string {
 	const pieces: string[] = [];
-	const [headOpen, , , headEnd] = scan.head;
+	const [headOpen, headStart, headClose, headEnd] = scan.head;
+	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
+		if (isScriptAt(html, scan.raw[i]!)) pieces.push(html.slice(scan.raw[i]!, scan.raw[i + 1]!));
+	}
+	pieces.push("\0");
 	const segments: number[] = [0, headOpen, headEnd];
 	for (const region of scan.regions) segments.push(region.start, region.end);
 	segments.push(html.length);
 	let script = 0;
 	for (let i = 0; i < segments.length; i += 2) {
+		// Where each region sits: markup moved from one side of a region to
+		// the other is a different shell, which a swap would leave misplaced.
+		if (i >= 4) pieces.push(`\0${scan.regions[(i >> 1) - 2]!.id}\0`);
 		let from = segments[i]!;
 		const to = segments[i + 1]!;
 		while (script < scan.scripts.length && scan.scripts[script]!.start < to) {
@@ -685,54 +797,96 @@ export function shellOf(html: string, scan: PageScan): string {
 		}
 		if (from < to) pieces.push(html.slice(from, to));
 	}
-	let text = pieces.join("").replace(NONCE_ATTRIBUTE, "");
-	for (const region of scan.regions) text += `\0${region.id}`;
-	return text;
+	return pieces.join("").replace(NONCE_ATTRIBUTE, "");
+}
+
+/** A part: the small document, and its script list for the `Natsu-Scripts` header. */
+export interface Part {
+	html: string;
+	/** Space-separated, one URL-encoded attribute list per script; "" for none. */
+	scripts: string;
 }
 
 /**
- * The part: a small document with the page's head less its scripts, the key,
- * the regions in order and the script list. A script is listed only if its
- * nonce is this response's (when the CSP has one): the runtime creates the
- * listed scripts itself, and under `'strict-dynamic'` a script it creates
- * runs whatever its host, so markup that slipped into the page cannot become
- * a script by riding along.
+ * The part: a small document with the page's head less its scripts, the key
+ * and the regions in order; the script list goes in a header.
  *
- * A nonce on anything else in the head (an inline `<style>`, a preload) is
- * written as `nonce=""` when it is this response's, and dropped when it is
- * not. That is how the browser shows the same element on the page already
- * there (it hides a nonce once the element is in a document with a CSP), so
- * the runtime's merge by `outerHTML` sees an unchanged element as unchanged;
- * and an element that is new gets the document's own nonce from the runtime,
- * the only one its CSP accepts, only if the server had vouched for it.
+ * Nothing in the part's markup ever becomes a script or gets the document's
+ * nonce on the server's word alone, because a browser can read markup in a
+ * page differently from this scanner (a stray end tag, foreign content), and
+ * markup that slipped into a page must not ride along into trust:
+ *
+ * - The scripts travel in `Natsu-Scripts`, which only the server writes, and
+ *   the runtime creates only those. Under a nonce CSP a script is listed
+ *   with a `nonce` key (the runtime gives it the document's nonce) only if
+ *   its nonce is this response's; one without is dropped when the CSP says
+ *   `'strict-dynamic'` (a runtime-made script would run whatever its host,
+ *   where the page's own would not) and listed without the key otherwise,
+ *   so the CSP's host list decides, as on a full load. The runtime's own
+ *   script is never listed.
+ * - A nonce on anything in the head keeps its value when it is this
+ *   response's and is dropped when not (bare ones too). The response's
+ *   nonces go in `Natsu-Nonce`, and the runtime trusts only an element whose
+ *   nonce is one of them: a value no markup can know in advance.
  */
-export function partOf(html: string, scan: PageScan, key: string, nonces: readonly string[], runtime = ""): string {
+export function partOf(
+	html: string,
+	scan: PageScan,
+	key: string,
+	nonces: readonly string[],
+	runtime = "",
+	strictDynamic = true,
+): Part {
 	const [, headStart, headClose] = scan.head;
+	const raw = scan.raw;
 	let head = "";
 	let from = headStart;
-	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
-		const start = scan.raw[i]!;
-		if (!html.startsWith("<script", start)) continue;
-		head += html.slice(from, start);
-		from = scan.raw[i + 1]!;
+	let r = firstAtOrAfter(raw, headStart);
+	for (let lt = html.indexOf("<", headStart); lt !== -1 && lt < headClose; ) {
+		while (r < raw.length && raw[r + 1]! <= lt) r += 2;
+		const rawStart = r < raw.length && raw[r]! <= lt ? raw[r]! : -1;
+		if (rawStart !== -1 && rawStart !== lt) {
+			// Inside a comment or raw text: no tag here.
+			lt = html.indexOf("<", raw[r + 1]!);
+			continue;
+		}
+		if (rawStart === lt && isScriptAt(html, lt)) {
+			head += html.slice(from, lt);
+			from = raw[r + 1]!;
+			lt = html.indexOf("<", from);
+			continue;
+		}
+		const tag = isLetter(html.charCodeAt(lt + 1)) ? readTag(html, lt) : null;
+		if (tag) {
+			for (const attribute of tag.attributes) {
+				if (attribute.name !== "nonce" || nonces.includes(attribute.value)) continue;
+				let cut = attribute.at;
+				while (cut > from && isSpace(html.charCodeAt(cut - 1))) cut--;
+				head += html.slice(from, cut);
+				from = attribute.end;
+			}
+		}
+		lt = html.indexOf("<", rawStart === lt ? raw[r + 1]! : tag ? tag.end : lt + 1);
 	}
 	head += html.slice(from, headClose);
-	head = head.replace(NONCE_ATTRIBUTE, (attribute) => (nonces.includes(nonceValue(attribute)) ? ' nonce=""' : ""));
 	let regions = "";
 	for (const region of scan.regions) regions += html.slice(region.start, region.end);
-	let scripts = "";
+	const scripts: string[] = [];
 	for (const tag of scan.scripts) {
-		if (nonces.length > 0 && (tag.nonce === undefined || !nonces.includes(tag.nonce))) continue;
 		if (runtime && tag.src === runtime) continue;
-		scripts += `${tag.open.replace(NONCE_ATTRIBUTE, "")}</script>`;
+		const vouched = tag.nonce !== undefined && nonces.includes(tag.nonce);
+		if (nonces.length > 0 && !vouched && strictDynamic) continue;
+		const attributes = new URLSearchParams();
+		for (const attribute of tag.attributes) {
+			if (attribute.name !== "nonce") attributes.append(attribute.name, decodeEntities(attribute.value));
+		}
+		if (vouched && nonces.length > 0) attributes.append("nonce", "");
+		scripts.push(attributes.toString());
 	}
-	return `<!doctype html><html><head>${head}<meta name="natsu" content="${key}"></head><body>${regions}${scripts}</body></html>`;
-}
-
-/** The value of a `nonce=…` attribute as NONCE_ATTRIBUTE matched it, quotes taken off. */
-function nonceValue(attribute: string): string {
-	const value = attribute.slice(attribute.indexOf("=") + 1).trim();
-	return value.startsWith('"') || value.startsWith("'") ? value.slice(1, -1) : value;
+	return {
+		html: `<!doctype html><html><head>${head}<meta name="natsu" content="${key}"></head><body>${regions}</body></html>`,
+		scripts: scripts.join(" "),
+	};
 }
 
 /** Every nonce a CSP header allows, in order. */
@@ -755,7 +909,7 @@ export function cspNonces(csp: string | null): string[] {
  * Bun's `indexOf` slows several times over on needles such as `<style` that
  * a page never holds.
  */
-const RAW_OPEN = /<(?:!--|(script|style|textarea|title)[\s/>])/g;
+const RAW_OPEN = /<(?:!--|(script|style|textarea|title)[\s/>])/gi;
 
 /** `<name` or `</name` as a tag, per tag name: what a region's end is found by. */
 const TAG_PATTERNS = new Map<string, RegExp>();
@@ -788,6 +942,13 @@ const SCRIPT_TYPES = new Set([
 	"speculationrules",
 ]);
 
+/** Where `</head` is, outside comments and raw text; -1 without one. */
+function headCloseOf(html: string): number {
+	const raw = rawRanges(html);
+	const open = findTag(html, raw, "<head", 0);
+	return open === -1 ? -1 : findTag(html, raw, "</head", open);
+}
+
 /** Comments and raw-text elements, as flat start/end pairs in document order. */
 function rawRanges(html: string): number[] {
 	const out: number[] = [];
@@ -802,11 +963,18 @@ function rawRanges(html: string): number[] {
 			if (html.startsWith(">", lt + 4)) end = lt + 5;
 			else if (html.startsWith("->", lt + 4)) end = lt + 6;
 			else {
-				const close = html.indexOf("-->", lt + 4);
-				end = close === -1 ? html.length : close + 3;
+				// A comment ends at `-->`, or at `--!>` as browsers also read it.
+				const close = html.indexOf("--", lt + 4);
+				end = html.length;
+				for (let at = close; at !== -1; at = html.indexOf("--", at + 1)) {
+					if (html.startsWith(">", at + 2)) end = at + 3;
+					else if (html.startsWith("!>", at + 2)) end = at + 4;
+					else continue;
+					break;
+				}
 			}
 		} else {
-			end = closeOf(html, `</${name}`, html.indexOf(">", lt + name.length + 1));
+			end = closeOf(html, name.toLowerCase(), html.indexOf(">", lt + name.length + 1));
 		}
 		out.push(lt, end);
 		open.lastIndex = end;
@@ -814,15 +982,19 @@ function rawRanges(html: string): number[] {
 	return out;
 }
 
-/** Past the `>` of the first `close` tag at or after `from`; the end of the page if there is none. */
-function closeOf(html: string, close: string, from: number): number {
+/** `</name` end tags of the raw-text elements, in any case, as browsers read them. */
+const CLOSE_PATTERNS = new Map<string, RegExp>();
+
+/** Past the `>` of the first `</name` end tag at or after `from`; the end of the page if there is none. */
+function closeOf(html: string, name: string, from: number): number {
 	if (from === -1) return html.length;
-	for (let at = html.indexOf(close, from); at !== -1; at = html.indexOf(close, at + 1)) {
-		if (!isTagEnd(html.charCodeAt(at + close.length))) continue;
-		const gt = html.indexOf(">", at);
-		return gt === -1 ? html.length : gt + 1;
-	}
-	return html.length;
+	let pattern = CLOSE_PATTERNS.get(name);
+	if (!pattern) CLOSE_PATTERNS.set(name, (pattern = new RegExp(`</${name}[\\s/>]`, "gi")));
+	pattern.lastIndex = from;
+	const match = pattern.exec(html);
+	if (match === null) return html.length;
+	const gt = html.indexOf(">", match.index);
+	return gt === -1 ? html.length : gt + 1;
 }
 
 /** The first `<name` (or `</name`) at or after `from` that is a tag outside raw text, or -1. */
@@ -842,7 +1014,7 @@ function endOf(html: string, raw: number[], name: string, from: number): number 
 	let pattern = TAG_PATTERNS.get(name);
 	if (!pattern) {
 		// Names are letters, digits and dashes (readTag), so nothing in one is a pattern.
-		pattern = new RegExp(`<(/?)${name}[\\s/>]`, "g");
+		pattern = new RegExp(`<(/?)${name}[\\s/>]`, "gi");
 		if (TAG_PATTERNS.size < 64) TAG_PATTERNS.set(name, pattern);
 	}
 	pattern.lastIndex = from;
@@ -888,7 +1060,8 @@ function firstAtOrAfter(raw: number[], at: number): number {
 
 interface Tag {
 	name: string;
-	attributes: Array<{ name: string; value: string; at: number }>;
+	/** Each attribute with where it starts and ends (past its value) in the page. */
+	attributes: Array<{ name: string; value: string; at: number; end: number }>;
 	/** Past the `>`. */
 	end: number;
 	get(name: string): string | undefined;
@@ -931,7 +1104,7 @@ function readTag(html: string, lt: number): Tag | null {
 				i = j;
 			}
 		}
-		attributes.push({ name: attribute, value, at });
+		attributes.push({ name: attribute, value, at, end: i });
 	}
 	return {
 		name,
@@ -960,6 +1133,27 @@ function isTagEnd(code: number): boolean {
 /** What ends an attribute name: whitespace, `/`, `>`, `=`. */
 function isAttributeEnd(code: number): boolean {
 	return isTagEnd(code) || code === 61 || Number.isNaN(code);
+}
+
+/** Whether a `<script` start tag (in any case) begins at `at`. */
+function isScriptAt(html: string, at: number): boolean {
+	return html.charCodeAt(at) === 60 && html.slice(at + 1, at + 7).toLowerCase() === "script" && isTagEnd(html.charCodeAt(at + 7));
+}
+
+function isLetter(code: number): boolean {
+	return (code >= 97 && code <= 122) || (code >= 65 && code <= 90);
+}
+
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+/** An attribute value as the browser reads it: the character references a template writes, decoded. */
+function decodeEntities(value: string): string {
+	if (value.indexOf("&") === -1) return value;
+	return value.replace(/&(?:#(\d+)|#x([\da-f]+)|(amp|lt|gt|quot|apos));?/gi, (match, dec?: string, hex?: string, name?: string) => {
+		if (name) return ENTITIES[name.toLowerCase()] ?? match;
+		const code = dec ? Number(dec) : Number.parseInt(hex!, 16);
+		return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+	});
 }
 
 function isNameChar(code: number): boolean {

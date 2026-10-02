@@ -88,7 +88,7 @@ function controllerImpl(prefix = "/", options: ControllerOptions = {}): unknown 
 			registry.set(`${name}@${route.property}`, resolve(route.property));
 		}
 
-		bindController({ name, prefix, domain: options.domain, routes: meta.routes, resolve });
+		bindController({ name, prefix, domain: options.domain, routes: meta.routes, marks: meta.marks, resolve });
 		return target;
 	};
 }

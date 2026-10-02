@@ -471,6 +471,10 @@ export class Assets {
 
 			await next();
 
+			// An island's fragment says it is one; it is still rewritten below,
+			// since its class names must match the page's renamed stylesheet.
+			navigation?.island(ctx);
+
 			// A navigation is answered whatever the body, including a page
 			// PageCache kept rewritten: the rewrite runs only for a page worth
 			// cutting, and only if it has not run already.

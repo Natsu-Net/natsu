@@ -19,8 +19,15 @@ export interface DecoratedRoute {
 	property: string;
 }
 
+/** What `@Navigable()` and `@Island()` set on a method, by property name. */
+export interface RouteMarks {
+	navigable?: { prefetch?: boolean };
+	island?: boolean;
+}
+
 export interface ControllerMeta {
 	routes: DecoratedRoute[];
+	marks?: Record<string, RouteMarks>;
 }
 
 export const ROUTE_META = Symbol.for("natsu.router.routes");
@@ -43,6 +50,8 @@ export interface ControllerBinding {
 	prefix: string;
 	domain: string | undefined;
 	routes: DecoratedRoute[];
+	/** `@Navigable()` and `@Island()`, by property name. */
+	marks?: Record<string, RouteMarks>;
 	/** Late-bound so the class is only instantiated when a request arrives. */
 	resolve: (property: string) => Handler;
 }
