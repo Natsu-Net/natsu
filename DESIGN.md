@@ -177,6 +177,11 @@ Set-Cookie always passes through.
 The script list is every `<script src>` outside the head and the regions,
 and only those whose nonce is this response's: the runtime creates them
 itself, so markup that slipped into a page never becomes a trusted script.
+A nonce on anything else in the part's head (an inline `<style>`, a
+preload) goes out as `nonce=""` when it is this response's and is dropped
+when not: that is how the browser shows the live element once it hides its
+nonce, so the runtime's merge keeps an unchanged element, and gives a new
+one the document's own nonce.
 
 **In a handler**, `ctx.nav` refuses, it never changes what is drawn:
 
@@ -191,6 +196,37 @@ false and `shown` runs at once. A route's CSP has to be on the response by
 the time `Assets.middleware()` sees it (set by the handler, or by middleware
 registered after Assets). In development every refusal is logged with its
 reason, and a shell change with the first line that changed.
+
+**In the browser** the runtime (`src/client/navigate.ts`, about 3.2 KB
+brotli) is built by `Assets.build()` as the classic entry `natsu-navigate`,
+readable and with console lines saying why a visit was a full load when
+`General.development` is on. A page script that keeps state or listeners
+writes them as a mount, and runs `defer`, after the runtime:
+
+```js
+natsu.mount("[data-clock]", (el, signal) => {
+  const timer = setInterval(() => tick(el), 1000);
+  el.addEventListener("click", onClick, { signal });
+  return () => clearInterval(timer);       // the region is being swapped out
+});
+```
+
+A mount runs on every match now and on every match in a region swapped in,
+while the page shown lists the script that registered it. Any listed script
+that never calls `natsu.mount` (and whose tag lacks `data-natsu-once`)
+makes every later visit a full load, so an unconverted page behaves as it
+always did. Also on `window.natsu`: `visit(url, { history, scroll })`,
+`refresh()` (after an action), `prefetch(url)`, `island(el)`; events
+`natsu:visit` (cancelable), `natsu:before-swap`, `natsu:load`; attributes
+`data-natsu-reload` (a real load for a link, a form or everything inside),
+`data-natsu-prefetch="off"`, `data-natsu-island="<url>"`, and
+`<html data-natsu-transition>` for a view transition. While a visit takes
+longer than 300 ms, `<html>` carries `data-natsu-loading`.
+
+`bun run test:e2e` drives Chromium against a natsu app built for it
+(`tests/fixtures/navigate/app.ts`: Assets with `navigate: true`, PageCache,
+a nonce CSP with `'strict-dynamic'`, two layouts), and prints the bytes and
+times of a full load against a soft visit.
 
 ## Defaults chosen where the request was open
 
