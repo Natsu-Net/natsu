@@ -1271,6 +1271,21 @@ describe("events and attributes", () => {
 		await p.natsu.refresh();
 		expect(p.document.title).toBe("A2");
 	});
+
+	test("refresh puts focus back on the element of the same id in the new region", async () => {
+		const p = open({
+			html: page({ main: `<h1>A</h1><input id="qty" value="1"><button id="go">go</button>` }),
+			routes: { "/a": () => answer(part({ title: "A", main: `<h1>A</h1><input id="qty" value="2"><button id="go">go</button>` })) },
+		});
+		const old = p.document.getElementById("qty");
+		old.focus();
+		let scrolled = 0;
+		p.window.HTMLElement.prototype.scrollIntoView = () => scrolled++;
+		await p.natsu.refresh();
+		const now = p.document.activeElement;
+		expect(now).not.toBe(old);
+		expect([now.id, now.value, scrolled]).toEqual(["qty", "2", 0]);
+	});
 });
 
 describe("history", () => {

@@ -592,12 +592,16 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 					if (trusted.has(e)) (e as HTMLElement).nonce = NONCE;
 				}
 				D.head.append(...incoming.values());
+				// Focus inside a region going out: refresh() gives it back to its namesake.
+				const was = D.activeElement;
+				const fid = now.some((el) => el.contains(was)) && was!.id;
 				now.forEach((el, i) => {
 					unmount(el);
 					el.replaceWith(next[i]!);
 				});
 				const s = o.scroll;
-				if (s != "keep") {
+				if (s == "keep") fid && D.getElementById(fid)?.focus({ preventScroll: true });
+				else {
 					const t = anchor(f);
 					// A y (back/forward), else the hash target, else the top.
 					if (t && s == null) t.scrollIntoView();
