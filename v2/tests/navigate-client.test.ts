@@ -529,6 +529,41 @@ describe("stylesheets", () => {
 		expect(text(p, "main h1")).toBe("Page B");
 	});
 
+	test("a sheet already parsed as it goes in (the memory cache's) swaps without waiting for its load event", async () => {
+		const p = open({ html: page(), routes: { "/b": () => answer(part({ sheet: "/_a/site.b.css" })) }, holdCss: ["/_a/site.b.css", "/_a/site.c.css"] });
+		// What Chromium shows for a cached sheet: its rules readable the moment the link is in.
+		// One still loading has none (or, in Firefox, rules that throw when read).
+		Object.defineProperty(p.window.HTMLLinkElement.prototype, "sheet", {
+			configurable: true,
+			get(this: Element) {
+				const href = this.getAttribute("href");
+				if (href === "/_a/site.b.css") return { cssRules: [] };
+				if (href === "/_a/site.c.css") return { get cssRules(): never { throw new Error("InvalidAccessError") } };
+				return null;
+			},
+		});
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(sheets(p)).toEqual(["/_a/site.b.css"]);
+	});
+
+	test("a sheet whose rules cannot be read yet is waited for", async () => {
+		const p = open({ html: page(), routes: { "/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>", sheet: "/_a/site.c.css" })) }, holdCss: ["/_a/site.c.css"] });
+		Object.defineProperty(p.window.HTMLLinkElement.prototype, "sheet", {
+			configurable: true,
+			get(this: Element) {
+				return this.getAttribute("href") === "/_a/site.c.css" ? { get cssRules(): never { throw new Error("InvalidAccessError") } } : null;
+			},
+		});
+		p.click("#to-c");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page A");
+		p.release("/_a/site.c.css");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page C");
+	});
+
 	test("the same sheet on both pages: nothing changes", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
 		const link = p.document.querySelector('link[rel="stylesheet"]');

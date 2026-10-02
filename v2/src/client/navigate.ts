@@ -429,6 +429,9 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 		}
 		const srcs = [...doc.querySelectorAll<HTMLScriptElement>("body>script[src]")];
 
+		// Where the page is, read now: once the new sheets are in, reading it
+		// costs a style pass over the whole page. Every scroll after keeps it.
+		ys.set(cur, scrollY);
 		// Stylesheets go in ahead of the current ones, which keep the page on
 		// screen styled as it is, and must load before anything moves.
 		const want = sheets(doc);
@@ -448,9 +451,17 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 				let left = adds.length;
 				// Four seconds without every load counts as a failure too (undefined).
 				setTimeout(y, 4e3);
+				const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || y(1));
 				// The handlers go on before the links go in: a cached sheet may load at once.
-				for (const l of adds) (l.onload = () => --left || y(1)), (l.onerror = () => y(0));
+				for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => y(0));
 				old[0] ? old[0].before(...adds) : D.head.append(...adds);
+				// A sheet the memory cache held is parsed as it goes in, but its load
+				// event can wait for the next frame: rules that can be read (never
+				// while loading, nor across origins) are a loaded sheet, a frame early.
+				for (const l of adds)
+					try {
+						if (l.sheet!.cssRules) done(l);
+					} catch {}
 			});
 		if (n != seq || !fine) {
 			for (const l of adds) l.remove();
@@ -464,7 +475,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 
 		const swap = () => {
 			fire("before-swap", D, { url: f.href });
-			ys.set(cur, scrollY);
+			const y = ys.get(cur);
 			if (h == "none") {
 				// An entry reached by back/forward keeps its id; one with no state
 				// (a hash link's, or one a script wrote) is given one.
@@ -476,7 +487,7 @@ if (KEY && D.querySelector(REGION) && window.DOMParser && HI.pushState) {
 				}
 			} else if (h == "replace") put(undefined, f.href);
 			else {
-				put(scrollY);
+				put(y);
 				HI.pushState({ natsu: { id: (cur = ++id) } }, "", f.href);
 			}
 			rendered = here();

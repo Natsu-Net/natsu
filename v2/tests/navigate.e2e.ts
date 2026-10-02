@@ -25,9 +25,10 @@
  * winning until the swap removes it.
  *
  * The last test measures: bytes on the wire for a full load and a part of
- * the same page, the time a full load and a soft visit take in the browser,
- * and the server's time for each. It prints them; it asserts only that the
- * part is smaller.
+ * the same page, the time a full load and a soft visit take in the browser
+ * (a click at once, and a click after the pointer rested on the link), and
+ * the server's time for each. It prints them; it asserts only that the part
+ * is smaller.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -830,6 +831,21 @@ describe("page switching in Chromium, against a natsu app", () => {
 				swapMs[path]!.push(swap);
 				softMs[path]!.push(done);
 			});
+			// And as a visitor clicks: the pointer rests on the link a moment first
+			// (250 ms here), long enough for the hover prefetch to bring the part.
+			const hoverMs: Record<string, number[]> = { "/catalog": [], "/p/1": [] };
+			await page.evaluate(() => ((window as any).__times = []));
+			for (let i = 0; i < 5; i++) {
+				for (const [link, name] of [["#to-catalog", "Catalog"], ["#to-p1", "Product 1"]] as const) {
+					await page.hover(link);
+					await page.waitForTimeout(250);
+					await page.click(link);
+					await title(page, name);
+					await page.waitForFunction((n: number) => (window as any).__times.length === n, i * 2 + (name === "Catalog" ? 1 : 2));
+					await page.mouse.move(5, 700);
+				}
+			}
+			for (const [path, , done] of (await page.evaluate(() => (window as any).__times)) as [string, number, number][]) hoverMs[path]!.push(done);
 			expect(await loads(page)).toBeGreaterThan(1);
 
 			// The server's time for each, as the app measured it (compression
@@ -860,12 +876,16 @@ describe("page switching in Chromium, against a natsu app", () => {
 						`${saved(b.part, b.full)} / ${saved(b.part + b.partHeaders, b.full + b.fullHeaders)} |`,
 				);
 			}
-			rows.push("", "| Page | Full load, nav start to load (median ms) | Soft visit, natsu:visit to swap / to natsu:load | Server, full page (socket / handle) | Server, part (socket / handle) |", "|---|---|---|---|---|");
+			rows.push(
+				"",
+				"| Page | Full load, nav start to load (median ms) | Soft visit, natsu:visit to swap / to natsu:load | After a 250 ms hover, to natsu:load | Server, full page (socket / handle) | Server, part (socket / handle) |",
+				"|---|---|---|---|---|---|",
+			);
 			for (const path of ["/catalog", "/p/1"]) {
 				const fullHandle = await handle(path, {});
 				const partHandle = await handle(path, { "natsu-nav": key });
 				rows.push(
-					`| ${path} | ${median(fullMs[path]!).toFixed(1)} | ${median(swapMs[path]!).toFixed(1)} / ${median(softMs[path]!).toFixed(1)} | ` +
+					`| ${path} | ${median(fullMs[path]!).toFixed(1)} | ${median(swapMs[path]!).toFixed(1)} / ${median(softMs[path]!).toFixed(1)} | ${median(hoverMs[path]!).toFixed(1)} | ` +
 						`${socket[path]!.full.toFixed(3)} / ${fullHandle.toFixed(3)} | ${socket[path]!.part.toFixed(3)} / ${partHandle.toFixed(3)} |`,
 				);
 			}
