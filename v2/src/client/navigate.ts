@@ -201,8 +201,14 @@ const unmount = (root: Element, inner?: 1) =>
 	}));
 
 const island = async (el: Element, signal?: AbortSignal) => {
-	const r = await fetch(el.getAttribute("data-natsu-island")!, { signal });
-	const html = r.status == 200 && /^text\/html/.test(r.headers.get("content-type")!) && (await r.text());
+	// Only this site, and only an answer from a route that says it is an
+	// island: markup that slipped into a page must not pull in another
+	// origin's HTML, nor a whole page of this one.
+	const u = new URL(el.getAttribute("data-natsu-island")!, L.href);
+	if (u.origin != L.origin) return;
+	const r = await fetch(u, { signal, headers: { "Natsu-Island": "1" } });
+	const html =
+		r.status == 200 && /^text\/html/.test(r.headers.get("content-type")!) && r.headers.get("natsu-island") == "1" && (await r.text());
 	if (html !== false && el.isConnected) {
 		unmount(el, 1);
 		el.innerHTML = html;

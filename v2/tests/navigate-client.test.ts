@@ -1350,6 +1350,9 @@ describe("prefetch", () => {
 });
 
 describe("islands", () => {
+	const isle = (body: string, headers: Record<string, string> = {}) =>
+		new Response(body, { headers: { "content-type": "text/html; charset=utf-8", "natsu-island": "1", ...headers } });
+
 	test("fetched after load into the element, mounted, fetched again by natsu.island; a non-200 leaves it be", async () => {
 		let n = 0;
 		let status = 200;
@@ -1358,13 +1361,11 @@ describe("islands", () => {
 			html: page({ shell: LINKS + `<div id="bell" data-natsu-island="/api/bell">…</div>`, scripts: ["/js/site.js"] }),
 			scripts: { "/js/site.js": (w) => w.natsu.mount("[data-row]", (el: Element) => void log.push(el.textContent!)) },
 			routes: {
-				"/api/bell": () =>
-					status === 200
-						? new Response(`<p data-row>row ${++n}</p>`, { headers: { "content-type": "text/html; charset=utf-8" } })
-						: new Response("no", { status }),
+				"/api/bell": () => (status === 200 ? isle(`<p data-row>row ${++n}</p>`) : new Response("no", { status, headers: { "natsu-island": "1" } })),
 			},
 		});
 		await settle();
+		expect(p.calls).toEqual([{ url: "/api/bell", headers: { "Natsu-Island": "1" } }]);
 		expect(text(p, "#bell")).toBe("row 1");
 		expect(log).toEqual(["row 1"]);
 		await p.natsu.island(p.document.getElementById("bell"));
@@ -1375,6 +1376,26 @@ describe("islands", () => {
 		expect(text(p, "#bell")).toBe("row 2");
 	});
 
+	test("only an answer that says Natsu-Island: 1 is taken, and only from this origin", async () => {
+		const p = open({
+			html: page({
+				shell:
+					LINKS +
+					`<div id="page" data-natsu-island="/account/delete">a</div><div id="text" data-natsu-island="/api/text">b</div>` +
+					`<div id="far" data-natsu-island="https://else.test/x">c</div><div id="rel" data-natsu-island="api/rel">d</div>`,
+			}),
+			routes: {
+				// A whole page, or a route that is not an island: no Natsu-Island back.
+				"/account/delete": () => new Response("<h1>deleted</h1>", { headers: { "content-type": "text/html" } }),
+				"/api/text": () => isle("plain", { "content-type": "text/plain" }),
+				"/api/rel": () => isle("<b>rel</b>"),
+			},
+		});
+		await settle();
+		expect([text(p, "#page"), text(p, "#text"), text(p, "#far"), text(p, "#rel")]).toEqual(["a", "b", "c", "rel"]);
+		expect(p.calls.map((c) => c.url).sort()).toEqual(["/account/delete", "/api/rel", "/api/text"]);
+	});
+
 	test("an island in a region swapped in is fetched; one swapped out is aborted", async () => {
 		const signals: AbortSignal[] = [];
 		const p = open({
@@ -1382,7 +1403,7 @@ describe("islands", () => {
 			routes: {
 				"/b": () => answer(part({ main: `<h1>B</h1><div id="box" data-natsu-island="/api/box">…</div>` })),
 				"/c": () => answer(part({ title: "C" })),
-				"/api/box": () => new Response("<b>box</b>", { headers: { "content-type": "text/html" } }),
+				"/api/box": () => isle("<b>box</b>"),
 			},
 		});
 		const fetch = p.window.fetch;
