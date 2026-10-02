@@ -22,6 +22,7 @@
 import type { Context, Handler } from "./context.ts";
 import { GetController } from "./controller.ts";
 import { CLog } from "./logger.ts";
+import { keepNavigable } from "./navigate.ts";
 import {
 	bindController,
 	routeMetaOf,
@@ -209,18 +210,22 @@ function hostMatches(domain: string, host: string): boolean {
 
 /**
  * Wrap a record's handler in its guards once, at compile time, so a request
- * pays for the guards it actually has and nothing else.
+ * pays for the guards it actually has and nothing else. A `navigable()`
+ * handler stays navigable behind its guards: the check that it is runs on the
+ * wrapper, before the guards do.
  */
 function guarded(record: RouteRecord): Handler {
 	const guards = record.guards;
 	if (guards.length === 0) return record.handler;
 	const handler = record.handler;
-	return async (ctx: Context) => {
+	const wrapped = async (ctx: Context) => {
 		for (const guard of guards) {
 			if (!(await guard(ctx))) return undefined;
 		}
 		return handler(ctx);
 	};
+	keepNavigable(handler, wrapped);
+	return wrapped;
 }
 
 function compileRoutes(source: readonly RouteRecord[]): CompiledRoutes {
