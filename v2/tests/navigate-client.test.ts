@@ -24,6 +24,7 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { brotliCompressSync, constants } from "node:zlib";
 import { Window } from "happy-dom";
 import HistoryItemList from "happy-dom/lib/history/HistoryItemList.js";
+import type { NatsuClient, NatsuLoadDetail, NatsuVisitOptions } from "../src/client/types.ts";
 
 // happy-dom's replaceState drops the entries after the current one; a
 // browser keeps them, and back/forward tests need them.
@@ -1977,6 +1978,30 @@ describe("development build", () => {
 	test("the production build carries none of it", () => {
 		expect(CODE).not.toContain("real load");
 		expect(DEV_CODE).toContain("real load");
+	});
+});
+
+describe("types", () => {
+	test("natsu is a global, mount is generic, and the natsu: events are typed on document", () => {
+		// Checked by tsc (`bunx tsc --noEmit -p v2`), never run: a wrong type fails the typecheck.
+		const typed = () => {
+			natsu.mount<HTMLFormElement>("form[data-upload]", (form, signal) => {
+				form.requestSubmit();
+				signal.throwIfAborted();
+			});
+			natsu.mount("[data-menu]", (el) => el.focus());
+			// @ts-expect-error an input is not a form
+			natsu.mount<HTMLInputElement>("input", (input) => input.requestSubmit());
+			document.addEventListener("natsu:visit", (e) => e.detail.url.startsWith("/admin") && e.preventDefault());
+			document.addEventListener("natsu:before-swap", (e) => e.detail.url);
+			document.addEventListener("natsu:load", (e) => e.detail.regions.map((r) => r.id + e.detail.url));
+			// @ts-expect-error regions are elements
+			document.addEventListener("natsu:load", (e) => e.detail.regions[0]!.toUpperCase());
+			const load: NatsuLoadDetail = { url: "/", regions: [] };
+			const how: NatsuVisitOptions = { history: "replace", scroll: "keep" };
+			return [load, window.natsu.visit("/b", how)];
+		};
+		expect(typeof typed).toBe("function");
 	});
 });
 

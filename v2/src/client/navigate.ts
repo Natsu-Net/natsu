@@ -113,25 +113,7 @@
  * real load; any other build leaves those lines out.
  */
 
-declare global {
-	interface Window {
-		natsu: NatsuClient;
-	}
-	interface NatsuVisitOptions {
-		/** "push" (default), "replace" this entry, or "none" (back/forward). */
-		history?: "push" | "replace" | "none";
-		/** "top", "keep" (no scroll, no focus move), or a y to scroll to. By default: the hash target, else the top. */
-		scroll?: "top" | "keep" | number;
-	}
-	interface NatsuClient {
-		mount(selector: string, fn: (el: Element, signal: AbortSignal) => void | (() => void)): void;
-		visit(url: string | URL, options?: NatsuVisitOptions): Promise<void>;
-		refresh(): Promise<void>;
-		prefetch(url: string | URL): void;
-		island(el: Element): Promise<void>;
-	}
-}
-
+import type { NatsuClient, NatsuVisitOptions } from "./types.ts";
 
 declare const NATSU_DEV: boolean | undefined;
 const DEV = typeof NATSU_DEV != "undefined" && NATSU_DEV;
@@ -240,7 +222,7 @@ const api: NatsuClient = (window.natsu = {
 		}
 		if (s) aware.add(s).add(s.src || s);
 		// A script in <head> runs once per document, as the shell does: its mounts go everywhere.
-		const r: Reg = [selector, fn, s && s.parentNode != D.head ? s.src : ""];
+		const r: Reg = [selector, fn as Reg[1], s && s.parentNode != D.head ? s.src : ""];
 		regs.push(r);
 		if (ready) mountIn(D.body, r);
 	},
