@@ -10,6 +10,7 @@
 
 import type { Server } from "bun";
 import { Cache, defaultCache } from "./cache.ts";
+import { type Nav, inertNav } from "./navigate.ts";
 import type { Session, SessionManager } from "./session/session.ts";
 import { type StateClass, grantRoom, resolveState, revokeRoom } from "./state.ts";
 
@@ -140,6 +141,14 @@ export class Context {
 	/** Per-request scratch space for middleware. */
 	public readonly locals: Record<string, unknown> = {};
 	public cache: Cache<unknown> = defaultCache;
+	/**
+	 * The page navigation this request is, if the client runtime sent it
+	 * (see `src/navigate.ts`). Set by `Assets.middleware()` before any route
+	 * runs; on every other request an inert object whose `skip`, `reload` and
+	 * `stale` do nothing and whose `shown` runs its callback at once, so a
+	 * handler can call it whether or not navigation is on.
+	 */
+	public nav: Nav = inertNav;
 
 	/** Set by the session middleware; `session` creates one on demand. */
 	public sessions: SessionManager | undefined;
