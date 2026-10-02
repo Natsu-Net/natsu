@@ -469,6 +469,19 @@ describe("page shapes", () => {
 		const html = '<html><head><link rel="stylesheet" href="/site.css"></head><body class="card"></body></html>';
 		expect(pipeline.rewrite(html)).toContain(pipeline.url("site"));
 	});
+
+	test("after another build, a shape seen before is cut from the sheet that build read", async () => {
+		const pipeline = assets();
+		await pipeline.build();
+		const html = '<body><div class="card">x</div></body>';
+		const first = pipeline.pageStyle("site", html);
+		writeFileSync(join(dir, "site.css"), CSS.replace(".card { border: 1px solid; }", ".card { border: 2px dashed; }"));
+		await pipeline.build();
+		const second = pipeline.pageStyle("site", html);
+		expect(second).not.toBe(first);
+		const body = (heldFiles(pipeline).get(second.slice("/_a/".length)) as { body: string }).body;
+		expect(body).toContain("dashed");
+	});
 });
 
 describe("minification", () => {

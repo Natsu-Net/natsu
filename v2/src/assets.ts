@@ -43,6 +43,7 @@ import { minifyCSS } from "uwu-template/assets/minify";
 import { addVary, negotiate } from "./compress.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
+import { type PageShape, PageShapes } from "./page-shape.ts";
 
 export interface AssetsOptions {
 	/** Where built chunks are written. Created if it is not there. */
@@ -191,6 +192,8 @@ export class Assets {
 	private safelist: Array<string | RegExp> = [];
 	/** Answers whose page went through `rewrite` already (see markRewritten). */
 	private readonly rewritten = new WeakSet<Context>();
+	/** Reads a page's shape from the class attribute values it has seen before. */
+	private shapes = new PageShapes(new Map(), new Map());
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -203,6 +206,7 @@ export class Assets {
 		this.safelist = [...(this.options.safelist ?? [])];
 		await this.planClasses();
 		await this.buildStyles();
+		this.shapes = new PageShapes(this.names, this.classes);
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
@@ -228,23 +232,28 @@ export class Assets {
 	 * is written.
 	 */
 	public rewrite(html: string): string {
-		// Renaming walks the whole page and profiles it on the way. Without a
-		// rename the page is profiled only when a stylesheet is narrowed for
-		// it: a page linking scripts alone, or `wholeStylesheets`, skips the
-		// walk, which costs several times the render.
+		// Renaming walks the whole page and reads its shape on the way. Without
+		// a rename the shape is read only when a stylesheet is narrowed for it:
+		// a page linking scripts alone, or `wholeStylesheets`, skips the walk.
 		let page = html;
-		let profile: DocumentProfile | undefined;
-		if (this.classes.size > 0) ({ html: page, profile } = renameAndProfile(html, this.classes));
+		let shape: PageShape | undefined;
+		const renaming = this.classes.size > 0;
+		if (renaming) ({ html: page, shape } = this.shapes.renameAndRead(html));
 		const pattern = this.rewritePattern();
 		if (!pattern) return page;
+		// A shape not seen yet has its chunk cut from the whole profile, read
+		// just as it was before shapes were read from kept values.
+		let profile: DocumentProfile | undefined;
+		const profiled = (): DocumentProfile =>
+			(profile ??= renaming ? renameAndProfile(html, this.classes).profile : profileDocument(page));
 		const resolved = new Map<string, string>();
 		const resolve = (from: string): string => {
 			let url = resolved.get(from);
 			if (url === undefined) {
 				const name = this.options.rewrite?.[from] ?? "";
 				if (this.sources.has(name) && !this.options.wholeStylesheets) {
-					profile ??= profileDocument(page);
-					url = this.pageStyle(name, page, profile);
+					shape ??= this.shapes.read(page);
+					url = this.styleFor(name, shape, profiled);
 				} else {
 					url = this.url(name);
 				}
@@ -295,32 +304,30 @@ export class Assets {
 	 * of this shape is seen.
 	 */
 	public pageStyle(name: string, html: string, profiled?: DocumentProfile): string {
+		if (!this.sources.has(name)) return this.url(name);
+		const shape = profiled ? this.shapes.fromProfile(profiled) : this.shapes.read(html);
+		return this.styleFor(name, shape, () => profiled ?? profileDocument(html));
+	}
+
+	/**
+	 * `pageStyle` for a page whose shape is read already. The key is the
+	 * page's shape, not its content (see PageShapes' `key`): two pages listing
+	 * different anime have the same classes and share a chunk. A shape not
+	 * seen yet is cut from `profileOf()`, the page's whole profile.
+	 */
+	private styleFor(name: string, shape: PageShape, profileOf: () => DocumentProfile): string {
 		const source = this.sources.get(name);
 		if (source === undefined) return this.url(name);
 
-		const profile = profiled ?? profileDocument(html);
-		// The key is the page's shape, not its content: two pages listing
-		// different anime have the same classes and share a chunk. Only the
-		// classes and ids the sheet's rules name count (tags never do), so a
-		// page's own `id="review-81"` does not make it a shape of its own.
-		// Bun.hash, not sha256: the key never leaves this process.
-		const names = this.names.get(name);
-		const named = (found: Set<string>, known: Set<string> | undefined): string => {
-			const list: string[] = [];
-			for (const item of found) if (!known || known.has(item)) list.push(item);
-			// A space, which no class or id can hold: `a,b` and `a`+`b` stay apart.
-			return list.sort().join(" ");
-		};
-		const shape = Bun.hash(
-			`${name}\n${named(profile.classes, names?.classes)}\n${named(profile.ids, names?.ids)}`,
-		).toString(36);
-		const known = this.pages.get(shape);
+		const key = this.shapes.key(name, shape);
+		const known = this.pages.get(key);
 		if (known) {
 			// Most recently used last, so the oldest shape is the one forgotten.
-			this.pages.delete(shape);
-			this.pages.set(shape, known);
+			this.pages.delete(key);
+			this.pages.set(key, known);
 			return known.url;
 		}
+		const profile = profileOf();
 
 		// A slice of an already minified sheet is minified; shaking it is a
 		// third of the work of shaking the source and minifying the result.
@@ -328,7 +335,7 @@ export class Assets {
 		if (!this.options.lazyStyles) {
 			const body = minify(shakeCSS(source, profile, { safelist: this.safelist }).css);
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
-			this.remember(shape, url, [basename(url)]);
+			this.remember(key, url, [basename(url)]);
 			return url;
 		}
 
@@ -347,7 +354,7 @@ export class Assets {
 			this.lazy.set(url, { url: laterUrl, triggers: split.triggers });
 			files.push(basename(laterUrl));
 		}
-		this.remember(shape, url, files);
+		this.remember(key, url, files);
 		return url;
 	}
 
