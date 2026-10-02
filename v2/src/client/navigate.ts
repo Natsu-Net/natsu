@@ -13,11 +13,15 @@
  * becomes a real browser load, so a wrong guess costs speed, never
  * correctness.
  *
- * The server injects it, with the document key, before `</head>` of every
- * page that has a region:
+ * The server puts the runtime's tag in every page with a head, before the
+ * head's first deferred script (so every script that calls `mount` runs
+ * after it), and the document key in every page with a region:
  *
  *   <meta name="natsu" content="<doc>.<shell>">
  *   <script src="/_a/natsu-navigate.<hash>.js" nonce="…" defer></script>
+ *
+ * A page without the key (no region) never swaps; `mount` and islands still
+ * work there. A second copy of the runtime on a page stays out.
  *
  * **What a page script writes.** One function, `natsu.mount`:
  *
@@ -30,79 +34,124 @@
  * It runs the function now on every match, and later on every match inside
  * a region swapped in, but only while the page shown lists the script that
  * registered it (two pages' scripts may share a selector). Swapping a region
- * out aborts `signal` and calls what the function returned. Elements in the
- * shell are mounted once. A script that calls `mount` while it runs is
- * swap-safe. Any other script this document ran (unless its tag says
- * `data-natsu-once`) makes every later visit a real load, so an unconverted
- * page behaves exactly as before and no listener ever stacks. Scripts that
- * call `mount` must run after this one: `defer`, as Assets emits them.
+ * out aborts `signal` and calls what the function returned; so does any
+ * later swap for an element page code took out of the document. Elements in
+ * the shell are mounted once.
+ *
+ * **Which scripts allow a swap.** Every script this document ran counts:
+ * inline, module, `defer` or `async`, in the head or the body, and the ones
+ * a swap appends. It is swap-safe once it has called `mount`, at any time
+ * (the script is `document.currentScript`, or for a module or a call made
+ * later the one the stack names). Any other makes every later visit a real
+ * load, so an unconverted page behaves exactly as before and no listener
+ * ever stacks. Left out: this runtime, a tag with `data-natsu-once`, data
+ * blocks and `nomodule`, and a classic head script that blocks the parser.
+ * A head script runs once per document, as the shell does, and its mounts
+ * apply on every page, whatever the page lists. A script that calls `mount`
+ * must run after this one: `defer`, as Assets emits them.
  *
  * **The wire format.** The request is a GET carrying
  * `Natsu-Nav: <doc>.<shell>` (and `Natsu-Prefetch: 1` for a hover). The
  * answers:
  *
  *  - a **part**: the page's own status, `Natsu-Part: 1`, and a small HTML
- *    document: the page's head (no scripts; a nonce the server vouched for
- *    written `nonce=""`, as the browser shows it on a live element), its
- *    regions in order, then its `<script src>` list;
+ *    document: the page's head with no scripts, then its regions in order.
+ *    Nothing in that markup is trusted. Its scripts come in
+ *    `Natsu-Scripts`: one entry per tag, space-separated, each the tag's
+ *    attributes URL-encoded (`src=%2F_a%2Fb.js&defer=&nonce=`); the `src`
+ *    is resolved against the part's URL, and a `nonce` key means "give it
+ *    the boot nonce". `Natsu-Nonce` lists the nonces the server vouches for
+ *    in the head; an element with one reads `nonce=""` (as the browser
+ *    shows it on a live element) and any other nonce is removed;
  *  - `204` with `Natsu-Location: <url>`: the page redirected (a path for a
  *    target on this site); a same-origin target is visited (five hops at
  *    most), any other is a real load;
- *  - `204` with `Natsu-Reload: <reason>`: load this page for real;
+ *  - `204` with `Natsu-Reload: <reason>`: load this page for real. For
+ *    `route` (not navigable) and `response` (no page there) the path is a
+ *    real load, never prefetched, for the rest of this document;
  *  - `204` with `Natsu-Prefetch: skip`: a hover was refused (a click still
  *    swaps).
+ *
+ * An island asks its URL, on this origin only, with `Natsu-Island: 1`, and
+ * takes the answer only when it is a `200` `text/html` that says
+ * `Natsu-Island: 1` back, as only a route made with `island()` does: an
+ * attribute slipped into content cannot pull another page into this one.
  *
  * **The swap**, step by step:
  *
  *  1. The part is parsed with `DOMParser`, and every `<noscript>` in it is
  *     removed: a parser with scripting off reads their content as markup, so
- *     `<noscript><style>` would otherwise become a live style.
+ *     `<noscript><style>` would otherwise become a live style. A part that
+ *     cannot be parsed (Trusted Types refuses `DOMParser`), or holds a
+ *     declarative shadow root (`<template shadowrootmode>`, which DOMParser
+ *     leaves inert), is a real load. An answer already in hand (prefetched)
+ *     yields a frame first, so the click's own frame paints.
  *  2. Its region ids must equal the current ones, in order.
  *  3. Its stylesheets go in before the current ones and must load first
  *     (four seconds at most; one the memory cache had, readable as it goes
  *     in, counts as loaded then). Every page's sheet is a slice of the same
  *     source in source order, so the old sheet, later in the cascade, keeps
  *     the old markup exactly as it was while the new one loads. A lazy half
- *     (`data-natsu-later`) loads too. There is no font step: in Chromium a
+ *     (`data-natsu-later`) loads too. A visit overtaken meanwhile removes the
+ *     sheets it added. There is no font step: in Chromium a
  *     face the new sheet declares again comes from the memory cache as the
  *     old sheet goes, so text does not flash in a fallback, and when the
  *     font cannot be cached, loading the new face early does not help,
  *     because removing the old sheet makes the browser build its faces
  *     afresh (tests/navigate.e2e.ts).
  *  4. In one synchronous step (inside a view transition only when
- *     `<html data-natsu-transition>` opts in): `natsu:before-swap`, history,
+ *     `<html data-natsu-transition>` opts in; a visit overtaken before the
+ *     transition runs it swaps nothing): `natsu:before-swap`, history,
  *     the head merged by `outerHTML` (only what the server sent: scripts,
  *     nodes a third party added and `<html>` attributes are never touched;
- *     a new element with `nonce=""` gets the boot nonce, so a page's own
- *     inline `<style>` applies under a nonce `style-src`),
+ *     a new element the server vouched for gets the boot nonce, so a page's
+ *     own inline `<style>` applies under a nonce `style-src`),
  *     the old stylesheets out, each region unmounted and replaced, scroll,
- *     focus, and the title read out through a `role=status` element.
+ *     focus (kept with `scroll: "keep"`), and the title read out through a
+ *     `role=status` element.
  *  5. The mounts already registered run on the new regions. The listed
- *     scripts this document has not run are created with the boot nonce
- *     (which `'strict-dynamic'` does not need, and a bare nonce policy does)
- *     and `async = false`, so they run in order and their `mount` calls bind
- *     as they run; once they have loaded, `natsu:load` bubbles from each
- *     region.
+ *     scripts this document has not run are created from their entries,
+ *     with the boot nonce where the entry says so (which `'strict-dynamic'`
+ *     does not need, and a bare nonce policy does) and `async = false`, so
+ *     they run in order and their `mount` calls bind as they run; once they
+ *     have loaded, `natsu:load` fires.
  *
  * **Scroll** is kept per history entry, keyed by the entry the page on
  * screen belongs to, never by whatever `history.state` says at the moment:
  * a scroll during a back/forward fetch still belongs to the page being left.
+ * It is saved on the entry at `pagehide` too, so a reload comes back to it.
+ * Each page shown is numbered, and every entry made from it carries the
+ * number: the browser's own entry for a hash link gets it at its popstate.
+ * A popstate to an entry with the number on screen is a scroll (to where the
+ * entry was, else to its hash target); any other is a visit. Back or Forward
+ * ends any visit on its way.
  *
- * **The API**, on `window.natsu`:
+ * **Prefetch.** A pointer that rests 65 ms on a link (a finger too: the
+ * browser taking the touch to pan, or a scroll, cancels it) fetches the part
+ * with `Natsu-Prefetch: 1`, two at a time at most, and none on Save-Data or
+ * 2G, or when `<meta name="natsu" data-prefetch="off">` says the server
+ * refuses them. A click within ten seconds uses the answer: a part, or a
+ * redirect or reload, acted on as it is. A skip is remembered as no answer
+ * for those ten seconds, so hovers stop asking and the click fetches.
  *
- *  - `mount(selector, (el, signal) => cleanup?)`
+ * **The API**, `natsu` (types in `client/types.ts`):
+ *
+ *  - `mount<E>(selector, (el: E, signal) => cleanup?)`
  *  - `visit(url, { history?: "push" | "replace" | "none", scroll?: "top" | "keep" | y })`
  *  - `refresh()`: this page again, scroll and focus kept (after an action)
  *  - `prefetch(url)`, and `island(el)` to fetch an island again
- *  - events on `document`: `natsu:visit` (cancelable), `natsu:before-swap`,
- *    and `natsu:load`, which bubbles from each new region (from `<body>`
- *    once at boot)
+ *  - events on `document`: `natsu:visit` (cancelable: the visit does not
+ *    happen, and on Back or Forward the page loads for real),
+ *    `natsu:before-swap`, and `natsu:load`, once per page shown (at boot
+ *    too) with `detail: { url, regions }`
  *  - attributes: `data-natsu-reload` on a link, form or ancestor for a real
- *    load (`="false"` turns it back off inside), `data-natsu-prefetch="off"`,
+ *    load, and on `<html>` for every visit from this document;
+ *    `data-natsu-prefetch` to turn hover prefetch on or off below it
+ *    (present is on, `"false"` or `"off"` is off, for both);
  *    `data-natsu-once` on a script, `data-natsu-island="<url>"` on an
  *    element whose content comes from that URL after load, and
  *    `<html data-natsu-transition>`. `html[data-natsu-loading]` is set
- *    when a visit takes longer than 300 ms.
+ *    when a visit takes longer than 300 ms, and cleared by any real load.
  *
  * With no key, no region, or a browser without `DOMParser` or `pushState`,
  * the runtime stays inert: `mount` still works and `visit` is
