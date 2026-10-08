@@ -11,6 +11,7 @@ export {
 	guard,
 	type ActionHandler,
 	type ActionInput,
+	type FormState,
 	type ActionOptions,
 	type ActionResult,
 	type AuthRule,

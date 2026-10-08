@@ -687,6 +687,25 @@ describe("inside an existing app", () => {
 		expect(site!.routes[0]!.data).toContainEqual({ name: "header", kind: "request", from: "header" });
 	});
 
+	test("request names see the form a refusal draws again with", async () => {
+		natsu.action("t.name", ({ input }) => {
+			throw new natsu.Invalid({}, `no ${input.title}`);
+		});
+		const { get } = await serve(
+			{ "index.uwu": `<page><action name="t.name"></page><template>[{{alert}}]<form @submit="action:name"><button>go</button></form></template>` },
+			{ request: { alert: (_ctx, { form }) => (form.message ? `${form.action}: ${form.message}` : "none") } },
+		);
+		const page = await get("/");
+		const html = await page.text();
+		expect(html).toContain("[none]");
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "name", _csrf: token, title: "x" });
+		const refused = await get("/", { method: "POST", body, headers: { cookie } });
+		expect(refused.status).toBe(422);
+		expect(await refused.text()).toContain("[name: no x]");
+	});
+
 	test("a page that reads none of them is still kept", async () => {
 		let loads = 0;
 		source("n", () => ++loads);

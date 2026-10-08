@@ -186,8 +186,16 @@ export function valuesOf(input: Record<string, string | string[]>): Record<strin
 	return out;
 }
 
+/** What a page reads as `form`: the refused action's short name, its errors, what was typed and why. */
+export interface FormState {
+	readonly action: string | null;
+	readonly errors: Readonly<Record<string, string>>;
+	readonly values: Readonly<Record<string, string | string[]>>;
+	readonly message: string;
+}
+
 /** What a page reads as `form` when no form was refused. */
-export const EMPTY_FORM = Object.freeze({ action: null, errors: Object.freeze({}), values: Object.freeze({}), message: "" });
+export const EMPTY_FORM: FormState = Object.freeze({ action: null, errors: Object.freeze({}), values: Object.freeze({}), message: "" });
 
 // --- CSRF and flash ----------------------------------------------------------
 

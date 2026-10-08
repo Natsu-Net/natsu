@@ -55,6 +55,7 @@ import {
 	CSRF_COOKIE,
 	CSRF_FIELD,
 	EMPTY_FORM,
+	type FormState,
 	FLASH_COOKIE,
 	type ActionInput,
 	type ActionResult,
@@ -104,9 +105,11 @@ export interface PagesOptions {
 	 * CSP nonce, its own `session`). Each getter is called once per page, when
 	 * the page or a layout reads the name, and may return a promise. One of
 	 * natsu's own names (`session`, `flash`) here replaces natsu's value. A page
-	 * that reads any of them is drawn for each visitor, never kept.
+	 * that reads any of them is drawn for each visitor, never kept. The second
+	 * argument holds the `form` a refused action draws the page again with
+	 * (empty otherwise), for an app whose layouts show a refusal their own way.
 	 */
-	request?: Record<string, (ctx: Context) => unknown>;
+	request?: Record<string, (ctx: Context, drawn: { form: FormState }) => unknown>;
 	/**
 	 * Runs around every page, action and not-found answer, which it starts with
 	 * `next()` and whose result it returns: what an existing app does around
@@ -447,7 +450,9 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			["form", () => EMPTY_FORM],
 			["flash", () => decodeFlash(ctx.cookies.get(FLASH_COOKIE))],
 		]);
-		for (const [name, get] of Object.entries(options.request ?? {})) request.set(name, () => get(ctx));
+		// The app's names see the form a refusal draws again with (its own flash may show it).
+		const form = "form" in extra ? extra.form : EMPTY_FORM;
+		for (const [name, get] of Object.entries(options.request ?? {})) request.set(name, () => get(ctx, { form: form as FormState }));
 		for (const [name, value] of Object.entries(extra)) request.set(name, () => value);
 		return { ctx, request, services: options.services ?? {}, path: state.path, params: state.page.params };
 	};
