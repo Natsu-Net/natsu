@@ -1,0 +1,13 @@
+<template>
+<h1>Open jobs</h1>
+<ul>
+{{#each jobs}}
+  <li><a href="/jobs/{{id}}">{{title}}</a> at {{company.name}}</li>
+{{#else}}
+  <li>Nothing open right now.</li>
+{{/each}}
+</ul>
+</template>
+<style>
+ul { list-style: none; }
+</style>
