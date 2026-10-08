@@ -497,6 +497,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			// A flash is shown once: a page that draws it is this visitor's, and
 			// a prefetch must not use it up unseen.
 			const flashed = state.readsFlash && ctx.cookies.has(FLASH_COOKIE);
+			// Read before it is cleared: clearing it takes it out of ctx.cookies too.
+			const extra = flashed ? { flash: decodeFlash(ctx.cookies.get(FLASH_COOKIE)) } : undefined;
 			if (flashed) {
 				if (ctx.nav.skip()) return undefined;
 				ctx.nav.shown(() => ctx.deleteCookie(FLASH_COOKIE, { path: "/" }));
@@ -535,7 +537,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 					return answer(ctx, kept);
 				}
 			}
-			return answer(ctx, await draw(ctx, state, secrets));
+			return answer(ctx, await draw(ctx, state, secrets, extra));
 		};
 		Object.defineProperty(handler, "name", { value: `page ${path}` });
 		return handler;
