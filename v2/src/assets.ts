@@ -31,18 +31,27 @@
  *
  * Templates keep the paths they already have; `rewrite` says which of them
  * the pipeline owns, and pages go out pointing at the chunks.
+ *
+ * With `navigate` on, the same middleware answers page navigations: a click
+ * fetches only the head and the regions of the next page, cut from the page
+ * this pipeline just pointed at its chunks (see `src/navigate.ts`).
  */
 
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, brotliCompressSync, constants, gzip, gzipSync } from "node:zlib";
 import { type DocumentProfile, profileDocument, selectorNames, shakeCSS, splitCSS } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import { addVary, negotiate } from "./compress.ts";
+import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
+import { scriptNonce } from "./csp.ts";
+import { LAZY_LOADER_HEAD, type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
+import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
 import { type PageShape, PageShapes } from "./page-shape.ts";
 
 export interface AssetsOptions {
@@ -140,6 +149,14 @@ export interface AssetsOptions {
 	 * inferred, so nothing is rewritten by surprise.
 	 */
 	rewrite?: Record<string, string>;
+	/**
+	 * Page navigation: a link click fetches only the parts of the next page
+	 * that change, and a small runtime swaps them in. Pages opt in by marking
+	 * regions (`<main id="main" data-natsu-region>`), routes by `navigable()`.
+	 * The runtime is built with the other entries and linked from the head of
+	 * every page with a region. See `src/navigate.ts`.
+	 */
+	navigate?: boolean | NavigateOptions;
 }
 
 export interface AssetReport {
@@ -192,11 +209,17 @@ export class Assets {
 	private safelist: Array<string | RegExp> = [];
 	/** Answers whose page went through `rewrite` already (see markRewritten). */
 	private readonly rewritten = new WeakSet<Context>();
+	/** Answers PageCache filled from a page kept rewritten, and the body it gave. */
+	private readonly filled = new WeakMap<Context, { body: string; filled: Filled }>();
+	/** Page navigation, when the `navigate` option turns it on. */
+	private readonly navigation: Navigation | undefined;
 	/** Reads a page's shape from the class attribute values it has seen before. */
 	private shapes = new PageShapes(new Map(), new Map());
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
+		const navigate = options.navigate;
+		if (navigate) this.navigation = new Navigation(navigate === true ? {} : navigate);
 	}
 
 	/** Build every entry. Call once at boot. */
@@ -210,6 +233,7 @@ export class Assets {
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
+		await this.buildNavigation();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
 	}
@@ -279,7 +303,12 @@ export class Assets {
 				const tag = out.slice(out.lastIndexOf("<", at), end + 1);
 				if (end !== -1 && /^<link\b/i.test(tag) && /\brel\s*=\s*["']?stylesheet\b/i.test(tag)) close = end;
 			}
-			if (close !== -1) out = `${out.slice(0, close + 1)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(close + 1)}`;
+			if (close === -1) continue;
+			// With navigation on, the link names its lazy half too: a part
+			// carries no inline script, so this is how the runtime learns it.
+			const attribute = this.navigation ? ` data-natsu-later="${lazy.url}"` : "";
+			const tagEnd = out[close - 1] === "/" ? close - 1 : close;
+			out = `${out.slice(0, tagEnd)}${attribute}${out.slice(tagEnd, close + 1)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(close + 1)}`;
 		}
 		return out;
 	}
@@ -333,9 +362,13 @@ export class Assets {
 	 * This answer's page went through `rewrite` already (a page kept rewritten,
 	 * see PageCache's `prepare`), so the middleware sends it as it is: a second
 	 * pass costs as much as the first, and renames what it already renamed.
+	 * Given the `page` PageCache answered, navigation reads the kept page once
+	 * rather than every answer (see `Navigation.fullFilled`).
 	 */
-	public markRewritten(ctx: Context): void {
+	public markRewritten(ctx: Context, page?: CachedPage): void {
 		this.rewritten.add(ctx);
+		const filled = page?.prepared ? filledOf(page) : undefined;
+		if (filled) this.filled.set(ctx, { body: page!.body, filled });
 	}
 
 	private pattern: RegExp | null | undefined;
@@ -446,6 +479,9 @@ export class Assets {
 	 *
 	 * One middleware rather than two, because they are one feature: a link
 	 * rewritten to a chunk that is not being served is a page with no styling.
+	 * Navigation answers live here for the same reason: a part must link the
+	 * chunk its whole page links, so it is cut after the rewrite, and inside
+	 * `compress()`, which sees it as the string it still is.
 	 */
 	public middleware(): Middleware {
 		const prefix = `${this.options.publicPath}/`;
@@ -498,22 +534,42 @@ export class Assets {
 				return;
 			}
 
+			// Read and delete the navigation headers before anything further in
+			// can see them; a prefetch refused outright never reaches a route.
+			const navigation = this.navigation;
+			if (navigation?.begin(ctx)) return;
+
 			await next();
 
-			const body = ctx.response.body;
-			if (typeof body !== "string") return;
-			// A lazy loader is the one inline script of ours, so only lazy
-			// styles need the answer's nonce.
-			if (this.rewritten.has(ctx)) {
-				const nonce = this.options.lazyStyles ? cspNonce(ctx) : undefined;
-				if (nonce) ctx.response.body = this.nonceLoaders(body, nonce);
+			// An island's fragment says it is one; it is still rewritten below,
+			// since its class names must match the page's renamed stylesheet.
+			navigation?.island(ctx);
+
+			// A navigation is answered whatever the body, including a page
+			// PageCache kept rewritten: the rewrite runs only for a page worth
+			// cutting, and only if it has not run already.
+			if (navigation && ctx.nav.requested) {
+				navigation.answer(ctx, (html) => (this.rewritten.has(ctx) ? html : this.rewrite(html)));
 				return;
 			}
+
+			const body = ctx.response.body;
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
-			const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
-			if (type ? !type.includes("html") : !body.startsWith("<")) return;
-			ctx.response.body = this.rewritePage(body, this.options.lazyStyles ? cspNonce(ctx) : undefined);
+			if (typeof body !== "string" || !isDocument(ctx, body)) return;
+			// A lazy loader is the one inline script of ours, so only lazy
+			// styles need the answer's nonce. A page kept rewritten was
+			// rewritten before any answer's nonce existed: its loaders get it now.
+			const nonce = this.options.lazyStyles ? cspNonce(ctx) : undefined;
+			const loaders = nonce ? (page: string) => this.nonceLoaders(page, nonce) : undefined;
+			const kept = this.filled.get(ctx);
+			// Still the body PageCache gave (the same string, so this reads none of it)?
+			if (navigation && kept?.body === body) {
+				ctx.response.body = navigation.fullFilled(ctx, body, kept.filled, loaders);
+				return;
+			}
+			const page = !this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body;
+			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
 		};
 	}
 
@@ -664,6 +720,44 @@ export class Assets {
 		}
 	}
 
+	/**
+	 * The navigation runtime, built as a classic script (an IIFE: it is a
+	 * plain `<script defer>` in the head), and the build id that goes into
+	 * every page's document key: a hash of the manifest, so a deploy that
+	 * changes any entry makes the next navigation a real load. In development
+	 * the runtime is built unminified with its console diagnostics (the
+	 * `NATSU_DEV` define the runtime reads); otherwise minified, whatever
+	 * `minify` says, because every visitor downloads it.
+	 */
+	private async buildNavigation(): Promise<void> {
+		const navigation = this.navigation;
+		if (!navigation) return;
+		const file = fileURLToPath(new URL("./client/navigate.ts", import.meta.url));
+		const dev = config.General.development;
+		const built = await Bun.build({
+			entrypoints: [file],
+			target: "browser",
+			format: "iife",
+			splitting: false,
+			minify: !dev,
+			define: {
+				NATSU_DEV: dev ? "true" : "false",
+				"process.env.NODE_ENV": JSON.stringify(dev ? "development" : "production"),
+			},
+		});
+		if (!built.success || !built.outputs[0]) {
+			for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
+		} else {
+			const body = await built.outputs[0].text();
+			const url = this.hold(`${RUNTIME_ENTRY}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
+			this.pin(url);
+			this.entries.set(RUNTIME_ENTRY, url);
+			this.report.sizes[RUNTIME_ENTRY] = { from: await sourceSize(file), to: body.length };
+		}
+		navigation.runtime = this.url(RUNTIME_ENTRY);
+		navigation.buildId = Bun.hash(JSON.stringify(this.manifest())).toString(36);
+	}
+
 	private async buildFiles(): Promise<void> {
 		for (const [name, file] of Object.entries(this.options.files ?? {})) {
 			let body: string;
@@ -804,8 +898,8 @@ function lazyLoader(url: string, triggers: string[], nonce: string | undefined):
 	return `${open}${LOADER_HEAD}${JSON.stringify(triggers.join(","))}${LOADER_MIDDLE}${JSON.stringify(url)}${LOADER_TAIL}`;
 }
 
-/** A lazy loader's text after its opening tag and up to its selector. */
-const LOADER_HEAD = '(()=>{let d=0,a=document.currentScript.previousElementSibling,E=["pointerover","pointerdown","touchstart","keydown","focusin","scroll"],S=';
+/** A lazy loader's text after its opening tag and up to its selector (shared with navigation, which leaves it out of the shell). */
+const LOADER_HEAD = LAZY_LOADER_HEAD;
 /** Its text between the selector and the lazy stylesheet's URL. */
 const LOADER_MIDDLE = ',c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=';
 /** Its text after the URL. */
@@ -849,39 +943,9 @@ function jsonStringAt(text: string, at: number): { value: string; length: number
 	}
 }
 
-/** A nonce source as CSP3 writes it: `'nonce-` and a base64 or base64url value, nothing to escape in an attribute. */
-const NONCE_SOURCE = /^'nonce-([A-Za-z0-9+/_-]+={0,2})'$/i;
-
-/**
- * The nonce this answer's own Content-Security-Policy allows inline
- * scripts by. Read from the response, after the route, so it is this
- * visitor's even on a page kept for everyone.
- *
- * A <script> is held to a policy's `script-src-elem`, or its `script-src`
- * when it has none, or its `default-src`; the first directive of a name
- * counts and later ones are ignored, as a browser parses them. A nonce
- * another directive names (`style-src`) would not let the loader run. The
- * header may hold several policies, joined by commas, each enforced on its
- * own; a script carries one nonce, the first that any of them allows
- * scripts by.
- */
+/** The nonce this answer's own Content-Security-Policy allows inline scripts by (see `scriptNonce`). */
 function cspNonce(ctx: Context): string | undefined {
-	const header = ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null;
-	if (!header) return undefined;
-	for (const policy of header.split(",")) {
-		const directives = new Map<string, string[]>();
-		for (const directive of policy.split(";")) {
-			const [name, ...sources] = directive.trim().split(/[\t\n\f\r ]+/);
-			const key = name?.toLowerCase();
-			if (key && !directives.has(key)) directives.set(key, sources);
-		}
-		const sources = directives.get("script-src-elem") ?? directives.get("script-src") ?? directives.get("default-src") ?? [];
-		for (const source of sources) {
-			const nonce = NONCE_SOURCE.exec(source)?.[1];
-			if (nonce !== undefined) return nonce;
-		}
-	}
-	return undefined;
+	return scriptNonce(ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null);
 }
 
 /**

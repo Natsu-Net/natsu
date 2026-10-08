@@ -16,6 +16,7 @@ import { CLog, formatLine, log, setLogLevel } from "./logger.ts";
 import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
+import { isIslandRequest, refuseBeforeHandler, refuseWithoutRoute } from "./navigate.ts";
 import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, setLiveHooks, setLiveServer, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
@@ -194,6 +195,13 @@ export class Application {
 			return this.fallbackTerminal(ctx);
 		}
 
+		// A page navigation runs only a route that opted in (navigable()), and
+		// is refused here, before the handler, otherwise: a GET that does
+		// something must not run once for the soft visit and again for the
+		// real load that follows the refusal. An island fetch, likewise, runs
+		// only an island() route.
+		if ((ctx.nav.requested || isIslandRequest(ctx)) && refuseBeforeHandler(ctx, handler)) return;
+
 		await this.invoke(handler, ctx);
 
 		// A guard that refused, or a handler that wrote nothing, still owes the
@@ -212,6 +220,8 @@ export class Application {
 	}
 
 	private async fallbackTerminal(ctx: Context): Promise<void> {
+		// No route: a static file or the 404 is never a page in the visitor's shell.
+		if ((ctx.nav.requested || isIslandRequest(ctx)) && refuseWithoutRoute(ctx)) return;
 		if (this.statics && !this.config.Static.beforeRoutes && (await this.statics.serve(ctx))) return;
 		if (ctx.response.body === undefined && !ctx.response.statusSet) {
 			ctx.response.status = 404;

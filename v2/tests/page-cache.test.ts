@@ -4,7 +4,7 @@
  */
 
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { type CachedPage, PageCache, type PageRender } from "../src/page-cache.ts";
+import { type CachedPage, PageCache, type PageRender, filledOf } from "../src/page-cache.ts";
 
 const NONCE_A = "a".repeat(32);
 const NONCE_B = "b".repeat(32);
@@ -35,6 +35,18 @@ describe("PageCache", () => {
 		expect(first?.body).toBe(`<script nonce="${NONCE_A}"></script><input value="${CSRF_A}">page 1`);
 		expect(second?.body).toBe(`<script nonce="${NONCE_B}"></script><input value="${CSRF_B}">page 1`);
 		expect(cache.counts).toEqual({ fresh: 1, stale: 0, rendered: 1 });
+	});
+
+	test("every mark is filled in one pass: many secrets, side by side, repeated, and a page with none", async () => {
+		const cache = new PageCache();
+		const secrets = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"];
+		const draw: PageRender = async (marks) => ({ body: `${marks.join("")}|${marks[11]}${marks[0]}|${marks[1]}.x`, status: 200 });
+		const first = await cache.serve("/many", secrets, draw);
+		const kept = await cache.serve("/many", secrets, draw);
+		const filled = `${secrets.join("")}|s11s0|s1.x`;
+		expect([first?.body, kept?.body]).toEqual([filled, filled]);
+		const none = await cache.serve("/none", [NONCE_A], async () => ({ body: "no marks here", status: 200 }));
+		expect(none?.body).toBe("no marks here");
 	});
 
 	test("visitors who arrive while it is being drawn share that one render", async () => {
@@ -302,5 +314,20 @@ describe("PageCache", () => {
 		headers["content-type"] = "changed too";
 		const second = await cache.serve("/p", [NONCE_A], draw);
 		expect(second?.headers).toEqual({ "content-type": "text/html" });
+	});
+
+	test("an answer says which kept page it was filled from, and fills pieces of it with its own secrets", async () => {
+		const cache = new PageCache({ prepare: (body) => body });
+		const page = renderer();
+		await cache.serve("/p", [NONCE_A, CSRF_A], page.draw);
+		const answer = (await cache.serve("/p", [NONCE_B, CSRF_B], page.draw))!;
+		const filled = filledOf(answer)!;
+		const kept = filled.page.body;
+		expect(kept).not.toContain(NONCE_A);
+		const at = kept.indexOf("<input");
+		expect(filled.fill(kept.slice(0, at)) + "|" + filled.fill(kept.slice(at))).toBe(answer.body.replace("<input", "|<input"));
+		const plain = "no marks here";
+		expect(filled.fill(plain)).toBe(plain);
+		expect(filledOf({ body: answer.body, status: 200 })).toBeUndefined();
 	});
 });

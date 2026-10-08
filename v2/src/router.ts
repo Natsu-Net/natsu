@@ -22,6 +22,7 @@
 import type { Context, Handler } from "./context.ts";
 import { GetController } from "./controller.ts";
 import { CLog } from "./logger.ts";
+import { island, keepNavigable, navigable } from "./navigate.ts";
 import {
 	bindController,
 	routeMetaOf,
@@ -29,6 +30,7 @@ import {
 	type ControllerBinding,
 	type DecoratorMetadata,
 	type HttpMethod,
+	type RouteMarks,
 	type RouteMethod,
 } from "./metadata.ts";
 
@@ -209,18 +211,22 @@ function hostMatches(domain: string, host: string): boolean {
 
 /**
  * Wrap a record's handler in its guards once, at compile time, so a request
- * pays for the guards it actually has and nothing else.
+ * pays for the guards it actually has and nothing else. A `navigable()`
+ * handler stays navigable behind its guards: the check that it is runs on the
+ * wrapper, before the guards do.
  */
 function guarded(record: RouteRecord): Handler {
 	const guards = record.guards;
 	if (guards.length === 0) return record.handler;
 	const handler = record.handler;
-	return async (ctx: Context) => {
+	const wrapped = async (ctx: Context) => {
 		for (const guard of guards) {
 			if (!(await guard(ctx))) return undefined;
 		}
 		return handler(ctx);
 	};
+	keepNavigable(handler, wrapped);
+	return wrapped;
 }
 
 function compileRoutes(source: readonly RouteRecord[]): CompiledRoutes {
@@ -318,6 +324,35 @@ function methodDecorator(method: RouteMethod) {
 	};
 }
 
+/** Mark a decorated method, in either order with its `@Get`. */
+function markDecorator(mark: (marks: RouteMarks) => void, label: string) {
+	return function decorate<T extends (ctx: Context) => unknown>(target: T, context: ClassMethodDecoratorContext): T {
+		if (context.static) throw new TypeError(`natsu: @${label} cannot decorate a static method (${String(context.name)})`);
+		const meta = routeMetaOf(context.metadata as DecoratorMetadata);
+		mark(((meta.marks ??= {})[String(context.name)] ??= {}));
+		return target;
+	};
+}
+
+/**
+ * `navigable()` for a decorated method: the route answers soft visits.
+ *
+ *   @Controller("/products")
+ *   class Products { @Navigable() @Get("/:id") show(ctx) { … } }
+ */
+export function Navigable(options: { prefetch?: boolean } = {}) {
+	return markDecorator((marks) => {
+		marks.navigable = options;
+	}, "Navigable");
+}
+
+/** `island()` for a decorated method: the route fills `data-natsu-island` elements. */
+export function Island() {
+	return markDecorator((marks) => {
+		marks.island = true;
+	}, "Island");
+}
+
 export const Get = methodDecorator("GET");
 export const Post = methodDecorator("POST");
 export const Put = methodDecorator("PUT");
@@ -345,7 +380,10 @@ function routerFor(domain: string | undefined, prefix: string): Router {
 setRouteBinder((binding: ControllerBinding) => {
 	const router = routerFor(binding.domain, binding.prefix);
 	for (const route of binding.routes) {
-		const handler = binding.resolve(route.property);
+		let handler = binding.resolve(route.property);
+		const marks = binding.marks?.[route.property];
+		if (marks?.navigable) handler = navigable(handler, marks.navigable);
+		if (marks?.island) handler = island(handler);
 		Object.defineProperty(handler, "name", { value: `${binding.name}@${route.property}` });
 		switch (route.method) {
 			case "ALL":
