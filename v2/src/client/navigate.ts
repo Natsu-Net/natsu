@@ -217,7 +217,6 @@ const REGION = "[data-natsu-region][id]";
 const LOADING = "data-natsu-loading";
 const SHEET = "link[rel=stylesheet]";
 const LATER = "data-natsu-later";
-const PASSIVE = { passive: true };
 const QUIET = { preventScroll: true };
 /** Every scroll the runtime makes jumps, as the browser's own restore does, whatever `scroll-behavior` says. */
 const INSTANT: ScrollToOptions = { behavior: "instant" };
@@ -235,8 +234,7 @@ const aware = new Set<unknown>([me]);
 let list: string[] | undefined;
 let ready = false;
 
-const on = (type: string, fn: (e: never) => unknown, options?: AddEventListenerOptions) =>
-	addEventListener(type, fn as EventListener, options);
+const on = (type: string, fn: (e: never) => unknown) => addEventListener(type, fn as EventListener);
 /** Every natsu event is on document, bubbling and cancelable. */
 const fire = (name: string, detail: unknown) =>
 	D.dispatchEvent(new CustomEvent("natsu:" + name, { bubbles: true, cancelable: true, detail }));
@@ -428,7 +426,7 @@ if (!first && KEY && regions(D)[0]) {
 	let away: unknown;
 	const ys = new Map<number, number>();
 	/** Ours into the entry shown; one a script pushed with no state of ours gets an id of its own first. */
-	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: st() ? cur : (cur = ++id), p: page, y } }, "", url);
+	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: cur, p: page, y } }, "", url);
 	// The browser restores scroll, on a reload too, until a swap makes the
 	// entries manual. A reload keeps that, and leaves the scroll to us: now,
 	// and again at load (images, fonts) unless the visitor scrolled meanwhile.
@@ -445,7 +443,7 @@ if (!first && KEY && regions(D)[0]) {
 	on(
 		"scroll",
 		() => {
-			frozen || away || st() || put();
+			frozen || away || st() || ((cur = ++id), put());
 			frozen == cur || ys.set(cur, scrollY);
 			// Into the entry too, once the scroll settles: Back or Forward leaves
 			// it with no event of its own, and the document may be gone before
@@ -454,7 +452,6 @@ if (!first && KEY && regions(D)[0]) {
 			clearTimeout(saving);
 			saving = setTimeout(save, 200);
 		},
-		PASSIVE,
 	);
 	// Back from the back/forward cache after a visit became a real load: no
 	// longer loading, and a loading timer frozen with the page must not fire.
@@ -607,7 +604,7 @@ if (!first && KEY && regions(D)[0]) {
 	// A finger waits as a mouse does: a flick across a grid of links is a
 	// scroll, which the browser says (pointercancel, as it takes the touch to
 	// pan) or the page does.
-	on("pointerover", intent, PASSIVE);
+	on("pointerover", intent);
 	on("pointerout", (e: PointerEvent) => over && !over.contains(e.relatedTarget as Node) && forget());
 	on("pointercancel", forget);
 
@@ -623,7 +620,7 @@ if (!first && KEY && regions(D)[0]) {
 	 */
 	const full = (u: URL, h?: string) =>
 		// This page again (refresh) is a reload: a replace of a URL with a hash would only jump, and one without would lose the scroll.
-		(idle(), h == "none" || (h == "replace" && u.href == L.href) ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
+		(idle(), L[h == "none" || (h && u.href == L.href) ? "reload" : h ? "replace" : "assign"](u.href));
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
@@ -670,8 +667,8 @@ if (!first && KEY && regions(D)[0]) {
 		if (to) {
 			const v = new URL(to, u);
 			v.hash ||= u.hash;
-			// Another page: "keep" was for the one asked for.
-			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: -~o.hops!, scroll: o.scroll == "keep" && v.pathname != u.pathname ? undefined : o.scroll };
+			// Shown from its top (or its hash), as a load that redirects is: a scroll asked for was for the URL asked for.
+			const next: Opts = { history: h == "none" ? "replace" : h, hops: -~o.hops! };
 			return next.hops! < 6 ? visit(v, next) : (DEV && why("redirect to", v.href), full(v, next.history));
 		}
 		if (!head.has("natsu-part")) {
