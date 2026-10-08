@@ -542,6 +542,58 @@ describe("PageCache tags", () => {
 		expect(cache.size).toBe(0);
 	});
 
+	test("a burst of expires draws a page one render at a time", async () => {
+		const cache = new PageCache({ fresh: 60, stale: 30 });
+		const gates: (() => void)[] = [];
+		let renders = 0;
+		let running = 0;
+		let most = 0;
+		const draw: PageRender = async () => {
+			const n = ++renders;
+			running++;
+			most = Math.max(most, running);
+			if (n > 1) await new Promise<void>((resolve) => gates.push(resolve));
+			running--;
+			return { body: `drawn ${n}`, status: 200, tags: ["catalog"] };
+		};
+		await cache.serve("/home", [], draw);
+		for (let i = 0; i < 5; i++) {
+			cache.dropTags(["catalog"], "expire");
+			expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 1");
+			expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 1");
+		}
+		expect(renders).toBe(2);
+		// The render under way read what was there before the later drops: not kept.
+		gates.shift()?.();
+		await Bun.sleep(0);
+		expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 1");
+		expect(renders).toBe(3);
+		gates.shift()?.();
+		await Bun.sleep(0);
+		expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 3");
+		expect(most).toBe(1);
+	});
+
+	test("a visitor after a drop never waits on a render that read what was there before", async () => {
+		const cache = new PageCache({ fresh: 60, stale: 30 });
+		let release = () => {};
+		let renders = 0;
+		const draw: PageRender = async () => {
+			const n = ++renders;
+			if (n === 2) await new Promise<void>((resolve) => (release = resolve));
+			return { body: `drawn ${n}`, status: 200, tags: ["catalog"] };
+		};
+		await cache.serve("/home", [], draw);
+		cache.dropTags(["catalog"], "expire");
+		expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 1");
+		// Nothing may be served any more: the next visitor draws its own page.
+		cache.expireAll(0);
+		expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 3");
+		release();
+		await Bun.sleep(0);
+		expect((await cache.serve("/home", [], draw))?.body).toBe("drawn 3");
+	});
+
 	test("with invalidate: true, a plain invalidation deletes and a soft one expires", async () => {
 		const cache = new PageCache({ fresh: 60, invalidate: true });
 		const page = tagged(["product:shoe"]);

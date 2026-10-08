@@ -45,7 +45,11 @@ invalidate(`product:${id}`, { soft: true });  // an edit: the old page is served
   moment old does no harm.
 - **A render under way is not kept** when one of the tags it drew is dropped
   while it runs: it read what was there before. It still answers the
-  requests that were waiting on it.
+  requests that were waiting on it, and no request after the drop joins it.
+  When a soft drop catches a page mid-render, that render stays the one
+  under way: visitors keep getting the old page, and the first one after it
+  ends draws the page again, so a burst of edits never stacks up renders of
+  the same page.
 
 `invalidate: true` listens for the life of the process, which suits a cache
 made once at startup. `pages.listen()` does the same and returns the

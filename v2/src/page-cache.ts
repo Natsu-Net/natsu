@@ -159,9 +159,10 @@ const MAX_REFUSED = 10_000;
 const MAX_DROPPED = 1024;
 
 /**
- * A render under way; `void` once the key was forgotten while it ran.
- * `dropped` holds the tags dropped meanwhile: a page that drew one read
- * what was there before, so it is not kept either.
+ * A render under way; `void` once the key was forgotten or made old while it
+ * ran, after which nobody new waits on it. `dropped` holds the tags dropped
+ * meanwhile: a page that drew one read what was there before, so it is not
+ * kept either.
  */
 interface Run {
 	done: Promise<Entry | null>;
@@ -253,8 +254,9 @@ export class PageCache {
 		// Past its stale time a page is not served; its memory goes with it.
 		if (kept) this.forget(key);
 		const running = this.pending.get(key);
-		if (running) {
-			// Someone else is drawing it: their page, our secrets.
+		// Someone else is drawing it: their page, our secrets. Not a render that
+		// read what a drop since made old: that one answers who asked before it.
+		if (running && !running.void) {
 			const entry = await running.done;
 			return entry ? this.fill(entry.page, secrets) : null;
 		}
@@ -329,7 +331,6 @@ export class PageCache {
 		const until = now + ms(staleSeconds, 0);
 		for (const [key, entry] of this.entries) this.age(key, entry, now, until);
 		for (const running of this.pending.values()) running.void = true;
-		this.pending.clear();
 	}
 
 	/**
@@ -343,13 +344,15 @@ export class PageCache {
 		return onInvalidate(heard);
 	}
 
-	/** Makes a kept page old, served until `until` at most; a render of it under way is not kept. */
+	/**
+	 * Makes a kept page old, served until `until` at most. A render of it under
+	 * way is not kept, but stays the one render under way: the visitors served
+	 * the old page meanwhile start no other, so a burst of drops draws a busy
+	 * page once at a time, and the first visitor after it ends draws it again.
+	 */
 	private age(key: string, entry: Entry, now: number, until: number): void {
 		const running = this.pending.get(key);
-		if (running) {
-			running.void = true;
-			this.pending.delete(key);
-		}
+		if (running) running.void = true;
 		if (until <= now) {
 			this.forget(key);
 			return;
