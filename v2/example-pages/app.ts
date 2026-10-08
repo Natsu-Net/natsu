@@ -17,6 +17,14 @@
  *
  * The layout reads `categories` (a source) and `viewer`. The data here is
  * in memory; the resolver is where the ORM plugin will plug in.
+ *
+ * Links between pages are `@href="/jobs/{{id}}"`: checked against the page
+ * files when they compile (rename `jobs/[id].uwu` and the start fails with
+ * the file and line of each link to it), drawn as plain hrefs. The job list
+ * and the Board link are fetched ahead once on screen
+ * (`data-natsu-prefetch="viewport"`), the rest on hover; every swap runs
+ * inside a view transition (`navigate.transition`), and a slow one shows
+ * the loading bar. `/login` is no page file, so it stays a plain href.
  */
 
 import { join } from "node:path";
@@ -101,7 +109,7 @@ const inventory = Bun.serve({
 	},
 });
 
-const assets = new Assets({ outDir: join(import.meta.dir, ".natsu", "assets"), navigate: true });
+const assets = new Assets({ outDir: join(import.meta.dir, ".natsu", "assets"), navigate: { transition: true } });
 await assets.build();
 
 const app = new Application();

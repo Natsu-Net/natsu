@@ -4,5 +4,5 @@
 <template>
 <h1>{{job.title}}</h1>
 <p>{{job.summary}}</p>
-<p>At <a href="/p/{{company.slug}}">{{company.name}}</a></p>
+<p>At <a @href="/p/{{company.slug}}">{{company.name}}</a></p>
 </template>

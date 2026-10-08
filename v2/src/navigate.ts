@@ -69,11 +69,25 @@ export interface NavigateOptions {
 	 */
 	inject?: boolean;
 	/**
-	 * Answer hover and touch prefetches (default true). Off, the key says so
-	 * (`data-prefetch="off"`) and the runtime sends none, and any that comes
-	 * anyway is refused before a route runs; a click still swaps.
+	 * When a link is fetched ahead of its click, for a link that does not say
+	 * (`data-natsu-prefetch` on it or an ancestor does):
+	 *
+	 * - `"hover"` (or true, the default): when a pointer rests on it 65 ms;
+	 * - `"viewport"`: once it is on screen, in idle time, and on hover too;
+	 * - `"none"`: never, unless the link says so;
+	 * - `false`: never, and the server refuses any prefetch before a route
+	 *   runs, whatever a link says.
+	 *
+	 * The key carries it (`data-prefetch="viewport"`); a click swaps whatever
+	 * this says.
 	 */
-	prefetch?: boolean;
+	prefetch?: boolean | "hover" | "viewport" | "none";
+	/**
+	 * Swap inside a view transition on every page (default false), as
+	 * `<html data-natsu-transition>` does on one: the key carries
+	 * `data-transition`. Never for a visitor who prefers reduced motion.
+	 */
+	transition?: boolean;
 }
 
 /**
@@ -396,6 +410,8 @@ export class Navigation {
 	private readonly documentHeaders: string[];
 	private readonly inject: boolean;
 	private readonly prefetch: boolean;
+	/** What the key says about prefetch and transitions: ` data-prefetch="…"`, ` data-transition`. */
+	private readonly keyAttributes: string;
 	/** Development only: recent shell texts by hash, to say what changed on a mismatch. */
 	private readonly shells = new Map<string, string>();
 	/** Development only: what each path was already warned about, so a log is not a flood. */
@@ -410,6 +426,8 @@ export class Navigation {
 		];
 		this.inject = options.inject !== false;
 		this.prefetch = options.prefetch !== false;
+		const mode = options.prefetch === false ? "off" : options.prefetch === "viewport" || options.prefetch === "none" ? options.prefetch : "";
+		this.keyAttributes = (mode ? ` data-prefetch="${mode}"` : "") + (options.transition ? " data-transition" : "");
 	}
 
 	/**
@@ -589,8 +607,7 @@ export class Navigation {
 		let tags = "";
 		if (shell !== undefined) {
 			if (development()) this.remember(hash, shell);
-			const prefetch = this.prefetch ? "" : ' data-prefetch="off"';
-			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}"${prefetch}>`;
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}"${this.keyAttributes}>`;
 		}
 		if (this.inject && this.runtime) {
 			const nonce = scriptNonce(csp);

@@ -1,8 +1,8 @@
 <template>
 <h1>Open jobs</h1>
-<ul>
+<ul data-natsu-prefetch="viewport">
 {{#each jobs}}
-  <li><a href="/jobs/{{id}}">{{title}}</a> at {{company.name}}</li>
+  <li><a @href="/jobs/{{id}}">{{title}}</a> at {{company.name}}</li>
 {{#else}}
   <li>Nothing open right now.</li>
 {{/each}}

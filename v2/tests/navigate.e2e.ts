@@ -828,6 +828,52 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
+	e2e("the loading bar shows under the page's CSP while a slow visit waits; a link in view is fetched ahead; Back reuses the kept part", async () => {
+		const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+		await context.addCookies([{ name: "visitor", value: "anon", url: ORIGIN }]);
+		const page = await context.newPage();
+		page.setDefaultTimeout(8_000);
+		// Before the runtime boots: the header's link to /c asks to be fetched once in view.
+		await page.addInitScript(() => {
+			(window as any).__csp = [];
+			document.addEventListener("securitypolicyviolation", (e) => (window as any).__csp.push(e.violatedDirective));
+			document.addEventListener("DOMContentLoaded", () => document.getElementById("to-c")?.setAttribute("data-natsu-prefetch", "viewport"));
+		});
+		let from = fixture.seen.length;
+		await page.goto(ORIGIN + "/a");
+		await page.waitForFunction(() => performance.getEntriesByName(`${location.origin}/c`).length > 0);
+		await page.waitForTimeout(50);
+		expect(asked(from, "/c")).toEqual([["part", "prefetch"]]);
+
+		// The bar: there, invisible, until a visit takes 150 ms.
+		const bar = () =>
+			page.evaluate(() => {
+				const el = document.querySelector("natsu-bar")!;
+				const s = getComputedStyle(el);
+				return { loading: document.documentElement.hasAttribute("data-natsu-loading"), position: s.position, opacity: s.opacity, height: s.height };
+			});
+		expect(await bar()).toEqual({ loading: false, position: "fixed", opacity: "0", height: "2px" });
+		from = fixture.seen.length;
+		await page.click("#to-b");
+		await title(page, "B");
+		await page.click("#to-c");
+		await title(page, "C");
+		// Back: /b comes from the part it was shown from, not asked again.
+		await page.goBack({ waitUntil: "commit" });
+		await title(page, "B");
+		expect(asked(from, "/b")).toEqual([["part", "fetch"]]);
+
+		page.click("#to-slow");
+		await page.waitForFunction(() => document.documentElement.hasAttribute("data-natsu-loading"));
+		await page.waitForTimeout(100);
+		const shown = await bar();
+		expect(shown.loading).toBe(true);
+		expect(Number(shown.opacity)).toBe(1);
+		await title(page, "Slow");
+		expect(await page.evaluate(() => (window as any).__csp)).toEqual([]);
+		await context.close();
+	});
+
 	e2e("a view transition runs only when <html data-natsu-transition> opts in", async () => {
 		const count = async (page: any) =>
 			page.evaluate(() => {

@@ -14,6 +14,18 @@
  *
  * A file or directory whose name starts with `_` is never a route.
  *
+ * **Links.** `<a @href="/p/{{vendor}}/{{slug}}">` (uwu's link directive)
+ * draws a plain `href="/p/acme/shoe"` that works without script, and is
+ * checked here against the routes above: a path no page file answers fails
+ * the compile with the file and line of the link (`checkLinks`). Each hole
+ * stands for one value, so it fits a `[param]` or a fixed segment; the query
+ * and the hash are free. The holes are reads like any other: inside
+ * `{{#each products}}`, `{{slug}}` asks the source for `slug`. A link to
+ * anything that is not a page file (a controller, a file, another site) is
+ * a plain `href`. With page navigation on, every link to the site swaps;
+ * `data-natsu-prefetch="viewport" | "hover" | "none"` picks when it is
+ * fetched ahead (docs/page-navigation.md).
+ *
  * A partial renders with its caller's data where it is included, so its
  * reads are walked there: `{{> card}}` inside `{{#each products}}` makes
  * `card`'s `{{name}}` a read of `products.name`. A partial registered only
@@ -31,7 +43,7 @@ import { createRequire } from "node:module";
 import { dirname, join, relative, sep } from "node:path";
 import { type PageBlock, splitPageBlock, textPaths } from "./block.ts";
 import { PageCompileError } from "./errors.ts";
-import { type Reads, type TplNode, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
+import { HOLE, type Reads, type TplNode, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
 
 export type FileKind = "page" | "layout" | "error" | "partial";
 
@@ -68,6 +80,8 @@ export interface CompiledFile {
 	unresolved: string[];
 	/** `@event="action:name"` in the template (and its partials), first use of each. */
 	actions: { name: string; line: number }[];
+	/** `@href="/path"` links in the template itself, each checked against the page routes (see `checkLinks`). */
+	links?: { href: string; line: number }[];
 	/** A partial file: the name it is included by. */
 	partial?: string;
 }
@@ -204,6 +218,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 	const partials = new Set<string>();
 	const unresolved = new Set<string>();
 	const actions = new Map<string, number>();
+	const links: { href: string; line: number }[] = [];
 	const scriptNames = scriptDeclarations(result.sfc.scripts);
 	const nodes = result.template?.nodes ?? [];
 	const reads: Reads = collectReads(nodes, {
@@ -220,6 +235,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 		onAction: (name, loc) => {
 			if (!actions.has(name)) actions.set(name, loc.line);
 		},
+		onLink: (href, loc) => void links.push({ href, line: loc.line }),
 	});
 
 	// The block reads too: title holes, data arguments, service paths.
@@ -250,6 +266,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 			partials: [...partials],
 			unresolved: [...unresolved],
 			actions: [...actions].map(([name, line]) => ({ name, line })),
+			...(links.length > 0 ? { links } : {}),
 			...(options.partial !== undefined ? { partial: options.partial } : {}),
 		},
 		tree: { nodes, scriptNames },
@@ -286,7 +303,67 @@ export function compileAll(appDir: string, options: CompileOptions = {}): Compil
 		if (other) throw new PageCompileError(`pages/${page.file}`, 1, `answers ${page.route}, as pages/${other} already does`);
 		routes.set(page.route!, page.file);
 	}
+	checkLinks(compiled);
 	return compiled;
+}
+
+/**
+ * Every `@href` in every file must lead to a page: `@href="/p/{{slug}}"`
+ * needs a page file that answers `/p/:slug` (or `/p/sale`, which a hole may
+ * fill). The value is the URL that ships, so this is the whole router: no
+ * table to keep, and a renamed or deleted page file is an error at compile,
+ * with the file and line of every link that pointed at it. A link to a
+ * route that is not a page file (a controller, a static file, another site)
+ * is a plain `href`.
+ */
+export function checkLinks(files: readonly CompiledFile[]): void {
+	const routes = files.filter((file) => file.kind === "page").map((file) => file.route!);
+	for (const file of files) for (const link of file.links ?? []) {
+		const problem = linkProblem(link.href, routes);
+		if (problem) throw new PageCompileError(`pages/${file.file}`, link.line, `@href="${link.href}" ${problem}`);
+	}
+}
+
+const HOLE_MARK = "\0";
+
+/** Why `href` reaches no route of `routes`, or undefined when one may answer it. */
+export function linkProblem(href: string, routes: readonly string[]): string | undefined {
+	// A hole stands for one value: out of the way while the path is read.
+	const marked = href.replace(HOLE, HOLE_MARK);
+	if (marked.startsWith(HOLE_MARK)) return "starts with data: write the path from /, or use href for a URL that is data";
+	if (/^[a-z][\w+.-]*:|^\/\//i.test(marked)) return "is another site: @href links to a page of this one; use href";
+	if (!marked.startsWith("/")) return "is relative: write the path from /, as the page's route says it";
+	// The router answers /x/ as /x; the query and the hash are the page's own.
+	let path = marked.split(/[?#]/)[0]!;
+	if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+	const segments = path === "/" ? [] : path.slice(1).split("/");
+	const fits = (route: string): boolean => {
+		const want = route === "/" ? [] : route.slice(1).split("/");
+		return (
+			want.length === segments.length &&
+			want.every((part, i) => {
+				const have = segments[i]!;
+				if (have === "") return false;
+				if (part.startsWith(":")) return true;
+				// A hole may fill a fixed segment: /{{section}} may be /about.
+				if (!have.includes(HOLE_MARK)) return safeDecode(have) === part;
+				const pattern = have.split(HOLE_MARK).map((text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".+");
+				return new RegExp(`^${pattern}$`).test(part);
+			})
+		);
+	};
+	if (routes.some(fits)) return undefined;
+	const shown = segments.length === 0 ? "/" : `/${segments.map((part) => (part.includes(HOLE_MARK) ? ":…" : part)).join("/")}`;
+	const near = routes.filter((route) => (route === "/" ? 0 : route.split("/").length - 1) === segments.length);
+	return `matches no page: no file under pages/ answers ${shown}${near.length > 0 ? ` (pages of that depth: ${near.sort().join(", ")})` : ""}`;
+}
+
+function safeDecode(text: string): string {
+	try {
+		return decodeURIComponent(text);
+	} catch {
+		return text;
+	}
 }
 
 /**

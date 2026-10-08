@@ -129,7 +129,8 @@
  *     because removing the old sheet makes the browser build its faces
  *     afresh (tests/navigate.e2e.ts).
  *  4. In one synchronous step (inside a view transition only when
- *     `<html data-natsu-transition>` opts in; a visit overtaken before the
+ *     `<html data-natsu-transition>` or the key's `data-transition` opts in,
+ *     and never under `prefers-reduced-motion`; a visit overtaken before the
  *     transition runs it swaps nothing): `natsu:before-swap`, history,
  *     the head merged by `outerHTML` (only what the server sent: scripts,
  *     nodes a third party added and `<html>` attributes are never touched;
@@ -170,10 +171,21 @@
  * browser taking the touch to pan, or a scroll, cancels it) fetches the part
  * with `Natsu-Prefetch: 1`, two at a time at most, and none on Save-Data or
  * 2G, or when `<meta name="natsu" data-prefetch="off">` says the server
- * refuses them. A click within ten seconds uses the answer: a part, or a
+ * refuses them. A link under `data-natsu-prefetch="viewport"` is fetched
+ * once it is on screen too (an IntersectionObserver, in idle time, not on
+ * 3G, and only while the cache has room, so it never pushes a hover out);
+ * one under `"none"` (or `"off"`) never is. The key's `data-prefetch`
+ * (`"viewport"`, `"none"`) is the default for a link that says nothing. A
+ * click within ten seconds uses the answer: a part, or a
  * redirect or reload, acted on as it is. Any other (a skip, a 404 part) is
  * remembered as no answer for those ten seconds, so hovers stop asking and
- * the click fetches.
+ * the click fetches. Five answers are kept, least recently used out first.
+ *
+ * **Back and Forward** to a page this document swapped in use the part it
+ * was shown from, for ten seconds from when it was asked for: the page comes
+ * back at once. A click always asks again (unless a hover just did); a page
+ * with live data, and an action's answer, are never kept; any submit or
+ * action lets them all go.
  *
  * **The API**, `natsu` (types in `client/types.ts`):
  *
@@ -190,12 +202,16 @@
  *    too) with `detail: { url, regions }`
  *  - attributes: `data-natsu-reload` on a link, form or ancestor for a real
  *    load, and on `<html>` for every visit from this document;
- *    `data-natsu-prefetch` to turn hover prefetch on or off below it
- *    (present is on, `"false"` or `"off"` is off, for both);
+ *    `data-natsu-prefetch` for when links below it are fetched ahead
+ *    (`"viewport"`, `"none"`, else on hover), and `data-natsu-reload`
+ *    (present is on, `"false"`, `"off"` or `"none"` is off);
  *    `data-natsu-once` on a script, `data-natsu-island="<url>"` on an
  *    element whose content comes from that URL after load, and
  *    `<html data-natsu-transition>`. `html[data-natsu-loading]` is set
- *    when a visit takes longer than 300 ms, and cleared by any real load.
+ *    when a visit takes longer than 150 ms, and cleared by any real load;
+ *    it shows `<natsu-bar>`, a 2px bar the runtime adds to the body, styled
+ *    from a constructed sheet in `@layer natsu` (so any page rule wins:
+ *    `natsu-bar { display: none }`, or `--natsu-bar` for its colour).
  *
  * With no key or no region the runtime stays inert: `mount` still works and
  * `visit` is `location.assign`.
@@ -231,7 +247,7 @@ const me = D.currentScript as HTMLScriptElement | null;
 const NONCE = me?.nonce as string;
 const META = D.querySelector<HTMLMetaElement>('meta[name="natsu"]');
 const KEY = META?.content;
-const OFF = /^(false|off)$/;
+const OFF = /^(false|off|none)$/;
 const REGION = "[data-natsu-region][id]";
 const LOADING = "data-natsu-loading";
 const SHEET = "link[rel=stylesheet]";
@@ -260,7 +276,7 @@ const on = (type: string, fn: (e: never) => unknown) => addEventListener(type, f
 /** Every natsu event is on document, bubbling and cancelable. */
 const fire = (name: string, detail: unknown) =>
 	D.dispatchEvent(new CustomEvent("natsu:" + name, { bubbles: true, cancelable: true, detail }));
-/** The nearest `data-natsu-<name>` at or above `el`: present is on, "false" and "off" are off; undefined if none. */
+/** The nearest `data-natsu-<name>` at or above `el`: present is on, "false", "off" and "none" are off; undefined if none. */
 const flag = (el: Element, name: string) => {
 	const v = el.closest(`[data-natsu-${name}]`)?.getAttribute("data-natsu-" + name);
 	return v == null ? v : !OFF.test(v);
@@ -391,11 +407,12 @@ const unbound = () => {
 	return [...listed].some(blind);
 };
 
-let status: HTMLElement | undefined;
+/** What the runtime adds to the body at boot: the title's `role=status`, the loading bar. */
+const extra: Element[] = [];
 const boot = () => {
 	if (!ready) {
 		ready = true;
-		status && D.body.append(status);
+		D.body.append(...extra);
 		mountIn(D.body);
 		// Noted now too: a script page code takes out before the first visit still ran.
 		unbound();
@@ -517,8 +534,21 @@ if (!first) {
 }
 
 if (!first && KEY && regions(D)[0]) {
-	(status = D.createElement("p")).setAttribute("role", "status");
+	const status = D.createElement("p");
+	status.setAttribute("role", "status");
 	status.style.cssText = "position:fixed;clip-path:inset(50%)";
+	// The loading bar, an element no page selector names: styled from a sheet
+	// in a layer of its own, so any rule of the page's (`natsu-bar { display:
+	// none }`) wins over it. A constructed sheet is outside style-src, so it
+	// shows under any CSP.
+	extra.push(status, D.createElement("natsu-bar"));
+	try {
+		const css = new CSSStyleSheet();
+		css.replaceSync(
+			"@layer natsu{natsu-bar{position:fixed;inset:0 0 auto;height:2px;z-index:999999;pointer-events:none;background:var(--natsu-bar,#47f);transform-origin:0;transform:scaleX(0);opacity:0;transition:opacity .2s,transform 0s .2s}[data-natsu-loading] natsu-bar{opacity:1;transform:scaleX(.9);transition:transform 8s ease-out}@media(prefers-reduced-motion:reduce){natsu-bar,[data-natsu-loading] natsu-bar{transition:none}}}"
+		);
+		D.adoptedStyleSheets = [...D.adoptedStyleSheets, css];
+	} catch {}
 
 	/** Head elements the server sent: the only ones a merge may remove. */
 	const owned = new Set([...D.head.children].filter((e) => !e.matches("script")));
@@ -606,7 +636,7 @@ if (!first && KEY && regions(D)[0]) {
 	on("beforeunload", save);
 	on("pagehide", () => {
 		save();
-		cache.clear();
+		clear();
 	});
 	on("popstate", () => {
 		const s = st();
@@ -633,8 +663,8 @@ if (!first && KEY && regions(D)[0]) {
 	/** The page on screen's URL, and what its links resolve against: its `<base href>`, read against it while `away`. */
 	const here = () => (away ? rendered : L.href);
 	const base = () => new URL(D.querySelector("base[href]")?.getAttribute("href") || "", here());
-	const link = (e: Event, click?: 1) => {
-		const a = (e.target as Element).closest?.("a[href]");
+	const link = (t: EventTarget | null, click?: 1) => {
+		const a = (t as Element).closest?.("a[href]");
 		// A link in an editor is not followed: a click there places the caret.
 		if (!(a instanceof HTMLAnchorElement) || a.isContentEditable || other(a.target) || a.hasAttribute("download")) return;
 		const u = new URL(a.getAttribute("href")!, base());
@@ -657,14 +687,14 @@ if (!first && KEY && regions(D)[0]) {
 	// On window, bubbling: after every listener on the document, so one that
 	// called preventDefault always wins.
 	on("click", (e: MouseEvent) => {
-		const a = !(e.defaultPrevented || e.button || (mod = ((e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && e.target) || null)) && link(e, 1);
+		const a = !(e.defaultPrevented || e.button || (mod = ((e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) && e.target) || null)) && link(e.target, 1);
 		if (a) {
 			e.preventDefault();
 			visit(a[1]);
 		}
 	});
 	on("submit", (e: SubmitEvent) => {
-		cache.clear();
+		clear();
 		const form = e.target as HTMLFormElement;
 		const by = e.submitter;
 		const attr = (n: string) => by?.getAttribute("form" + n) ?? form.getAttribute(n);
@@ -697,8 +727,13 @@ if (!first && KEY && regions(D)[0]) {
 	 * a real load from now on, never prefetched.
 	 */
 	const refused = new Set<string>();
-	/** The server's `navigate.prefetch: false`. */
-	const quiet = OFF.test(META!.dataset.prefetch!);
+	/** The server's `navigate.prefetch`: "off" (false) refuses them all, "none" or "viewport" is the default for a link that says nothing. */
+	const quiet = META!.dataset.prefetch == "off";
+	/** A link's prefetch: "" none, "viewport", else "hover". */
+	const pf = (el: Element) => {
+		const v = el.closest("[data-natsu-prefetch]")?.getAttribute("data-natsu-prefetch") ?? META!.dataset.prefetch ?? "";
+		return OFF.test(v) ? "" : v == "viewport" ? v : "hover";
+	};
 	const get = (u: URL, pre?: 1) =>
 		fetch(bare(u), { headers: { "Natsu-Nav": KEY!, ...(pre && { "Natsu-Prefetch": "1" }) } }).then(
 			async (r): Promise<Answer> => (
@@ -706,19 +741,18 @@ if (!first && KEY && regions(D)[0]) {
 				[r, await r.text()]
 			),
 		);
-	/** A cached answer young enough to use, taken out of the cache. */
-	const fresh = (k: string) => {
-		const hit = cache.get(k);
-		cache.delete(k);
+	/** A cached answer young enough to use, taken out of the cache (or out of `kept`). */
+	const fresh = (k: string, m = cache) => {
+		const hit = m.get(k);
+		m.delete(k);
 		return (Date.now() - hit?.t! < 1e4 && hit) as typeof hit;
 	};
 	const prefetch = (url: string | URL) => {
 		const u = new URL(url, L.href);
 		const k = bare(u);
 		const hit = fresh(k);
-		const c = (navigator as { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
 		if (hit) return void cache.set(k, hit); // now the most recently used
-		if (quiet || unsafe() || c?.saveData || /2g/.test(c?.effectiveType!) || flying > 1 || k == bare(L) || u.origin != L.origin || refused.has(u.pathname))
+		if (quiet || unsafe() || slow(/2g/) || flying > 1 || k == bare(L) || u.origin != L.origin || refused.has(u.pathname))
 			return;
 		flying++;
 		cache.set(k, {
@@ -732,18 +766,61 @@ if (!first && KEY && regions(D)[0]) {
 					const x = a[0].headers;
 					if (x.has("natsu-part") ? a[0].status == 200 : !x.has("natsu-prefetch")) return a;
 				}, () => void cache.delete(k))
-				.finally(() => flying--),
+				.finally(() => (flying--, soon())),
 		});
-		if (cache.size > 5) cache.delete([...cache.keys()][0]!);
+		trim(cache);
 	};
+	/**
+	 * The parts of the pages this document showed, for Back and Forward only:
+	 * a page left comes back at once while it is fresh (ten seconds from when
+	 * it was asked for). A click always asks again, unless a hover just did.
+	 */
+	const kept: typeof cache = new Map();
+	const trim = (m: typeof cache) => m.size > 5 && m.delete([...m.keys()][0]!);
+	const clear = () => (cache.clear(), kept.clear());
+	/** Save-Data, or a connection `re` names (2g for any prefetch, 3g too for one in view). */
+	const slow = (re: RegExp) => {
+		const c = (navigator as { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
+		return c?.saveData || re.test(c?.effectiveType!);
+	};
+	// In view: a link with `data-natsu-prefetch="viewport"` (or every link,
+	// when that is the site's default) is fetched once it has been on screen,
+	// in idle time, two at a time, while the cache has room: at most five
+	// parts are kept, and a link in view must not push out the one hovered.
+	const seen = new Set<Element>();
+	let due = 0;
+	const pump = () => {
+		due = 0;
+		for (const [k, v] of cache) Date.now() - v.t < 1e4 || cache.delete(k);
+		for (const a of seen) {
+			if (flying > 1 || cache.size > 4 || slow(/[23]g/)) return;
+			seen.delete(a);
+			io?.unobserve(a);
+			const l = link(a);
+			l && prefetch(l[1]);
+		}
+	};
+	const soon = () => seen.size && !due && (due = 1) && ("requestIdleCallback" in window ? requestIdleCallback : setTimeout)(pump);
+	const io =
+		window.IntersectionObserver &&
+		new IntersectionObserver((es) => {
+			for (const e of es) e.isIntersecting ? seen.add(e.target) : seen.delete(e.target);
+			soon();
+		});
+	if (io)
+		regs.push([
+			META!.dataset.prefetch == "viewport" ? "a[href]" : "[data-natsu-prefetch=viewport] a[href],a[href][data-natsu-prefetch=viewport]",
+			(el, signal) => pf(el) == "viewport" && (io.observe(el), (signal.onabort = () => (io.unobserve(el), seen.delete(el)))),
+			"",
+		]);
 	let over: Element | null | undefined;
 	let dwell: ReturnType<typeof setTimeout>;
 	const intent = (e: Event) => {
-		const a = link(e);
+		const a = link(e.target);
 		if (!a || a[0] == over) return;
 		over = a[0];
 		clearTimeout(dwell);
-		dwell = setTimeout(() => flag(a[0], "prefetch") == false || prefetch(a[1]), 65);
+		dwell = setTimeout(() => pf(a[0]) && prefetch(a[1]), 65);
 	};
 	const forget = () => {
 		clearTimeout(dwell);
@@ -791,12 +868,15 @@ if (!first && KEY && regions(D)[0]) {
 		// the link it holds may be in a region about to go, which it would keep.
 		forget();
 		clearTimeout(timer);
-		timer = setTimeout(() => H.setAttribute(LOADING, ""), 300);
+		timer = setTimeout(() => H.setAttribute(LOADING, ""), 150);
 		const n = ++seq;
 		let a: Answer | undefined;
+		/** When the answer was asked for: one kept for Back and Forward lives ten seconds from then. */
+		let t = Date.now();
+		let hit: ReturnType<typeof fresh>;
 		try {
 			if (o.a) a = await o.a;
-			else if (o.scroll != "keep") a = await fresh(bare(u))?.p;
+			else if (o.scroll != "keep" && (hit = fresh(bare(u)) || ("none" == h ? fresh(bare(u), kept) : undefined))) (t = hit.t), (a = await hit.p);
 			// In hand already (prefetched): the swap would run in the click's own
 			// task and hold its frame back, so it yields first.
 			if (a)
@@ -833,6 +913,8 @@ if (!first && KEY && regions(D)[0]) {
 			const f = new URL(r.url || u);
 			f.hash = u.hash;
 			const doc = new DOMParser().parseFromString(text, "text/html");
+			// Read now: the swap moves the head's elements out of `doc`.
+			const live = doc.querySelector('meta[name="natsu-live"]');
 			// A nonce in the part's head is the real one, and Natsu-Nonce lists the
 			// ones the server vouched for. Those read "" (as a live element shows its
 			// hidden nonce, so the merge sees an unchanged one as unchanged) and
@@ -973,7 +1055,7 @@ if (!first && KEY && regions(D)[0]) {
 				}
 			};
 			if (
-				H.hasAttribute("data-natsu-transition") &&
+				(H.hasAttribute("data-natsu-transition") || META!.hasAttribute("data-transition")) &&
 				D.startViewTransition &&
 				!D.hidden &&
 				!matchMedia("(prefers-reduced-motion: reduce)").matches
@@ -982,6 +1064,12 @@ if (!first && KEY && regions(D)[0]) {
 			else swap();
 			if (n != seq) return;
 			idle();
+			// Kept for Back and Forward. Not an action's answer, and not a page
+			// with live data, which may change while it is not watched.
+			if (!o.a && r.status == 200 && !live) {
+				kept.set(bare(f), { t, p: Promise.resolve(a) });
+				trim(kept);
+			}
 
 			// Mounts allowed here (in the shell too: one a page that did not list
 			// its script stopped), then the scripts this document has not run (one
@@ -1028,7 +1116,7 @@ if (!first && KEY && regions(D)[0]) {
 
 	api.visit = visit;
 	api.refresh = () => visit(L.href, { history: "replace", scroll: "keep" });
-	act = (u, body) => visit(L.href, { history: "replace", scroll: "keep", a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) });
+	act = (u, body) => (clear(), visit(L.href, { history: "replace", scroll: "keep", a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) }));
 	api.prefetch = prefetch;
 }
 // Last, so that a runtime added after load boots with all of the above set up.
