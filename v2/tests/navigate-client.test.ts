@@ -1707,14 +1707,17 @@ describe("events and attributes", () => {
 		expect(p.click("#r2")).toBe(true);
 	});
 
-	test("html[data-natsu-loading] appears after 300 ms and goes at the swap", async () => {
+	test("html[data-natsu-loading] appears after 150 ms and goes at the swap; the loading bar is in the body", async () => {
 		let release!: () => void;
 		const p = open({ html: page(), routes: { "/b": () => new Promise((y) => (release = () => y(answer(part())))) } });
 		const html = p.document.documentElement;
+		// One element, after the page's own, which the page's CSS may restyle or hide.
+		expect(p.document.querySelectorAll("natsu-bar").length).toBe(1);
+		expect(p.document.body.lastElementChild.localName).toBe("natsu-bar");
 		p.click("#to-b");
-		await tick(200);
+		await tick(100);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
-		await tick(150);
+		await tick(100);
 		expect(html.hasAttribute("data-natsu-loading")).toBe(true);
 		release();
 		await settle();
@@ -1794,6 +1797,24 @@ describe("events and attributes", () => {
 		await p.natsu.visit("/c");
 		expect(used).toBe(1);
 		expect(p.document.title).toBe("C");
+	});
+
+	test("the key's data-transition (navigate.transition) turns view transitions on for every page; never under prefers-reduced-motion", async () => {
+		for (const reduce of [false, true]) {
+			const p = open({
+				html: page().replace(`content="k1.s1">`, `content="k1.s1" data-transition>`),
+				routes: { "/b": () => answer(part()) },
+				before: (w) => (w.matchMedia = (q: string) => ({ matches: reduce && /reduce/.test(q) })),
+			});
+			let used = 0;
+			p.document.startViewTransition = (fn: () => void) => {
+				used++;
+				fn();
+				return { updateCallbackDone: Promise.resolve() };
+			};
+			await p.natsu.visit("/b");
+			expect([reduce, used, text(p, "main h1")]).toEqual([reduce, reduce ? 0 : 1, "Page B"]);
+		}
 	});
 
 	test("a visit overtaken during the transition's first frame (a second visit, a Back) swaps nothing, mounts nothing, creates no script", async () => {
@@ -1915,6 +1936,74 @@ describe("history", () => {
 		expect(text(p, "main h1")).toBe("Page B");
 		expect(p.window.scrollY).toBe(2000);
 		expect(p.loads).toEqual([]);
+	});
+
+	test("Back and Forward to a page this document swapped in reuse its part for ten seconds; a click asks again; a live page is asked again", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/b": () => answer(part()),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>" })),
+				"/live": () => answer(part({ title: "L", main: "<h1>Live</h1>", head: `<meta name="natsu-live" content="t|sig">` })),
+			},
+			before: (w) =>
+				(w.WebSocket = class {
+					send() {}
+				}),
+		});
+		p.click("#to-b");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c"]);
+		p.window.history.back();
+		await settle();
+		expect([path(p), text(p, "main h1")]).toEqual(["/b", "Page B"]);
+		p.window.history.forward();
+		await settle();
+		expect([path(p), text(p, "main h1")]).toEqual(["/c", "Page C"]);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c"]);
+		// A click is a new visit: asked again, whatever is kept.
+		p.click("#to-b");
+		await settle();
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c", "/b"]);
+		// Ten seconds after /c was asked for, Back asks again.
+		const D = p.window.Date;
+		const now = D.now;
+		try {
+			const at = now();
+			D.now = () => at + 10_001;
+			p.window.history.back();
+			await settle();
+		} finally {
+			D.now = now;
+		}
+		expect([path(p), text(p, "main h1")]).toEqual(["/c", "Page C"]);
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c", "/b", "/c"]);
+		// A page with live data is never kept: it may have changed while it was not watched.
+		await p.natsu.visit("/live");
+		p.window.history.back();
+		await settle();
+		p.window.history.forward();
+		await settle();
+		expect(text(p, "main h1")).toBe("Live");
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c", "/b", "/c", "/live", "/live"]);
+		expect(p.loads).toEqual([]);
+	});
+
+	test("any submit lets go of the kept parts", async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<form id="f" action="/c"><input name="q" value="1"></form>` }),
+			routes: { "/b": () => answer(part()), "/c?q=1": () => answer(part({ title: "C" })) },
+		});
+		p.click("#to-b");
+		await settle();
+		p.submit("#f");
+		await settle();
+		p.window.history.back();
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/c?q=1", "/b"]);
 	});
 
 	const anchors = `<h1>Page A</h1><a id="jump" href="#results">results</a><div class="tall"></div><div id="results">r</div>`;
@@ -2510,13 +2599,15 @@ describe("prefetch", () => {
 		await p.natsu.visit("/b");
 		await p.natsu.visit("/c");
 		expect(p.calls.slice(before).map((c) => c.url)).toEqual(["/c"]);
-		const now = Date.now;
+		// The runtime reads the window's Date, which happy-dom keeps apart from Bun's.
+		const D = p.window.Date;
+		const now = D.now;
 		try {
 			const at = now();
-			Date.now = () => at + 10_001;
+			D.now = () => at + 10_001;
 			await p.natsu.visit("/d");
 		} finally {
-			Date.now = now;
+			D.now = now;
 		}
 		expect(p.calls.slice(before).map((c) => c.url)).toEqual(["/c", "/d"]);
 	});
@@ -2536,6 +2627,152 @@ describe("prefetch", () => {
 		p.window.dispatchEvent(new p.window.Event("pagehide"));
 		await p.natsu.visit("/c");
 		expect(p.calls.map((c) => c.url)).toEqual(["/b", "/b", "/c", "/c"]);
+	});
+});
+
+describe("prefetch in view and per link", () => {
+	/** An IntersectionObserver the test drives: `show(el)` puts a link on screen, `hide(el)` takes it off. */
+	class FakeIO {
+		static last: FakeIO;
+		observed = new Set<Element>();
+		constructor(private cb: (entries: { target: Element; isIntersecting: boolean }[]) => void) {
+			FakeIO.last = this;
+		}
+		observe(el: Element) {
+			this.observed.add(el);
+		}
+		unobserve(el: Element) {
+			this.observed.delete(el);
+		}
+		show(...els: Element[]) {
+			this.cb(els.map((target) => ({ target, isIntersecting: true })));
+		}
+		hide(...els: Element[]) {
+			this.cb(els.map((target) => ({ target, isIntersecting: false })));
+		}
+	}
+	const withIO = (w: W) => (w.IntersectionObserver = FakeIO);
+	const ids = () => [...FakeIO.last.observed].map((el) => el.id).sort();
+	const hover = (p: Opened, sel: string) =>
+		p.document.querySelector(sel).dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
+	const prefetches = (p: Opened) => p.calls.filter((c) => c.headers["Natsu-Prefetch"]).map((c) => c.url);
+	const $ = (p: Opened, sel: string) => p.document.querySelector(sel);
+	const viewport = (html: string, mode = "viewport") => html.replace(`content="k1.s1">`, `content="k1.s1" data-prefetch="${mode}">`);
+
+	test('data-natsu-prefetch="viewport": fetched once on screen, in idle time, once; the click uses it', async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<a id="v" href="/v" data-natsu-prefetch="viewport">v</a>` }),
+			routes: { "/v": () => answer(part({ title: "V" })) },
+			before: withIO,
+		});
+		expect(ids()).toEqual(["v"]);
+		await tick(30);
+		expect(p.calls).toEqual([]);
+		FakeIO.last.show($(p, "#v"));
+		await until(() => p.calls.length);
+		await p.prefetched();
+		expect(p.calls).toEqual([{ url: "/v", headers: { "Natsu-Nav": "k1.s1", "Natsu-Prefetch": "1" } }]);
+		expect(ids()).toEqual([]);
+		p.click("#v");
+		await settle();
+		expect(p.calls.length).toBe(1);
+		expect(p.document.title).toBe("V");
+	});
+
+	test("a link that leaves the screen before idle time is not fetched", async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<a id="v" href="/v" data-natsu-prefetch="viewport">v</a>` }),
+			routes: { "/v": () => answer(part()) },
+			before: withIO,
+		});
+		FakeIO.last.show($(p, "#v"));
+		FakeIO.last.hide($(p, "#v"));
+		await settle();
+		expect(p.calls).toEqual([]);
+		expect(ids()).toEqual(["v"]);
+	});
+
+	test('the site default (key data-prefetch="viewport"): every link is watched but those under data-natsu-prefetch="none"; swapped regions are watched and let go', async () => {
+		const p = open({
+			html: viewport(page({ shell: LINKS + `<nav data-natsu-prefetch="none"><a id="n" href="/n">n</a></nav>`, main: `<h1>A</h1><a id="m" href="/m">m</a>` })),
+			routes: { "/b": () => answer(part({ main: `<h1>B</h1><a id="m2" href="/m2">m2</a>` })) },
+			before: withIO,
+		});
+		expect(ids()).toEqual(["m", "to-b", "to-c"]);
+		// Hover still prefetches a link that is not off; never one that is.
+		hover(p, "#to-b");
+		await until(() => p.calls.length);
+		await p.prefetched();
+		expect(prefetches(p)).toEqual(["/b"]);
+		hover(p, "#n");
+		await tick(90);
+		expect(prefetches(p)).toEqual(["/b"]);
+		await p.natsu.visit("/b");
+		expect(text(p, "main h1")).toBe("B");
+		expect(ids()).toEqual(["m2", "to-b", "to-c"]);
+	});
+
+	test("links in view: two at a time, and no more than the cache keeps (five), so a hover is never pushed out", async () => {
+		const xs = "vwxyzqr".split("");
+		const links = xs.map((x) => `<a id="${x}" href="/${x}" data-natsu-prefetch="viewport">${x}</a>`).join("");
+		const routes: Record<string, Route> = {};
+		let now = 0;
+		let most = 0;
+		for (const x of xs)
+			routes[`/${x}`] = async () => {
+				most = Math.max(most, ++now);
+				await tick(5);
+				now--;
+				return answer(part({ title: x }));
+			};
+		const p = open({ html: page({ shell: LINKS + links }), routes, before: withIO });
+		FakeIO.last.show(...p.document.querySelectorAll("[data-natsu-prefetch]"));
+		await until(() => p.calls.length >= 5);
+		await p.prefetched();
+		await settle();
+		expect(prefetches(p)).toEqual(["/v", "/w", "/x", "/y", "/z"]);
+		expect(most).toBeLessThanOrEqual(2);
+		// The two left wait in view, and are not fetched while the cache is full.
+		expect(ids()).toEqual(["q", "r"]);
+	});
+
+	test("Save-Data or a 3g connection: nothing is fetched for being in view; a hover on 3g still is", async () => {
+		for (const connection of [{ saveData: true }, { effectiveType: "3g" }] as { saveData?: boolean; effectiveType?: string }[]) {
+			const p = open({
+				html: page({ shell: LINKS + `<a id="v" href="/v" data-natsu-prefetch="viewport">v</a>` }),
+				routes: { "/v": () => answer(part()) },
+				before: (w) => (withIO(w), Object.defineProperty(w.navigator, "connection", { value: connection, configurable: true })),
+			});
+			FakeIO.last.show($(p, "#v"));
+			await settle();
+			expect([connection, p.calls]).toEqual([connection, []]);
+			hover(p, "#v");
+			await tick(90);
+			await p.prefetched();
+			expect([connection, prefetches(p)]).toEqual([connection, connection.saveData ? [] : ["/v"]]);
+		}
+	});
+
+	test('data-natsu-prefetch="none" on a link: no hover prefetch; with the key\'s data-prefetch="none", only a link that asks is prefetched', async () => {
+		const p = open({ html: page({ shell: LINKS + `<a id="x" href="/x" data-natsu-prefetch="none">x</a>` }), routes: { "/x": () => answer(part()) } });
+		hover(p, "#x");
+		await tick(90);
+		expect(p.calls).toEqual([]);
+		const q = open({
+			html: viewport(page({ shell: LINKS + `<a id="h" href="/h" data-natsu-prefetch="hover">h</a>` }), "none"),
+			routes: { "/b": () => answer(part()), "/h": () => answer(part()) },
+		});
+		hover(q, "#to-b");
+		await tick(90);
+		expect(q.calls).toEqual([]);
+		hover(q, "#h");
+		await until(() => q.calls.length);
+		await q.prefetched();
+		expect(prefetches(q)).toEqual(["/h"]);
+		// natsu.prefetch() is the app's own call: it still fetches.
+		q.natsu.prefetch("/b");
+		await q.prefetched();
+		expect(prefetches(q)).toEqual(["/h", "/b"]);
 	});
 });
 
@@ -2811,8 +3048,10 @@ describe("live data", () => {
 });
 
 describe("size", () => {
-	test("the minified runtime, actions and live data included, stays within 5 KiB of brotli", () => {
+	// 5 KiB until the loading bar, prefetch in view and the Back/Forward cache
+	// (about 600 bytes together); raise it only with a note of what it bought.
+	test("the minified runtime, actions, live data, the loading bar and prefetch in view included, stays within 5.5 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(5120);
+		expect(br).toBeLessThanOrEqual(5632);
 	});
 });

@@ -329,11 +329,17 @@ Forward loads the page for real), `natsu:before-swap`, and `natsu:load`,
 once per page shown, at boot too, with `detail: { url, regions }`.
 Attributes: `data-natsu-reload` (a real load for a link, a form or
 everything inside; on `<html>`, for every visit from that document),
-`data-natsu-prefetch` (hover prefetch below it), both on when present and
-off when `"false"` or `"off"`; `data-natsu-once`;
-`data-natsu-island="<url>"`; and `<html data-natsu-transition>` for a view
-transition. While a visit takes longer than 300 ms, `<html>` carries
-`data-natsu-loading`, which any full load clears.
+on when present and off when `"false"`, `"off"` or `"none"`;
+`data-natsu-prefetch` (`"hover"` by default, `"viewport"` to fetch links
+once on screen, `"none"`; `navigate.prefetch` sets the site's default);
+`data-natsu-once`; `data-natsu-island="<url>"`; and
+`<html data-natsu-transition>` (or `navigate.transition` for every page) for
+a view transition, never under reduced motion. While a visit takes longer
+than 150 ms, `<html>` carries `data-natsu-loading`, which any full load
+clears, and the runtime's `<natsu-bar>` shows a thin bar the page may
+restyle or hide. Back and Forward to a page the tab swapped in reuse its
+part for ten seconds. In page files, `@href="/p/{{slug}}"` is checked
+against the page routes at compile.
 
 `bun run test:e2e` drives Chromium against a natsu app built for it
 (`tests/fixtures/navigate/app.ts`: Assets with `navigate: true`, PageCache,

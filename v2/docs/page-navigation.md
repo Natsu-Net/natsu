@@ -135,13 +135,62 @@ Attributes:
 | Attribute | Effect |
 | --- | --- |
 | `data-natsu-reload` on a link, a form or any ancestor | always a real load; on `<html>`, for every visit from that page |
-| `data-natsu-prefetch="off"` on a link or any ancestor | no hover prefetch below it |
+| `data-natsu-prefetch` on a link or any ancestor | when links below it are fetched ahead: `"hover"` (the default), `"viewport"`, `"none"` (see Prefetch) |
 | `data-natsu-once` on a script | needs no mount (see above) |
 | `data-natsu-island="/url"` | fill the element from an island route (below) |
-| `data-natsu-transition` on `<html>` | swap inside a view transition |
+| `data-natsu-transition` on `<html>` | swap inside a view transition (or `navigate.transition` for every page) |
 
-While a visit takes longer than 300 ms, `<html>` carries
-`data-natsu-loading`: style a progress bar on it.
+## Prefetch
+
+A link is fetched ahead of its click, so the click swaps at once. When:
+
+| `data-natsu-prefetch` | Fetched |
+| --- | --- |
+| `"hover"`, or nothing | when a pointer rests 65 ms on the link (a finger too) |
+| `"viewport"` | once the link is on screen, in idle time; and on hover |
+| `"none"` (or `"off"`) | never |
+
+The attribute counts on the link or any ancestor, so a whole menu says it
+once: `<nav data-natsu-prefetch="viewport">`. `navigate.prefetch` sets what
+a link that says nothing gets, for the whole site (below).
+
+What is fetched ahead is a part, with `Natsu-Prefetch: 1`, which a route can
+refuse (`navigable(h, { prefetch: false })`, `ctx.nav.skip()`). A click within
+ten seconds uses it. Two are fetched at a time and five kept, so links in
+view stop being fetched once five answers are waiting: they never push out
+the one a pointer is resting on. Nothing is fetched ahead on Save-Data or a
+2G connection, and nothing for being in view on 3G either.
+
+## Back and Forward
+
+Back or Forward to a page this tab swapped in shows it at once from the part
+it was shown from, for ten seconds after that part was asked for; later, it
+is asked again. A click on a link always asks again (unless a hover just
+fetched it). A page with live data is never kept, since it may have changed
+while nothing watched it, and any submit or action lets every kept part go.
+
+## Loading bar
+
+While a visit takes longer than 150 ms, `<html>` carries
+`data-natsu-loading`, and a 2px bar shows at the top: `<natsu-bar>`, an
+element the runtime adds to the body. Its default style lives in
+`@layer natsu`, so any rule of yours wins:
+
+```css
+natsu-bar { --natsu-bar: rebeccapurple; height: 3px; } /* restyle */
+natsu-bar { display: none; }                          /* or turn it off */
+```
+
+It grows without a step and fades out when the page is in; under
+`prefers-reduced-motion` it only appears and goes. The style comes from a
+constructed stylesheet, which a `style-src` CSP does not block.
+
+## View transitions
+
+Off by default. `navigate: { transition: true }` swaps every page inside a
+view transition, as `<html data-natsu-transition>` does on the pages that
+carry it; style it with the usual `::view-transition-*` rules. A visitor who
+prefers reduced motion never gets one, nor does a tab in the background.
 
 ## Islands
 
@@ -163,6 +212,39 @@ only from an answer that says `Natsu-Island: 1` back, which only an
 `island()` route sends; any other route is refused before its handler runs.
 Islands are fetched from your own site only. If your pages show HTML your
 users wrote, strip `data-natsu-*` attributes from it in your sanitizer.
+
+## Links in page files
+
+In a page file (`pages/**/*.uwu`), write links to other pages with uwu's
+`@href`. The value is the URL as it ships, holes and all:
+
+```html
+{{#each products}}
+  <a @href="/p/{{vendor}}/{{slug}}" data-natsu-prefetch="viewport">{{name}}</a>
+{{/each}}
+```
+
+It is drawn as a plain `<a href="/p/acme/shoe">` (with uwu's `data-uwu-link`
+marker), so it works without script, can be opened in a new tab, and is
+what a crawler sees. natsu checks it when it compiles the pages: some page
+file must answer the path (here `pages/p/[vendor]/[slug].uwu`). Each hole
+stands for one value, so it fits a `[param]` or a fixed segment; the query
+and the hash are free, and a trailing slash is fine. A link no page
+answers stops the compile (and `compilePages` for a deploy) with its file
+and line:
+
+```
+pages/index.uwu:12: @href="/prodcuts/{{slug}}" matches no page: no file under pages/ answers /prodcuts/:… (pages of that depth: /jobs/:id, /p/:slug)
+```
+
+so renaming or deleting a page file shows every link that pointed at it.
+The holes are data the page reads like any other: inside the each above,
+the `products` source is asked for `vendor` and `slug`.
+
+A link to something that is not a page file (a controller route, a file,
+another site) is a plain `href`; it swaps all the same when its route is
+`navigable()`. `@href` must start with `/`: a link whose whole URL is data
+cannot be checked, so it is a plain `href` too.
 
 ## Content-Security-Policy
 
@@ -216,7 +298,9 @@ false and do nothing, and `shown` runs at once.
 
 ```ts
 navigate: {
-  prefetch: false,                       // no hover or touch prefetch anywhere
+  prefetch: "viewport",                  // links in view too ("hover" is the default, "none" only links that ask)
+  // prefetch: false,                    // none at all, and the server refuses any that comes
+  transition: true,                      // every swap inside a view transition
   inject: false,                         // link assets.url("natsu-navigate") yourself
   documentHeaders: ["x-frame-options"],  // more headers a page must share to swap
 }

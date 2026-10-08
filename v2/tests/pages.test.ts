@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import * as natsu from "../index.ts";
 import { Assets } from "../src/assets.ts";
 import { splitPageBlock } from "../src/pages/block.ts";
-import { compilePageFile, compilePages, routeOf } from "../src/pages/compile.ts";
+import { compilePageFile, compilePages, linkProblem, routeOf } from "../src/pages/compile.ts";
 import { clearSources, defaultKind, registerModelResolver, source } from "../src/pages/data.ts";
 import { Forbidden, NotFound, PageCompileError } from "../src/pages/errors.ts";
 import { type PagesOptions, type PageSite, mountPages } from "../src/pages/mount.ts";
@@ -133,6 +133,50 @@ describe("routes from files", () => {
 		expect(html).toContain("<title>P-x</title>");
 		expect(html).toMatch(/<h1 data-uwu-c-[0-9a-f]+="">P-x<\/h1>/);
 		expect(html).toMatch(/<style>h1\[data-uwu-c-/);
+	});
+});
+
+describe("links (@href)", () => {
+	test("@href draws a plain href and reads its holes as data: inside an each, the item's fields", async () => {
+		let asked: string[] = [];
+		source("products", ({ fields }) => ((asked = fields), [{ vendor: "acme", slug: "shoe", name: "Shoe" }]));
+		const { get } = await serve({
+			"index.uwu": `<template>{{#each products}}<a @href="/p/{{vendor}}/{{slug}}?from=home#top">{{name}}</a>{{/each}}</template>`,
+			"p/[vendor]/[slug].uwu": `<template>{{params.slug}}</template>`,
+		});
+		expect(await (await get("/")).text()).toBe(`<a href="/p/acme/shoe?from=home#top" data-uwu-link>Shoe</a>`);
+		expect(asked).toEqual(["name", "slug", "vendor"]);
+	});
+
+	test("an @href no page answers fails at compile, naming the file and line; so does one in a layout, the error page or a partial", async () => {
+		const cases: [Record<string, string>, RegExp][] = [
+			[{ "index.uwu": `<template>\n<p>\n<a @href="/jobz/{{id}}">x</a></p></template>` }, /pages\/index.uwu:3: @href="\/jobz\/\{\{id\}\}" matches no page: no file under pages\/ answers \/jobz\/:…/],
+			[{ "_layout.uwu": `<template><a @href="/abuot">x</a>{{> @child}}</template>` }, /pages\/_layout.uwu:1: @href="\/abuot" matches no page.*pages of that depth: \/about, \/jobs/],
+			[{ "_error.uwu": `<template><a @href="/home">home</a></template>` }, /pages\/_error.uwu:1: @href="\/home" matches no page/],
+			[{ "_partials/card.uwu": `<template><a @href="/p/{{a}}/{{b}}">x</a></template>` }, /pages\/_partials\/card.uwu:1: @href="\/p\/\{\{a\}\}\/\{\{b\}\}" matches no page/],
+			[{ "index.uwu": `<template><a @href="about">x</a></template>` }, /is relative: write the path from \//],
+			[{ "index.uwu": `<template><a @href="https://example.com/">x</a></template>` }, /is another site/],
+			[{ "index.uwu": `<template><a @href="{{url}}">x</a></template>` }, /starts with data/],
+		];
+		for (const [files, error] of cases) {
+			rmSync(join(dir, "pages"), { recursive: true, force: true });
+			write({ "about.uwu": `<template>about</template>`, "jobs/index.uwu": `<template>jobs</template>`, "p/[slug].uwu": `<template>p</template>`, ...files });
+			await expect(mountPages({ dir })).rejects.toThrow(error);
+			expect(() => compilePages(dir, join(dir, "build"))).toThrow(PageCompileError);
+		}
+	});
+
+	test("what a page route takes: params, a hole for a fixed segment, a trailing slash, a query and a hash; percent-escapes", () => {
+		const routes = ["/", "/about", "/jobs", "/p/:slug", "/p/:vendor/:slug", "/café"];
+		for (const href of ["/", "/?sort={{s}}", "/#top", "/about", "/about/", "/{{section}}", "/p/{{slug}}", "/p/fixed", "/p/{{v}}/{{s}}", "/p/x-{{s}}", "/jobs?page={{n}}", "/caf%C3%A9"])
+			expect([href, linkProblem(href, routes)]).toEqual([href, undefined]);
+		for (const href of ["/nope", "/p", "/p/{{a}}/{{b}}/{{c}}", "/about/team", "//cdn.test/x", "mailto:a@b.c", "/a//b"])
+			expect([href, typeof linkProblem(href, routes)]).toEqual([href, "string"]);
+	});
+
+	test("a link to a route that is not a page file stays a plain href, unchecked", async () => {
+		const { get } = await serve({ "index.uwu": `<template><a href="/api/feed">feed</a></template>` });
+		expect(await (await get("/")).text()).toBe(`<a href="/api/feed">feed</a>`);
 	});
 });
 

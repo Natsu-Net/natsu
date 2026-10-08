@@ -7,9 +7,9 @@
 </head>
 <body>
 <header>
-  <a href="/">Jobs</a>
-  <a href="/board">Board</a>
-  {{#each categories}}<a href="/?category={{slug}}">{{name}}</a>{{/each}}
+  <a @href="/">Jobs</a>
+  <a @href="/board" data-natsu-prefetch="viewport">Board</a>
+  {{#each categories}}<a @href="/?category={{slug}}">{{name}}</a>{{/each}}
   {{#if viewer}}<span>Hi {{viewer.name}}</span>{{#else}}<a href="/login">Sign in</a>{{/if}}
 </header>
 <main id="main" data-natsu-region>{{> @child}}</main>

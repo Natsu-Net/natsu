@@ -1101,6 +1101,23 @@ describe("delivery", () => {
 		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}" data-prefetch="off">`);
 	});
 
+	test("prefetch: viewport or none, and transition: true, are said on the key; the server still answers prefetches", async () => {
+		const calls = route("/p");
+		for (const [navigate, attributes] of [
+			[{ prefetch: "viewport" }, ' data-prefetch="viewport"'],
+			[{ prefetch: "none", transition: true }, ' data-prefetch="none" data-transition'],
+			[{ prefetch: "hover" }, ""],
+			[{ transition: true }, " data-transition"],
+		] as const) {
+			const { app } = await pipeline({ navigate });
+			const html = await (await get(app, "/p")).text();
+			expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"${attributes}>`);
+			calls.count = 0;
+			const prefetch = await nav(app, "/p", metaKey(html), { "natsu-prefetch": "1" });
+			expect([navigate, prefetch.headers.get("natsu-part"), calls.count]).toEqual([navigate, "1", 1]);
+		}
+	});
+
 	test("the runtime is a classic script served from the chunk path, immutable", async () => {
 		const { assets, app } = await pipeline();
 		const answer = await get(app, assets.url("natsu-navigate"));
@@ -1115,7 +1132,8 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5120);
+		// 5.5 KiB: see the size test in navigate-client.test.ts for what the last 512 bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5632);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {
