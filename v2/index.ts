@@ -49,6 +49,7 @@ export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, Redirect, ac
 export type {
 	ActionHandler,
 	ActionInput,
+	FormState,
 	ActionOptions,
 	ActionResult,
 	AuthRule,

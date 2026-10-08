@@ -236,7 +236,7 @@ type Reg = [string, (el: Element, signal: AbortSignal) => unknown, string];
 type Mounted = Element & { natsu?: Set<Reg> };
 type Answer = [Response, string];
 /** `a`: the answer already on its way (an action's post), used instead of a GET. */
-type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer> };
+type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer>; k?: () => void };
 
 const D = document;
 const H = D.documentElement;
@@ -459,7 +459,7 @@ const send = (url: string, body: FormData | URLSearchParams, key?: string) =>
  * `act(url, body)` runs the post and redraws the page; `key` is the
  * document key (forms go by the browser without one).
  */
-const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParams) => unknown, key?: string) =>
+const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParams, k?: () => void) => unknown, key?: string) =>
 	regs.push([
 		"[data-uwu-action]",
 		(el, signal) => {
@@ -480,7 +480,7 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 					el.setAttribute("aria-busy", "true");
 					acting++;
 					try {
-						await act(to, [...fd.values()].some((v) => typeof v != "string") ? fd : new URLSearchParams(fd as unknown as string[][]));
+						await act(to, [...fd.values()].some((v) => typeof v != "string") ? fd : new URLSearchParams(fd as unknown as string[][]), form ? typed(form) : undefined);
 					} finally {
 						acting--;
 						el.removeAttribute("aria-busy");
@@ -491,6 +491,24 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 		},
 		"",
 	]);
+
+/** Fields a visitor types in or picks (not hidden, a password or a file). */
+const FIELDS = "input:not([type=hidden],[type=password],[type=file],[type=submit],[type=button]),textarea,select";
+/**
+ * What was typed in a form, and how to put it back in the form of the same
+ * action once a refusal has drawn the page again: whatever the server wrote
+ * in its fields, the visitor's own text is what they fix.
+ */
+const typed = (form: HTMLFormElement) => {
+	const sel = `form[data-uwu-action="${CSS.escape(form.dataset.uwuAction!)}"]`;
+	const i = [...D.querySelectorAll(sel)].indexOf(form);
+	const of = (f?: Element) => (f ? [...f.querySelectorAll<HTMLInputElement>(FIELDS)] : []);
+	const was = of(form).map((e) => [e.value, e.checked] as const);
+	return () => {
+		const now = of(D.querySelectorAll(sel)[i]);
+		if (now.length == was.length) now.forEach((e, n) => ((e.value = was[n]![0]), (e.checked = was[n]![1])));
+	};
+};
 
 /** Watch the page's live tags; `refresh` redraws it. */
 const watchLive = (refresh: () => unknown) => {
@@ -526,10 +544,10 @@ const watchLive = (refresh: () => unknown) => {
 };
 
 /** An action's post, and the page drawn again: without a key, a reload once it is done (a page with one swaps instead). */
-let act = (u: string, body: FormData | URLSearchParams): Promise<unknown> =>
+let act = (u: string, body: FormData | URLSearchParams, _k?: () => void): Promise<unknown> =>
 	send(u, body).then((r) => (r.url && r.url != L.href ? L.assign(r.url) : L.reload()));
 if (!first) {
-	actions(regs, (u, body) => act(u, body), KEY && regions(D)[0] ? KEY : undefined);
+	actions(regs, (u, body, k) => act(u, body, k), KEY && regions(D)[0] ? KEY : undefined);
 	watchLive(() => api.refresh());
 }
 
@@ -1040,6 +1058,8 @@ if (!first && KEY && regions(D)[0]) {
 					unmount(el);
 					el.replaceWith(next[i]!);
 				});
+				// A refused form: what the visitor typed is put back.
+				r.status == 422 && o.k?.();
 				const s = o.scroll;
 				if (s == "keep") fid && D.getElementById(fid)?.focus(QUIET);
 				else {
@@ -1116,7 +1136,7 @@ if (!first && KEY && regions(D)[0]) {
 
 	api.visit = visit;
 	api.refresh = () => visit(L.href, { history: "replace", scroll: "keep" });
-	act = (u, body) => (clear(), visit(L.href, { history: "replace", scroll: "keep", a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) }));
+	act = (u, body, k) => (clear(), visit(L.href, { history: "replace", scroll: "keep", k, a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) }));
 	api.prefetch = prefetch;
 }
 // Last, so that a runtime added after load boots with all of the above set up.
