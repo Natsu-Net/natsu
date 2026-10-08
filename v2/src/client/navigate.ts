@@ -34,14 +34,18 @@
  * It runs the function now on every match, and later on every match inside
  * a region swapped in, but only while the page shown lists the script that
  * registered it (two pages' scripts may share a selector). Swapping a region
- * out aborts `signal` and calls what the function returned; so does any
- * later swap for an element page code took out of the document. Elements in
- * the shell are mounted once.
+ * out aborts `signal` and calls what the function returned, for an element
+ * page code moved out of it too (a portal to `<body>`); so does any later
+ * swap for an element page code took out of the document. Elements in the
+ * shell are mounted once, and stopped when a page that does not list the
+ * script is shown.
  *
  * **Which scripts allow a swap.** Every script this document runs counts:
  * inline, module, `defer` or `async`, in the head or the body, the ones a
  * swap appends, and one a loader adds at any time (the document's scripts
- * are read again as each visit starts). It is swap-safe once it has called
+ * are read as the runtime runs, at DOMContentLoaded, as each visit starts
+ * and after the new regions' mounts, so one that takes its tag out still
+ * counts). It is swap-safe once it has called
  * `mount`, at any time (the script is `document.currentScript`, or for a
  * module or a call made later the one the stack names). Any other makes
  * every later visit a real load, so an unconverted page behaves exactly as
@@ -49,30 +53,34 @@
  * called `mount` once it has run gets its page loaded for real, since it may
  * be waiting for a `DOMContentLoaded` that never comes again. One a swap
  * created counts once it has run: a visit that starts while it still loads
- * (Back, pressed at once) stays a swap. Left out: this
+ * (Back, pressed at once) stays a swap, and one to a page that lists it
+ * waits for it. Left out: this
  * runtime, a tag with `data-natsu-once`, data blocks, `nomodule` and any
  * other type the browser does not run, and a classic head script that
  * blocks the parser. A head script runs once per document, as the shell
- * does, and its mounts apply on every page, whatever the page lists. A
+ * does, and its mounts apply on every page, whatever the page lists; so do
+ * those of a script a loader created, which no page lists. A
  * script that calls `mount` must run after this one: `defer`, as Assets
  * emits them.
  *
  * **Which clicks.** A plain left click on a link to this site, and the
  * submit of a GET form. Left to the browser: a click with a modifier (on a
  * submit button too: it opens a tab or a window), a target other than
- * `_self` (the element's own, else `<base target>`), `download`, a file
+ * `_self` (the element's own, else the first `<base target>`), `download`, a file
  * (an extension other than `.html`), a link inside an editor
  * (`contenteditable`), `data-natsu-reload`, and a form whose
  * `accept-charset` is not UTF-8. A link to the page shown with a hash is
- * the browser's own jump. While a Back or Forward to another page is on
- * its way, a link or form is read against the page still on screen.
+ * the browser's own jump. A form with no action goes to the page's own
+ * URL, and one with no field to send to `action?`. While a Back or Forward
+ * to another page is on its way, a link or form is read against the page
+ * still on screen (and its `<base href>`).
  *
  * **The wire format.** The request is a GET carrying
  * `Natsu-Nav: <doc>.<shell>` (and `Natsu-Prefetch: 1` for a hover). The
  * answers:
  *
  *  - a **part**: the page's own status, `Natsu-Part: 1`, and a small HTML
- *    document: the page's head with no scripts, then its regions in order.
+ *    document: the page's head with no scripts, then its regions in order, with no `<noscript>`.
  *    Nothing in that markup is trusted. Its scripts come in
  *    `Natsu-Scripts`: one entry per tag, space-separated, each the tag's
  *    attributes URL-encoded (`src=%2F_a%2Fb.js&defer=&nonce=`); the `src`
@@ -151,8 +159,12 @@
  * Each page shown is numbered, and every entry made from it carries the
  * number: the browser's own entry for a hash link gets it at its popstate.
  * A popstate to an entry with the number on screen is a scroll (to where the
- * entry was, else to its hash target); any other is a visit. Back or Forward
- * ends any visit on its way.
+ * entry was, else to its hash target); any other is a visit. An entry a
+ * script pushed with no state of ours gets an id of its own at its first
+ * scroll. Back or Forward ends any visit on its way; a hash link's own jump
+ * does not, as a browser lets a load go on past it. A page restored from
+ * the back/forward cache while a Back or Forward was on its way loads the
+ * URL in the address bar for real.
  *
  * **Prefetch.** A pointer that rests 65 ms on a link (a finger too: the
  * browser taking the touch to pan, or a scroll, cancels it) fetches the part
@@ -167,8 +179,11 @@
  *
  *  - `mount<E>(selector, (el: E, signal) => cleanup?)`
  *  - `visit(url, { history?: "push" | "replace" | "none", scroll?: "top" | "keep" | y })`
- *  - `refresh()`: this page again, scroll and focus kept (after an action)
- *  - `prefetch(url)`, and `island(el)` to fetch an island again
+ *  - `refresh()`: this page again, scroll and focus kept (after an action);
+ *    when the server answers with a real load, `location.reload()`, and a
+ *    redirect shows its page from the top, as a reload that redirects does
+ *  - `prefetch(url)`, and `island(el)` to fetch an island again (only the
+ *    latest fetch's answer goes in)
  *  - events on `document`: `natsu:visit` (cancelable: the visit does not
  *    happen, and on Back or Forward the page loads for real),
  *    `natsu:before-swap`, and `natsu:load`, once per page shown (at boot
