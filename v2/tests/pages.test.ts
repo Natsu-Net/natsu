@@ -878,6 +878,49 @@ describe("page switching", () => {
 	});
 });
 
+describe("page switching, off", () => {
+	test('<page navigate="off">: a soft visit is told to load it for real, and nothing runs; its forms still post', async () => {
+		writeFileSync(join(dir, "site.css"), "body { margin: 0; }");
+		const assets = new Assets({ outDir: join(dir, "out"), styles: { site: [join(dir, "site.css")] }, navigate: true });
+		await assets.build();
+		let loads = 0;
+		let posts = 0;
+		source("secret", () => ++loads);
+		natsu.action("t.press", () => {
+			posts++;
+		});
+		const layout = `<template><!doctype html><html><head><meta charset="utf-8">{{{page.head}}}</head><body><main id="main" data-natsu-region>{{> @child}}</main></body></html></template>`;
+		const { get } = await serve(
+			{
+				"_layout.uwu": layout,
+				"index.uwu": `<template><h1>Home</h1></template>`,
+				"secret.uwu": `<page navigate="off" cache="off"><action press="t.press"></page><template><h1>{{secret}}</h1><form @submit="action:press"><button>go</button></form></template>`,
+			},
+			{ assets },
+			(app) => app.use(assets.middleware()),
+		);
+		const key = /<meta name="natsu" content="([^"]+)"/.exec(await (await get("/")).text())?.[1];
+		expect(key).toBeTruthy();
+		const soft = await get("/secret", { headers: { "natsu-nav": key! } });
+		expect(soft.status).toBe(204);
+		expect(loads).toBe(0);
+		const page = await get("/secret");
+		expect(page.status).toBe(200);
+		expect(loads).toBe(1);
+		const html = await page.text();
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "press", _csrf: token });
+		const posted = await get("/secret", { method: "POST", body, headers: { cookie, "natsu-nav": key! }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posts).toBe(1);
+	});
+
+	test('<page navigate="on"> is refused at compile time', async () => {
+		await expect(serve({ "index.uwu": `<page navigate="on"></page><template>x</template>` })).rejects.toThrow(/navigate="on"/);
+	});
+});
+
 describe("development", () => {
 	test("a change recompiles; a new file adds its route; a broken file keeps the last good build", async () => {
 		const { get } = await serve({ "index.uwu": `<template>one</template>` }, { dev: true });

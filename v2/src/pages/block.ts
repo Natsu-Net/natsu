@@ -72,6 +72,12 @@ export interface PageBlock {
 	cache?: "off" | number;
 	/** "none", or a layout file under `pages/` (`_bare` for `pages/_bare.uwu`). */
 	layout?: string;
+	/**
+	 * "off": always a document of its own, never reached by a soft visit or
+	 * prefetched (a page whose address holds a secret, or whose headers differ).
+	 * Its forms still post with the runtime. Read when the route is first mounted.
+	 */
+	navigate?: "off";
 	data: DataDecl[];
 	actions: ActionDecl[];
 	line: number;
@@ -81,7 +87,7 @@ const IDENT = /^[A-Za-z_$][\w$]*$/;
 const PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$\d][\w$]*)*$/;
 const SOURCE_NAME = /^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)*$/;
 const SERVICE_CALL = /^([A-Za-z_][\w-]*):([A-Za-z]+)\s+(.+)$/;
-const PAGE_ATTRIBUTES = new Set(["title", "description", "cache", "layout"]);
+const PAGE_ATTRIBUTES = new Set(["title", "description", "cache", "layout", "navigate"]);
 const FLAGS = new Set(["required", "when", "fallback"]);
 /** An action's short name, as uwu accepts it after `action:`. */
 const ACTION_SHORT = /^[A-Za-z_$][\w$.:-]*$/;
@@ -228,7 +234,7 @@ export function splitPageBlock(source: string, file: string): Split {
 function applyPageAttribute(block: PageBlock, attr: Tag["attrs"][number], source: string, file: string): void {
 	const line = lineAt(source, attr.offset);
 	if (!PAGE_ATTRIBUTES.has(attr.name)) {
-		throw new PageCompileError(file, line, `<page> has no '${attr.name}' attribute (title, description, cache, layout)`);
+		throw new PageCompileError(file, line, `<page> has no '${attr.name}' attribute (title, description, cache, layout, navigate)`);
 	}
 	if (attr.value === true) throw new PageCompileError(file, line, `<page ${attr.name}> needs a value`);
 	const value = attr.value;
@@ -247,6 +253,10 @@ function applyPageAttribute(block: PageBlock, attr: Tag["attrs"][number], source
 				throw new PageCompileError(file, line, `<page layout="${value}">: "none" or a layout file under pages/`);
 			}
 			block.layout = value;
+			return;
+		case "navigate":
+			if (value !== "off") throw new PageCompileError(file, line, `<page navigate="${value}">: "off", or leave it out`);
+			block.navigate = value;
 			return;
 	}
 }

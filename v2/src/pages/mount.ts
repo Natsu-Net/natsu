@@ -433,9 +433,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (registered.has(path)) continue;
 			registered.add(path);
 			added = true;
-			router.get(path, navigable(wrapped(handlerFor(path))));
+			// `<page navigate="off">`: a soft visit to it is answered "load it for real".
+			const own = wrapped(handlerFor(path));
+			router.get(path, next.get(path)?.page.block?.navigate === "off" ? own : navigable(own));
 			// Every page takes its actions' posts. A post is never prefetched,
-			// and with the runtime its answer is a part like a visit's.
+			// and with the runtime its answer is a part like a visit's (and the
+			// page it goes back to, when that is navigate="off", a real load).
 			router.post(path, navigable(wrapped(actionHandlerFor(path)), { prefetch: false }));
 		}
 		if (added && options.app?.running) options.app.reload();
