@@ -492,21 +492,19 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 		"",
 	]);
 
-/** Fields a visitor types in or picks (not hidden, a password or a file). */
-const FIELDS = "input:not([type=hidden],[type=password],[type=file],[type=submit],[type=button]),textarea,select";
 /**
- * What was typed in a form, and how to put it back in the form of the same
- * action once a refusal has drawn the page again: whatever the server wrote
- * in its fields, the visitor's own text is what they fix.
+ * What was typed, picked or ticked in a form (never a hidden field, a
+ * password or a file), and how to put it back in the form of the same action
+ * at the same place on the page once a refusal has drawn it again: whatever the
+ * server wrote in its fields, the visitor's own text is what they fix.
  */
 const typed = (form: HTMLFormElement) => {
-	const sel = `form[data-uwu-action="${CSS.escape(form.dataset.uwuAction!)}"]`;
-	const i = [...D.querySelectorAll(sel)].indexOf(form);
-	const of = (f?: Element) => (f ? [...f.querySelectorAll<HTMLInputElement>(FIELDS)] : []);
+	const i = [...D.forms].indexOf(form);
+	const of = (f?: HTMLFormElement) => [...(f?.elements || [])].filter((e) => !/^(hi|pa|fi|su|bu)/.test((e as HTMLInputElement).type)) as HTMLInputElement[];
 	const was = of(form).map((e) => [e.value, e.checked] as const);
 	return () => {
-		const now = of(D.querySelectorAll(sel)[i]);
-		if (now.length == was.length) now.forEach((e, n) => ((e.value = was[n]![0]), (e.checked = was[n]![1])));
+		const now = of(D.forms[i]);
+		now.length == was.length && now.forEach((e, n) => ([e.value, e.checked] = was[n]!));
 	};
 };
 
