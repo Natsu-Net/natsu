@@ -38,6 +38,7 @@ export { Assets };
 export { addVary, compress, negotiate };
 export { PageCache };
 export { island, navigable };
+export type { IslandOptions } from "./src/navigate.ts";
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };
 export { Action, Networked, State };
 export { caller, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor };

@@ -318,7 +318,13 @@ const unmount = (root: Element, inner?: 1) =>
 		}
 	}));
 
-const island = async (el: Element & { q?: object }, signal?: AbortSignal) => {
+/** Live islands on the page: each one's element, and the signed tags its last answer carried. */
+const isles = new Map<Isle, string>();
+/** Tell the socket what the page and its islands watch now (set by watchLive). */
+let relive = () => {};
+type Isle = Element & { q?: object; s?: AbortSignal; w?: ReturnType<typeof setTimeout> };
+
+const island = async (el: Isle, signal?: AbortSignal) => {
 	// Only this site, and only an answer from a route that says it is an
 	// island: markup that slipped into a page must not pull in another
 	// origin's HTML, nor a whole page of this one.
@@ -326,13 +332,19 @@ const island = async (el: Element & { q?: object }, signal?: AbortSignal) => {
 	if (u.origin != L.origin) return;
 	// Only the answer to the latest fetch of this island goes in: an earlier one may come back last.
 	const q = (el.q = {});
-	const r = await fetch(u, { signal, headers: { "Natsu-Island": "1" } });
+	// Kept for a live refetch, which is the mount's own fetch again.
+	signal && (el.s = signal);
+	const r = await fetch(u, { signal: el.s, headers: { "Natsu-Island": "1" } });
 	const html =
 		r.status == 200 && /^text\/html/.test(r.headers.get("content-type")!) && r.headers.get("natsu-island") == "1" && (await r.text());
 	if (html !== false && el.isConnected && el.q == q) {
 		unmount(el, 1);
 		el.innerHTML = html;
 		mountIn(el);
+		// A live island: its answer named the tags it was drawn from.
+		const t = r.headers.get("natsu-live");
+		t ? isles.set(el, t) : isles.delete(el);
+		relive();
 	}
 };
 /**
@@ -508,10 +520,20 @@ const typed = (form: HTMLFormElement) => {
 	};
 };
 
-/** Watch the page's live tags; `refresh` redraws it. */
+/** The tags of a signed list. */
+const tagsOf = (s: string) => s.slice(0, s.lastIndexOf("|")).split(" ");
+
+/**
+ * Watch the page's live tags and its live islands'; `refresh` redraws the
+ * page when one of its own is invalidated, and an island's fetches that
+ * island again, alone.
+ */
 const watchLive = (refresh: () => unknown) => {
 	let ws: WebSocket | 0 = 0;
-	let want = "";
+	/** The page's signed tags. */
+	let mine = "";
+	/** What was last said: one signed list, or the page's and the islands'. */
+	let want: string | string[] = "";
 	let wait = 1e3;
 	let back = 0;
 	let t: ReturnType<typeof setTimeout>;
@@ -526,7 +548,12 @@ const watchLive = (refresh: () => unknown) => {
 		};
 		s.onmessage = (e) => {
 			try {
-				JSON.parse(e.data).t == "invalidate" && !acting && (clearTimeout(t), (t = setTimeout(refresh, 30)));
+				const m = JSON.parse(e.data);
+				if (m.t == "invalidate")
+					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(refresh, 30)));
+					else
+						for (const [el, s] of isles)
+							tagsOf(s).includes(m.tag) && (clearTimeout(el.w), (el.w = setTimeout(() => island(el).catch(() => {}), 30)));
 			} catch {}
 		};
 		s.onclose = () => {
@@ -535,9 +562,16 @@ const watchLive = (refresh: () => unknown) => {
 			want && setTimeout(() => want && !ws && open(), (wait = Math.min(wait * 2, 3e4)));
 		};
 	};
+	relive = () => {
+		for (const el of isles.keys()) el.isConnected || isles.delete(el);
+		const all = [mine, ...isles.values()].filter(Boolean);
+		const n = all[1] ? all : all[0] || "";
+		// A signed list holds no comma, so the lists joined are a fair comparison.
+		if ("" + n != "" + want) (want = n), ws ? say() : n && open();
+	};
 	document.addEventListener("natsu:load", () => {
-		const n = document.querySelector<HTMLMetaElement>('meta[name="natsu-live"]')?.content || "";
-		if (n != want) (want = n), ws ? say() : n && open();
+		mine = document.querySelector<HTMLMetaElement>('meta[name="natsu-live"]')?.content || "";
+		relive();
 	});
 };
 

@@ -49,6 +49,7 @@ import { config } from "./config.ts";
 import type { Context, Handler } from "./context.ts";
 import { GetController } from "./controller.ts";
 import { scriptNonce } from "./csp.ts";
+import { signTags } from "./invalidate.ts";
 import { log } from "./logger.ts";
 import type { CachedPage, Filled } from "./page-cache.ts";
 
@@ -253,14 +254,36 @@ const islands = new WeakSet<Handler>();
  * Any other route is refused before its handler runs: an attribute is easy
  * to slip into user content, and an island naming `/account/delete` must not
  * pull that page's form, CSRF token and all, into someone's product page.
+ *
+ * A live island says which live-data tags its answer was drawn from, and the
+ * runtime fetches that island again, alone, when one is invalidated: the
+ * rest of the page (a video playing, a form half filled) is left as it is.
+ *
+ *   Routes.get("/bell", island(bell, { tags: (ctx) => [`bell:${userOf(ctx)}`] }));
+ *   invalidate(`bell:${user}`);           // after a write, from anywhere
  */
-export function island(ref: Handler | string): Handler {
+export function island(ref: Handler | string, options: IslandOptions = {}): Handler {
 	const handler = typeof ref === "string" ? GetController(ref) : ref;
-	const marked: Handler = (ctx) => handler(ctx);
+	const tags = options.tags;
+	const marked: Handler = tags
+		? async (ctx) => {
+				const out = await handler(ctx);
+				// Signed, as a page's <meta name="natsu-live"> is: the socket
+				// watches what this server said, never a tag a page made up.
+				const signed = signTags(await tags(ctx));
+				if (signed) ctx.response.headers.set("natsu-live", signed);
+				return out;
+			}
+		: (ctx) => handler(ctx);
 	Object.defineProperty(marked, "name", { value: typeof ref === "string" ? ref : handler.name || "island" });
 	keepNavigable(handler, marked);
 	islands.add(marked);
 	return marked;
+}
+
+export interface IslandOptions {
+	/** The live-data tags this answer was drawn from (see invalidate.ts): an invalidated one fetches the island again. */
+	tags?: (ctx: Context) => Iterable<string> | Promise<Iterable<string>>;
 }
 
 /** Island fetches in flight: refused before any route that is not an `island()`. */
