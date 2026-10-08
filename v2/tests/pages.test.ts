@@ -417,9 +417,10 @@ describe("the <page> block", () => {
 				},
 				{ name: "cart", line: 5, required: false, when: "session", fallback: undefined, from: { t: "source", source: "cart", args: {} } },
 			],
+			actions: [],
 		});
 		expect(splitPageBlock(`<template>x</template>`, "x").block).toBeNull();
-		expect(splitPageBlock(`<page cache="off"/><template>x</template>`, "x").block).toEqual({ line: 1, cache: "off", data: [] });
+		expect(splitPageBlock(`<page cache="off"/><template>x</template>`, "x").block).toEqual({ line: 1, cache: "off", data: [], actions: [] });
 	});
 
 	test("refuses expressions, calls and what it does not know, with the line", () => {
@@ -442,7 +443,7 @@ describe("the <page> block", () => {
 		expect(fail(`<page><data p="x" fallback="nope"></page>`)).toContain("is not a literal");
 		expect(fail(`<page><data p="x" required fallback="null"></page>`)).toContain("both required and has a fallback");
 		expect(fail(`<page>\n<data p="x">\n<data p="y"></page>`)).toBe("pages/x.uwu:3: 'p' is declared twice in <page>");
-		expect(fail(`<page><p>hi</p></page>`)).toContain("only <data> elements");
+		expect(fail(`<page><p>hi</p></page>`)).toContain("only <data> and <action> elements");
 		expect(fail(`<page><data p="x">`)).toContain("<page> is not closed");
 		expect(fail(`<template>x</template>\n<page cache="off"></page>`)).toBe("pages/x.uwu:2: <page> must come first in the file, before <template>");
 	});

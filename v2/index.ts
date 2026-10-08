@@ -45,8 +45,26 @@ export { grantRoom, hasRoom, revokeRoom, revokeSession };
 export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
-export { Forbidden, HttpError, NotFound, PageCompileError, compilePages, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
-export type { ModelResolver, PageMeta, PageSite, PagesOptions, ServiceConfig, SourceFn, SourceInput, SourceOptions } from "./src/pages/index.ts";
+export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, action, compilePages, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
+export type {
+	ActionHandler,
+	ActionInput,
+	ActionOptions,
+	ActionResult,
+	AuthRule,
+	Guard,
+	GuardInput,
+	ModelResolver,
+	PageMeta,
+	PageSite,
+	PagesOptions,
+	ServiceConfig,
+	SourceFn,
+	SourceInput,
+	SourceOptions,
+} from "./src/pages/index.ts";
+export { invalidate, onInvalidate, setLiveSecret } from "./src/invalidate.ts";
+export type { InvalidateListener } from "./src/invalidate.ts";
 
 export type { ApplicationOptions, ErrorHandler, StartOptions } from "./src/server.ts";
 export type { CookieOptions, Handler, Middleware, NatsuSocketData, ResponseBody } from "./src/context.ts";

@@ -6,6 +6,7 @@
  *     <data product="products.bySlug slug=params.slug" required>
  *     <data stock="inventory:GET /stock/{{params.slug}}" fallback="null">
  *     <data cart="cart.forSession" when="session">
+ *     <action review="reviews.add" auth="viewer">
  *   </page>
  *   <template>…</template>
  *
@@ -49,6 +50,21 @@ export interface DataDecl {
 	line: number;
 }
 
+/**
+ * `<action review="reviews.add" auth="viewer">`: the template's
+ * `action:review` runs the registered action `reviews.add`, for a visitor
+ * the `auth` rule lets through ("viewer": anyone signed in; any other
+ * name: a registered `guard`).
+ */
+export interface ActionDecl {
+	/** The name the template uses: `@submit="action:review"`. */
+	short: string;
+	/** The registered `action(name, …)` it runs. */
+	name: string;
+	auth?: string;
+	line: number;
+}
+
 export interface PageBlock {
 	title?: TextTemplate;
 	description?: TextTemplate;
@@ -57,6 +73,7 @@ export interface PageBlock {
 	/** "none", or a layout file under `pages/` (`_bare` for `pages/_bare.uwu`). */
 	layout?: string;
 	data: DataDecl[];
+	actions: ActionDecl[];
 	line: number;
 }
 
@@ -66,6 +83,9 @@ const SOURCE_NAME = /^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)*$/;
 const SERVICE_CALL = /^([A-Za-z_][\w-]*):([A-Za-z]+)\s+(.+)$/;
 const PAGE_ATTRIBUTES = new Set(["title", "description", "cache", "layout"]);
 const FLAGS = new Set(["required", "when", "fallback"]);
+/** An action's short name, as uwu accepts it after `action:`. */
+const ACTION_SHORT = /^[A-Za-z_$][\w$.:-]*$/;
+const GUARD = /^[A-Za-z_][\w.:-]*$/;
 
 export interface Split {
 	/** The file with the block replaced by newlines. */
@@ -152,7 +172,7 @@ export function splitPageBlock(source: string, file: string): Split {
 	}
 	const line = lineAt(source, start);
 	const open = readTag(source, start + 5, file, "page");
-	const block: PageBlock = { data: [], line };
+	const block: PageBlock = { data: [], actions: [], line };
 	for (const attr of open.attrs) applyPageAttribute(block, attr, source, file);
 
 	let end = open.end;
@@ -175,7 +195,17 @@ export function splitPageBlock(source: string, file: string): Split {
 				}
 				continue;
 			}
-			throw new PageCompileError(file, lineAt(source, i), "only <data> elements may sit inside <page>");
+			if (/^<action[\s/>]/.test(source.slice(i, i + 8))) {
+				const tag = readTag(source, i + 7, file, "action");
+				block.actions.push(parseAction(tag, file, lineAt(source, i)));
+				i = tag.end;
+				if (!tag.selfClosing) {
+					const after = skipBlank(source, i);
+					if (source.startsWith("</action>", after)) i = after + "</action>".length;
+				}
+				continue;
+			}
+			throw new PageCompileError(file, lineAt(source, i), "only <data> and <action> elements may sit inside <page>");
 		}
 	}
 
@@ -183,6 +213,11 @@ export function splitPageBlock(source: string, file: string): Split {
 	for (const decl of block.data) {
 		if (names.has(decl.name)) throw new PageCompileError(file, decl.line, `'${decl.name}' is declared twice in <page>`);
 		names.add(decl.name);
+	}
+	const shorts = new Set<string>();
+	for (const decl of block.actions) {
+		if (shorts.has(decl.short)) throw new PageCompileError(file, decl.line, `action '${decl.short}' is declared twice in <page>`);
+		shorts.add(decl.short);
 	}
 
 	const spanned = source.slice(0, end);
@@ -253,6 +288,28 @@ function parseData(tag: Tag, file: string, line: number): DataDecl {
 	}
 	if (required && fallback) throw new PageCompileError(file, line, `<data ${named.name}> is both required and has a fallback`);
 	return { name: named.name, from: parseFrom(named.value.trim(), file, line, named.name), required, when, fallback, line };
+}
+
+function parseAction(tag: Tag, file: string, line: number): ActionDecl {
+	let named: Tag["attrs"][number] | undefined;
+	let auth: string | undefined;
+	for (const attr of tag.attrs) {
+		if (attr.name === "auth") {
+			if (attr.value === true || !GUARD.test(attr.value)) {
+				throw new PageCompileError(file, line, `<action auth> names a rule: auth="viewer", or a registered guard("name", …)`);
+			}
+			auth = attr.value;
+			continue;
+		}
+		if (named) throw new PageCompileError(file, line, `<action> names one action; it has '${named.name}' and '${attr.name}'`);
+		named = attr;
+	}
+	if (!named) throw new PageCompileError(file, line, `<action> needs a name: <action review="reviews.add">`);
+	if (!ACTION_SHORT.test(named.name)) throw new PageCompileError(file, line, `<action ${named.name}>: not a name uwu accepts after action:`);
+	if (named.value === true || !SOURCE_NAME.test(named.value.trim())) {
+		throw new PageCompileError(file, line, `<action ${named.name}> needs the registered action it runs: ${named.name}="area.name"`);
+	}
+	return { short: named.name, name: named.value.trim(), auth, line };
 }
 
 function parseFrom(spec: string, file: string, line: number, name: string): DataFrom {
