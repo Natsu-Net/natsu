@@ -16,6 +16,9 @@
  * resolver is handed as `fields`, so it can select only those.
  */
 
+import type { Attr, Expr, TplNode } from "uwu-template/ast";
+
+/** Where a read is (uwu's `Loc` without the offset). */
 export interface Loc {
 	line: number;
 	col: number;
@@ -32,32 +35,7 @@ export interface Read {
 
 export type Reads = Map<string, Read>;
 
-// The parts of uwu's template tree this needs, structurally: uwu-template
-// exports `compile` and its result, not the node types.
-type Expr =
-	| { t: "path"; segments: readonly string[]; parentDepth: number }
-	| { t: "literal" }
-	| { t: "js"; parts: readonly (string | Expr)[] }
-	| { t: "directive" };
-
-type AttrPart = { t: "text" } | { t: "interp"; expr: Expr };
-
-type Attr =
-	| { t: "dynamic"; parts: readonly AttrPart[] }
-	| { t: "can"; recordExpr?: Expr }
-	| { t: "static" | "bool" | "event" | "bind" | "poll" | "spaLink" | "action" | "skeleton" };
-
-export type TplNode =
-	| { t: "text" | "raw"; loc: Loc }
-	| { t: "interp"; expr: Expr; loc: Loc }
-	| { t: "if"; branches: readonly { cond?: Expr; body: readonly TplNode[] }[]; loc: Loc }
-	| { t: "each"; src: Expr; body: readonly TplNode[]; empty?: readonly TplNode[]; loc: Loc }
-	| { t: "await"; as: string; src: Expr; body: readonly TplNode[]; loading?: readonly TplNode[]; loc: Loc }
-	| { t: "helper"; call: { args: readonly Expr[]; hash: Record<string, Expr> }; loc: Loc }
-	| { t: "layout"; name: string; loc: Loc }
-	| { t: "component"; props: Record<string, Expr>; loc: Loc }
-	| { t: "element"; attrs: readonly Attr[]; children: readonly TplNode[]; loc: Loc }
-	| { t: "elementVoid"; attrs: readonly Attr[]; loc: Loc };
+export type { TplNode } from "uwu-template/ast";
 
 /** A data frame: the top, or a loop item standing for `name.prefix[i]`. */
 type Frame = { root: true } | { root: false; name?: string; prefix: string[] };

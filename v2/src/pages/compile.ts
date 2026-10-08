@@ -20,11 +20,11 @@
  * directory needs no module resolution of its own.
  */
 
-import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { type PageBlock, splitPageBlock, textPaths } from "./block.ts";
 import { PageCompileError } from "./errors.ts";
-import { type Reads, type TplNode, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
+import { type Reads, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
 
 export type FileKind = "page" | "layout" | "error";
 
@@ -56,21 +56,23 @@ export interface PageManifest {
 	files: (Omit<CompiledFile, "server"> & { module: string })[];
 }
 
+import type { TemplateAST } from "uwu-template/ast";
+
 /** The part of uwu's `compile` result natsu reads. */
 interface UwuCompiled {
 	server: string;
 	css: string;
 	sfc: { scripts: { content: string }[] };
-	template?: { nodes: unknown[] };
+	template?: TemplateAST;
 }
 
-type UwuCompile = (source: string, options: { file?: string; componentId?: string }) => UwuCompiled;
-
-// Loaded by a specifier the type checker does not follow: uwu ships its
-// TypeScript sources, written to flags looser than natsu's, and checking
-// natsu should not mean checking uwu's compiler with them.
+// uwu ships TypeScript sources written to flags looser than natsu's, so its
+// compiler and runtime are loaded by specifiers the type checker does not
+// follow (checking natsu should not mean checking uwu with natsu's flags).
+// The tree's types come from `uwu-template/ast`, a file of types alone.
 const UWU = "uwu-template";
-const { compile } = (await import(UWU)) as { compile: UwuCompile };
+const UWU_RUNTIME = "uwu-template/runtime";
+const { compile } = (await import(UWU)) as { compile: (source: string, options: { file?: string }) => UwuCompiled };
 
 const SEGMENT = /^[\w.~-]+$/;
 const PARAM = /^\[([A-Za-z_][\w]*)\]$/;
@@ -141,9 +143,8 @@ export function compilePageFile(source: string, file: string): CompiledFile {
 
 	let result: UwuCompiled;
 	try {
-		// uwu derives the scope of a `<style>` from the component id, and its
-		// default is the same for every file: name each one, or their styles mix.
-		result = compile(rest, { file: shown, componentId: `pages/${file}` });
+		// uwu derives the scope of a `<style>` from the file's path.
+		result = compile(rest, { file: shown });
 	} catch (error) {
 		const loc = (error as { loc?: { line: number } }).loc;
 		throw new PageCompileError(shown, loc?.line ?? 1, (error as Error).message);
@@ -153,7 +154,7 @@ export function compilePageFile(source: string, file: string): CompiledFile {
 	}
 
 	const partials: string[] = [];
-	const reads: Reads = collectReads((result.template?.nodes ?? []) as TplNode[], {
+	const reads: Reads = collectReads(result.template?.nodes ?? [], {
 		scriptNames: scriptDeclarations(result.sfc.scripts),
 		onPartial: (name) => partials.push(name),
 	});
@@ -223,16 +224,9 @@ export type Render = (props: Record<string, unknown>, child?: string, opts?: Rec
 
 let runtime: Promise<Record<string, unknown>> | undefined;
 
-/**
- * uwu's runtime, found from where `uwu-template` itself lives: the compiled
- * modules import `@uwu/runtime`, which is uwu-template's dependency, not
- * natsu's, and need not be resolvable from the app.
- */
+/** uwu's server runtime: what compiled modules import as `@uwu/runtime`. */
 export function uwuRuntime(): Promise<Record<string, unknown>> {
-	return (runtime ??= (async () => {
-		const umbrella = realpathSync(Bun.resolveSync("uwu-template", import.meta.dir));
-		return (await import(Bun.resolveSync("@uwu/runtime", dirname(umbrella)))) as Record<string, unknown>;
-	})());
+	return (runtime ??= import(UWU_RUNTIME) as Promise<Record<string, unknown>>);
 }
 
 const RUNTIME_IMPORT = /^import\s*\{([^}]*)\}\s*from\s*"@uwu\/runtime";?\s*$/m;
