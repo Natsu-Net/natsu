@@ -26,6 +26,8 @@
  *    parser with scripting off reads as markup.
  *  - `/legacy`: lists a script that never calls `natsu.mount`. Page A also
  *    has a link marked `data-natsu-reload`.
+ *  - `/w1`, `/w2`: list `loader.js`, which appends `/w.js` (a converted
+ *    widget no page lists) to the body.
  *  - `/quiet`: navigable without prefetch. `/slow`: a navigation answered
  *    after 400 ms with `ctx.nav.reload()`. `/old`: a redirect to `/c` that
  *    sets the flash; `/away`, one to another origin. `/plain`: not navigable. `/missing`: a 404 page in the
@@ -148,6 +150,7 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 			"b-only": join(HERE, "js/b-only.js"),
 			legacy: join(HERE, "js/legacy.js"),
 			account: join(HERE, "js/account.js"),
+			loader: join(HERE, "js/loader.js"),
 		},
 		rewrite: {
 			"/assets/site.css": "site",
@@ -155,6 +158,7 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 			"/assets/js/b-only.js": "b-only",
 			"/assets/js/legacy.js": "legacy",
 			"/assets/js/account.js": "account",
+			"/assets/js/loader.js": "loader",
 		},
 		navigate: true,
 	});
@@ -269,6 +273,10 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 		scripts: ["counter"],
 	}))));
 	Routes.get("/legacy", navigable(own(() => ({ title: "Legacy", main: "<h1>Legacy</h1>", scripts: ["legacy"] }))));
+	// A converted loader that appends a converted widget script to the body: no page lists the widget.
+	Routes.get("/w1", navigable(own(() => ({ title: "W1", main: '<h1>W1</h1><b id="w" data-w>no</b>', scripts: ["loader"] }))));
+	Routes.get("/w2", navigable(own(() => ({ title: "W2", main: '<h1>W2</h1><b id="w" data-w>no</b>', scripts: ["loader"] }))));
+	Routes.get("/w.js", () => new Response('natsu.mount("[data-w]", (el) => { el.textContent = "mounted"; });', { headers: { "content-type": "text/javascript" } }));
 	Routes.get("/quiet", navigable(own(() => ({ title: "Quiet", main: "<h1>Quiet</h1>" })), { prefetch: false }));
 	Routes.get("/slow", navigable(async (ctx) => {
 		if (ctx.nav.requested) {

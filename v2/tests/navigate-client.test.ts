@@ -1442,6 +1442,128 @@ describe("mounts and scripts", () => {
 		expect(seen).toEqual(["2"]);
 		expect(p.errors.map((e) => (e as Error).message)).toEqual(["boom"]);
 	});
+
+	test("a deferred script that takes its tag out before DOMContentLoaded still counts, and is never created again", async () => {
+		// Unconverted: the next visit must be a real load, as for any script that never called mount.
+		const p = open({
+			html: page({ scripts: ["/js/legacy.js"] }),
+			scripts: { "/js/legacy.js": (_w, el) => el.remove() },
+			routes: { "/b": () => answer(part()) },
+		});
+		p.click("#to-b");
+		await settle();
+		// Converted: a page that lists it must not run it a second time (nor mount it twice).
+		let ran = 0;
+		const log: string[] = [];
+		const q = open({
+			html: page({ scripts: ["/js/site.js"], main: "<h1>A</h1><b data-x>a</b>" }),
+			scripts: {
+				"/js/site.js": (w, el) => {
+					ran++;
+					w.natsu.mount("[data-x]", (e: Element) => void log.push(e.textContent!));
+					el.remove();
+				},
+			},
+			routes: { "/b": () => answer(part({ main: "<h1>B</h1><b data-x>b</b>", scripts: ["/js/site.js"] })) },
+		});
+		await q.natsu.visit("/b");
+		expect([p.loads, path(p), ran, log]).toEqual([[["assign", `${ORIGIN}/b`]], "/a", 1, ["a", "b"]]);
+	});
+
+	test("a visit that overtakes one whose script still loads, to a page listing that script: it waits for it, and reloads if it never calls mount", async () => {
+		const seen: string[] = [];
+		const p = open({
+			html: page(),
+			holdJs: ["/js/legacy.js"],
+			scripts: { "/js/legacy.js": (w) => w.document.addEventListener("DOMContentLoaded", () => w.natsu.mount("x", () => {})) },
+			routes: {
+				"/b": () => answer(part({ scripts: ["/js/legacy.js"] })),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>", scripts: ["/js/legacy.js"] })),
+			},
+			before: (w) => w.document.addEventListener("natsu:load", (e: W) => void seen.push(e.detail.url)),
+		});
+		p.click("#to-b");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		expect([path(p), text(p, "main h1")]).toEqual(["/c", "Page C"]);
+		const early = [...seen];
+		p.release("/js/legacy.js");
+		await settle();
+		// natsu:load of C waits for the script C lists; it ran on C and never called mount (it waits for
+		// DOMContentLoaded): C is loaded for real, as B would have been.
+		expect([early, p.loads]).toEqual([[`${ORIGIN}/a`], [["reload"]]]);
+	});
+
+	test("a mount that moves its element out of the region (a portal to body) is stopped when its region goes", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ scripts: ["/js/modal.js"], main: `<h1>A</h1><div data-modal>m</div>` }),
+			scripts: {
+				"/js/modal.js": (w) =>
+					w.natsu.mount("[data-modal]", (el: Element, signal: AbortSignal) => {
+						w.document.body.append(el);
+						signal.addEventListener("abort", () => log.push("abort"));
+						return () => (log.push("cleanup"), el.remove());
+					}),
+			},
+			routes: {
+				"/b": () => answer(part({ scripts: ["/js/modal.js"] })),
+				"/a": () => answer(part({ title: "A", main: `<h1>A</h1><div data-modal>m</div>`, scripts: ["/js/modal.js"] })),
+			},
+		});
+		expect(p.document.querySelectorAll("[data-modal]").length).toBe(1);
+		await p.natsu.visit("/b");
+		await p.natsu.visit("/a");
+		expect([p.loads, path(p)]).toEqual([[], "/a"]);
+		// A full load of A has one modal; the one A's first copy moved out must not stay, with its listeners.
+		expect([p.document.querySelectorAll("[data-modal]").length, log]).toEqual([1, ["abort", "cleanup"]]);
+	});
+
+	test("a page script's mount on a shell element goes when the page shown no longer lists the script", async () => {
+		const log: string[] = [];
+		const p = open({
+			html: page({ shell: LINKS + `<input id="q">` }),
+			scripts: {
+				"/js/search.js": (w) =>
+					w.natsu.mount("#q", (el: Element, signal: AbortSignal) => {
+						el.addEventListener("input", () => log.push("live"), { signal });
+					}),
+			},
+			routes: {
+				"/b": () => answer(part({ scripts: ["/js/search.js"] })),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>" })),
+			},
+		});
+		await p.natsu.visit("/b");
+		p.document.getElementById("q").dispatchEvent(new p.window.Event("input"));
+		expect(log).toEqual(["live"]);
+		await p.natsu.visit("/c");
+		expect([p.loads, path(p)]).toEqual([[], "/c"]);
+		p.document.getElementById("q").dispatchEvent(new p.window.Event("input"));
+		// A full load of C has no search.js: its input has no such listener.
+		expect(log).toEqual(["live"]);
+	});
+
+	test("a script a mount on the new regions adds is not created a second time by the page's own list", async () => {
+		let ran = 0;
+		const p = open({
+			html: page({ scripts: ["/js/site.js"] }),
+			scripts: {
+				"/js/site.js": (w) =>
+					w.natsu.mount("[data-chart]", () => {
+						if (w.document.querySelector('script[src="/js/chart.js"]')) return;
+						const s = w.document.createElement("script");
+						s.src = "/js/chart.js";
+						w.document.body.append(s);
+					}),
+				"/js/chart.js": (w) => (ran++, w.natsu.mount("[data-chart]", () => {})),
+			},
+			routes: { "/b": () => answer(part({ main: "<h1>B</h1><div data-chart></div>", scripts: ["/js/site.js", "/js/chart.js"] })) },
+		});
+		await p.natsu.visit("/b");
+		expect([ran, p.document.querySelectorAll('script[src="/js/chart.js"]').length]).toEqual([1, 1]);
+	});
 });
 
 describe("events and attributes", () => {
@@ -2423,6 +2545,24 @@ describe("islands", () => {
 		await p.natsu.visit("/c");
 		expect(signals.length).toBe(1);
 		expect(signals[0]!.aborted).toBe(true);
+	});
+
+	test("natsu.island while an earlier fetch of the same island is still out: the later answer stays", async () => {
+		let n = 0;
+		const p = open({
+			html: page({ shell: LINKS + `<div id="cart" data-natsu-island="/api/cart">…</div>` }),
+			routes: {
+				// The first answer (sent before the visitor's action) is slow; the one asked after the action is quick.
+				"/api/cart": () => (++n == 1 ? tick(80).then(() => isle("0 items")) : isle("1 item")),
+			},
+		});
+		await tick(5);
+		// The visitor added an item; the page asks the island again.
+		await p.natsu.island(p.document.getElementById("cart"));
+		expect(text(p, "#cart")).toBe("1 item");
+		await tick(150);
+		expect(n).toBe(2);
+		expect(text(p, "#cart")).toBe("1 item");
 	});
 });
 

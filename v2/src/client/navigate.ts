@@ -223,8 +223,11 @@ const INSTANT: ScrollToOptions = { behavior: "instant" };
 const go = (top: number) => scrollTo({ ...INSTANT, top });
 
 const regs: Reg[] = [];
-/** Live mounts: the element, and what stops it (abort the signal, run the cleanup). */
-let live: [Element, () => void][] = [];
+/**
+ * Live mounts: the element, what stops it (abort the signal, run the
+ * cleanup), its registration, and the region it was mounted in.
+ */
+let live: [Element, () => void, Reg, Element | null][] = [];
 /**
  * Scripts that called `mount`: each element, and its src. Also this
  * runtime's own tag, and a script a swap appended until it has run.
@@ -252,23 +255,27 @@ const mountIn = (root: Element, only?: Reg) => {
 				if (!el.matches(r[0]) || done.has(r)) continue;
 				done.add(r);
 				const a = new AbortController();
+				// Read before the function runs: it may move the element (a portal to body).
+				const home = el.closest(REGION);
 				let cleanup: unknown;
 				try {
 					cleanup = r[1](el, a.signal);
 				} catch (e) {
 					reportError(e);
 				}
-				live.push([el, () => (a.abort(), typeof cleanup == "function" && cleanup())]);
+				live.push([el, () => (a.abort(), typeof cleanup == "function" && cleanup()), r, home]);
 			}
 };
 
 /**
- * Stop the mounts inside `root`, and on it unless `inner`; and any whose
- * element page code took out of the document since, which nothing else stops.
+ * Stop the mounts inside `root`, and on it unless `inner` (one mounted in it
+ * that page code moved out counts); and any whose element page code took out
+ * of the document since, which nothing else stops.
  */
 const unmount = (root: Element, inner?: 1) =>
-	(live = live.filter(([el, stop]) => {
-		if ((!root.contains(el) || (inner && el == root)) && el.isConnected) return 1;
+	(live = live.filter(([el, stop, r, home]) => {
+		if ((!(root.contains(el) || root == home) || (inner && el == root)) && el.isConnected && (!r[2] || !list || list.includes(r[2]))) return 1;
+		(el as Mounted).natsu!.delete(r);
 		try {
 			stop();
 		} catch (e) {
@@ -276,16 +283,18 @@ const unmount = (root: Element, inner?: 1) =>
 		}
 	}));
 
-const island = async (el: Element, signal?: AbortSignal) => {
+const island = async (el: Element & { q?: object }, signal?: AbortSignal) => {
 	// Only this site, and only an answer from a route that says it is an
 	// island: markup that slipped into a page must not pull in another
 	// origin's HTML, nor a whole page of this one.
 	const u = new URL((el as HTMLElement).dataset.natsuIsland!, L.href);
 	if (u.origin != L.origin) return;
+	// Only the answer to the latest fetch of this island goes in: an earlier one may come back last.
+	const q = (el.q = {});
 	const r = await fetch(u, { signal, headers: { "Natsu-Island": "1" } });
 	const html =
 		r.status == 200 && /^text\/html/.test(r.headers.get("content-type")!) && r.headers.get("natsu-island") == "1" && (await r.text());
-	if (html !== false && el.isConnected) {
+	if (html !== false && el.isConnected && el.q == q) {
 		unmount(el, 1);
 		el.innerHTML = html;
 		mountIn(el);
@@ -310,8 +319,10 @@ const api: NatsuClient = {
 			| HTMLScriptElement
 			| undefined;
 		if (s) aware.add(s.src || s);
-		// A script in <head> runs once per document, as the shell does: its mounts go everywhere.
-		const r: Reg = [selector, fn as Reg[1], s && s.parentNode != D.head ? s.src : ""];
+		// A script in <head> runs once per document, as the shell does, and one a
+		// loader created (force-async: async with no attribute) is listed by no
+		// page: their mounts go everywhere.
+		const r: Reg = [selector, fn as Reg[1], s && s.parentNode != D.head && s.async == s.hasAttribute("async") ? s.src : ""];
 		regs.push(r);
 		if (ready) mountIn(D.body, r);
 	},
@@ -324,6 +335,8 @@ if (!first) window.natsu = api;
 
 /** The src of every script this document ran or started. */
 const loaded = new Set<string>();
+/** The run of each script a swap created, by src: a later visit that lists it waits for it too. */
+const made: Record<string, unknown> = {};
 /** The ones that must have called `mount` by the time a visit starts, for a swap to be safe. */
 const listed = new Set<HTMLScriptElement>();
 /**
@@ -348,7 +361,7 @@ const counts = (s: HTMLScriptElement) =>
  * A listed script that has not called `mount` (yet), by its src: an inline
  * one that called it is in `aware` itself, so it is never listed.
  */
-const blind = (s: HTMLScriptElement) => !aware.has(s.src);
+const blind = (s: HTMLScriptElement) => !aware.has(s.src || s);
 const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
 /**
  * Whether a script that counts has not called `mount`, noting the
@@ -771,6 +784,9 @@ if (!first && KEY && regions(D)[0]) {
 				// a Back): this one is over, and leaves nothing behind.
 				if (n != seq) return adds.forEach((l) => l.remove());
 				begun = 1;
+				// The page's scripts, whose mounts may run from now on: a mount of any
+				// other (on the shell too) goes as the regions are unmounted below.
+				list = scripts.map((s) => s[0]);
 				fire("before-swap", { url: f.href });
 				// From here the runtime restores this document's scroll, so the
 				// browser must not: on the entry left, and on the entries after it.
@@ -829,15 +845,19 @@ if (!first && KEY && regions(D)[0]) {
 			if (n != seq) return;
 			idle();
 
-			// Mounts allowed here, then the scripts this document has not run (one
-			// a loader added before the visit began has run), in order.
-			list = scripts.map((s) => s[0]);
-			for (const el of next) mountIn(el);
+			// Mounts allowed here (in the shell too: one a page that did not list
+			// its script stopped), then the scripts this document has not run (one
+			// a loader added before the visit began has run), in order: one a
+			// visit before this one created and that still loads is waited for.
+			mountIn(D.body);
+			// Read again: a script a loader added since the visit began (a mount just now, say) is not created twice.
+			unbound();
 			await Promise.all(
 				scripts.map(
 					([src, p]) =>
-						loaded.has(src) ||
-						new Promise((y) => {
+						(made[src] ||=
+							loaded.has(src) ||
+							new Promise((y) => {
 							const c = D.createElement("script");
 							// One the server vouched for gets the boot nonce; any other is left
 							// to the page's CSP, exactly as on a full load.
@@ -846,11 +866,10 @@ if (!first && KEY && regions(D)[0]) {
 							// pressed at once) must not take it for one that never called mount.
 							aware.add(c);
 							c.async = false;
-							loaded.add(src);
 							// One the browser never runs (nomodule, a consent-gated type) fires no event.
 							runs(c) ? (c.onload = c.onerror = () => y(aware.delete(c))) : y(0);
 							D.body.append(c);
-						}),
+							})),
 				),
 			);
 			if (n != seq) return;
@@ -875,6 +894,8 @@ if (!first && KEY && regions(D)[0]) {
 }
 // Last, so that a runtime added after load boots with all of the above set up.
 if (!first) {
+	// Noted as the runtime runs too: a deferred script may take its tag out before DOMContentLoaded.
+	unbound();
 	D.addEventListener("DOMContentLoaded", boot);
 	on("load", boot);
 	if (D.readyState == "complete") boot();

@@ -715,6 +715,17 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
+	e2e("a converted script a loader appends to the body still mounts on a page swapped in", async () => {
+		const page = await open("/w1");
+		await page.waitForFunction(() => document.getElementById("w")!.textContent === "mounted");
+		await page.evaluate(() => (window as any).natsu.visit("/w2"));
+		await title(page, "W2");
+		await page.waitForTimeout(300);
+		// A full load of W2 shows "mounted": its loader loads the widget, which mounts.
+		expect([await loads(page), await page.textContent("#w")]).toEqual([1, "mounted"]);
+		await page.context().close();
+	});
+
 	e2e("a page the back/forward cache kept while a Back was on its way: restored, it shows the page its URL names", async () => {
 		if (!full) return console.warn("skipped: the headless shell never uses the back/forward cache");
 		const page = await open("/a");
