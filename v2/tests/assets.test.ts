@@ -1,3 +1,4 @@
+import { brotliDecompressSync } from "node:zlib";
 /**
  * The asset pipeline.
  *
@@ -374,7 +375,7 @@ describe("compression", () => {
 		expect(await plain.text()).toContain(".card");
 	});
 
-	test("a chunk asked for before its copies are ready waits for them", async () => {
+	test("a chunk asked for before its copies are ready goes out at once, briefly cached", async () => {
 		reset();
 		const pipeline = assets();
 		await pipeline.build();
@@ -388,6 +389,16 @@ describe("compression", () => {
 		expect(response.headers.get("content-encoding")).toBe("br");
 		// compress() saw an encoded body and left it, so Vary is said once.
 		expect(response.headers.get("vary")).toBe("Accept-Encoding");
+		// A shared cache keeps the fast copy a minute, then fetches the smaller one.
+		expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, s-maxage=60, immutable");
+		const decoded = new TextDecoder().decode(brotliDecompressSync(new Uint8Array(await response.arrayBuffer())));
+		expect(decoded).toContain(".card");
+
+		await pipeline.settled();
+		const later = await running.fetch(url, { headers: { "accept-encoding": "br" }, decompress: false } as RequestInit);
+		expect(later.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+		const gz = await running.fetch(url, { headers: { "accept-encoding": "gzip" }, decompress: false } as RequestInit);
+		expect(gz.headers.get("content-encoding")).toBe("gzip");
 	});
 });
 

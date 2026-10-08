@@ -41,7 +41,7 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { brotliCompress, constants, gzip } from "node:zlib";
+import { brotliCompress, brotliCompressSync, constants, gzip, gzipSync } from "node:zlib";
 import { type DocumentProfile, profileDocument, selectorNames, shakeCSS, splitCSS } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
@@ -509,17 +509,22 @@ export class Assets {
 				// The name carries the hash, so a change is a new URL and this
 				// can be as long as the spec allows. A file from disk that could
 				// not be checked against its name gets a few minutes instead.
-				ctx.response.headers.set(
-					"cache-control",
-					this.unverified.has(file) ? "public, max-age=300" : "public, max-age=31536000, immutable",
-				);
+				let cacheControl = this.unverified.has(file) ? "public, max-age=300" : "public, max-age=31536000, immutable";
 				// Both answers vary, so a cache never hands brotli to a client that asked for none.
 				addVary(ctx.response.headers, "Accept-Encoding");
 				const encoding = negotiate(ctx.request.headers.get("accept-encoding"));
-				// A chunk asked for while its copies are still being made waits
-				// for them: off this thread, rather than compressed again on it.
-				const copies = encoding ? (this.encoded.get(file) ?? (await this.encoding.get(file))) : undefined;
-				const bytes = encoding ? copies?.[encoding] : undefined;
+				let bytes = encoding ? this.encoded.get(file)?.[encoding] : undefined;
+				if (encoding && !bytes) {
+					// The top-quality copies are still being made. Waiting for
+					// brotli 11 costs about 50 ms on a 30 KB chunk, and several times
+					// that on a busy or slow machine; a fast copy costs well under a
+					// millisecond and is a few percent larger. It goes out now. The
+					// browser keeps it (same content), while a shared cache keeps it
+					// a minute and then comes back for the smaller copy.
+					bytes = fastCopy(held.body, encoding);
+					if (!this.unverified.has(file)) cacheControl = "public, max-age=31536000, s-maxage=60, immutable";
+				}
+				ctx.response.headers.set("cache-control", cacheControl);
 				if (encoding && bytes) {
 					ctx.response.headers.set("content-encoding", encoding);
 					ctx.response.body = bytes as Uint8Array<ArrayBuffer>;
@@ -1000,6 +1005,21 @@ async function precompress(body: string): Promise<{ br: Uint8Array; gzip: Uint8A
 		gzipAsync(bytes, { level: 9 }),
 	]);
 	return { br: new Uint8Array(br), gzip: new Uint8Array(gz) };
+}
+
+/** A chunk compressed at a level that costs well under a millisecond, for while its top-quality copy is made. */
+function fastCopy(body: string, encoding: keyof Encoded): Uint8Array {
+	const bytes = new TextEncoder().encode(body);
+	if (encoding === "gzip") return new Uint8Array(gzipSync(bytes, { level: 6 }));
+	return new Uint8Array(
+		brotliCompressSync(bytes, {
+			params: {
+				[constants.BROTLI_PARAM_QUALITY]: 5,
+				[constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
+				[constants.BROTLI_PARAM_SIZE_HINT]: bytes.length,
+			},
+		}),
+	);
 }
 
 /** The type a chunk is served as, by its extension; undefined for anything else. */
