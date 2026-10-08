@@ -195,8 +195,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		expect(nonces.boot.length).toBe(32);
 		expect(nonces.added).toBe(nonces.boot);
 		expect(nonces.async).toBe(false);
-		// No script was refused. (Page B's `<noscript><style>` draws a style
-		// report from DOMParser; the noscript test pins that down.)
+		// No script was refused.
 		expect(await page.evaluate(() => (window as any).__csp.filter((v: string) => v.startsWith("script-src")))).toEqual([]);
 		expect(await loads(page)).toBe(1);
 		await page.context().close();
@@ -424,7 +423,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("<noscript> in a part is stripped: DOMParser reads it as markup, and its style would hide the ad", async () => {
+	e2e("<noscript> never reaches a part: DOMParser would read it as markup, and its style would hide the ad", async () => {
 		const page = await open("/a");
 		expect(
 			await page.evaluate(async () => {
@@ -438,13 +437,23 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.click("#to-b");
 		await title(page, "B");
 		await page.waitForTimeout(100);
+		expect(await loads(page)).toBe(1);
 		expect(await page.evaluate(() => getComputedStyle(document.getElementById("ad")!).display)).toBe("block");
 		expect(await page.evaluate(() => document.querySelectorAll("noscript").length)).toBe(0);
-		// The style element DOMParser made inside the noscript is never used,
-		// but Chromium still reports it against the page's style-src. Parsing
-		// any inline style does this; only noscript adds reports a real load
-		// would not.
-		expect(await page.evaluate(() => (window as any).__csp)).toEqual(["style-src-elem inline"]);
+		// The server dropped it, so DOMParser made no style for Chromium to report.
+		expect(await page.evaluate(() => (window as any).__csp)).toEqual([]);
+		await page.context().close();
+	});
+
+	e2e("noscript content a full load reads as text never becomes live markup after a swap", async () => {
+		const whole = await open("/ns");
+		expect(await whole.evaluate(() => document.getElementById("escaped") === null)).toBe(true);
+		await whole.context().close();
+		const page = await open("/a");
+		await page.evaluate(() => (window as any).natsu.visit("/ns"));
+		await title(page, "NS");
+		expect(await loads(page)).toBe(1);
+		expect(await page.evaluate(() => document.getElementById("escaped") === null)).toBe(true);
 		await page.context().close();
 	});
 

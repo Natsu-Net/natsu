@@ -22,6 +22,8 @@
  *  - `/p/1` to `/p/40` and `/catalog`: kept by PageCache with the nonce and the
  *    visitor's CSRF token as secrets; the product page also has the token in
  *    a form inside its main region.
+ *  - `/ns`: a `<noscript>` whose text holds a `</div>`, which only a
+ *    parser with scripting off reads as markup.
  *  - `/legacy`: lists a script that never calls `natsu.mount`. Page A also
  *    has a link marked `data-natsu-reload`.
  *  - `/quiet`: navigable without prefetch. `/slow`: a navigation answered
@@ -260,6 +262,12 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 		// A counter with no counter.js listed: its mount must not run here.
 		return layout({ nonce: secure(ctx), csrf: csrfOf(ctx), title: "C", main: `${note}<h1>Page C</h1><button id="count" data-counter>0</button>` });
 	}));
+	// A noscript whose raw text holds an end tag: read with scripting off, `</div>` would let the rest out.
+	Routes.get("/ns", navigable(own(() => ({
+		title: "NS",
+		main: '<h1>NS</h1><div><noscript></div><p id="escaped">only without scripting</p></noscript></div>',
+		scripts: ["counter"],
+	}))));
 	Routes.get("/legacy", navigable(own(() => ({ title: "Legacy", main: "<h1>Legacy</h1>", scripts: ["legacy"] }))));
 	Routes.get("/quiet", navigable(own(() => ({ title: "Quiet", main: "<h1>Quiet</h1>" })), { prefetch: false }));
 	Routes.get("/slow", navigable(async (ctx) => {

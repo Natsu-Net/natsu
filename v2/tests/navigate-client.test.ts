@@ -860,7 +860,7 @@ describe("stylesheets", () => {
 });
 
 describe("regions", () => {
-	test("<noscript> is stripped from the part, so its style never applies", async () => {
+	test("a <noscript> left in the part (the server drops them) means a real load: DOMParser reads its content as markup", async () => {
 		const p = open({
 			html: page(),
 			routes: {
@@ -874,9 +874,9 @@ describe("regions", () => {
 		});
 		p.click("#to-b");
 		await settle();
-		expect(p.document.querySelector("[data-ad-spot]")).not.toBeNull();
-		expect(p.document.querySelectorAll("noscript").length).toBe(0);
-		expect(p.document.querySelectorAll("main style").length).toBe(0);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+		expect(text(p, "main h1")).toBe("Page A");
+		expect(p.document.querySelectorAll("noscript, style").length).toBe(0);
 	});
 
 	test("region ids that differ from the current ones, or in another order, mean a real load", async () => {

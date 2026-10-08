@@ -98,12 +98,13 @@
  *
  * **The swap**, step by step:
  *
- *  1. The part is parsed with `DOMParser`, and every `<noscript>` in it is
- *     removed: a parser with scripting off reads their content as markup, so
- *     `<noscript><style>` would otherwise become a live style. A part that
- *     cannot be parsed (Trusted Types refuses `DOMParser`), or holds a
- *     declarative shadow root (`<template shadowrootmode>`, which DOMParser
- *     leaves inert), is a real load. An answer already in hand (prefetched)
+ *  1. The part is parsed with `DOMParser`. The server leaves every
+ *     `<noscript>` out of it: a parser with scripting off reads their content
+ *     as markup, so `<noscript><style>` would become a live style, and a
+ *     `</div>` inside would let the rest out of it. A part that cannot be
+ *     parsed (Trusted Types refuses `DOMParser`), or still holds a
+ *     `<noscript>` or a declarative shadow root (`<template shadowrootmode>`,
+ *     which DOMParser leaves inert), is a real load. An answer already in hand (prefetched)
  *     yields a frame first, so the click's own frame paints.
  *  2. Its region ids must equal the current ones, in order.
  *  3. Its stylesheets go in before the current ones and must load first
@@ -675,8 +676,6 @@ if (!first && KEY && regions(D)[0]) {
 			const f = new URL(r.url || u);
 			f.hash = u.hash;
 			const doc = new DOMParser().parseFromString(text, "text/html");
-			// Read with scripting off, their content is markup: a <noscript><style> would apply.
-			for (const e of doc.querySelectorAll("noscript")) e.remove();
 			// A nonce in the part's head is the real one, and Natsu-Nonce lists the
 			// ones the server vouched for. Those read "" (as a live element shows its
 			// hidden nonce, so the merge sees an unchanged one as unchanged) and
@@ -697,13 +696,15 @@ if (!first && KEY && regions(D)[0]) {
 				.map((p) => [new URL(p.get("src")!, f).href, p] as const);
 			const now = regions(D);
 			const next = regions(doc);
-			// DOMParser leaves a declarative shadow root an inert <template>; a real load attaches it.
-			if (ids(now) != ids(next) || doc.querySelector("template[shadowrootmode]")) {
+			// DOMParser leaves a declarative shadow root an inert <template>; a real
+			// load attaches it. And it reads a <noscript> with scripting off, as
+			// markup: the server drops them, and one left (in svg, say) is refused.
+			if (ids(now) != ids(next) || doc.querySelector("noscript,template[shadowrootmode]")) {
 				if (DEV)
 					why(
 						...(ids(now) != ids(next)
 							? ["regions differ:", now.map((e) => e.id), "->", next.map((e) => e.id)]
-							: ["a declarative shadow root in a region:", doc.querySelector("template[shadowrootmode]")]),
+							: ["a <noscript> or a declarative shadow root in the part:", doc.querySelector("noscript,template[shadowrootmode]")]),
 					);
 				return full(u, h);
 			}

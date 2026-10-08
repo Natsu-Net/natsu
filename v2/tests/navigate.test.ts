@@ -724,6 +724,20 @@ describe("the script list", () => {
 		expect(part).not.toContain("stale");
 	});
 
+	test("drops every <noscript>, in the head and the regions, which a parser with scripting off would read as markup", () => {
+		const html = page({
+			head: '<noscript><base href="/evil/"></noscript><NoScript><link rel="stylesheet" href="/n.css"></NoScript>',
+			main: '<h1>A</h1><div><noscript></div><p id="escaped">x</p></noscript></div><!-- <noscript>kept</noscript> --><p title="<noscript>">t</p>',
+		});
+		const scan = scanPage(html);
+		if (scan === null || "reason" in scan) throw new Error("no scan");
+		const part = partOf(html, scan, "k.k", ["n1"]).html;
+		expect(part).not.toContain("evil");
+		expect(part).not.toContain("/n.css");
+		expect(part).not.toContain("escaped");
+		expect(part).toContain('<main id="main" data-natsu-region><h1>A</h1><div></div><!-- <noscript>kept</noscript> --><p title="<noscript>">t</p></main>');
+	});
+
 	test("a bare nonce, or one in the title's text, never passes for this response's", () => {
 		const html = page({
 			title: 'Say nonce="n1" here',
