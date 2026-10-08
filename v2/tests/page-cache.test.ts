@@ -4,6 +4,7 @@
  */
 
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { invalidate } from "../src/invalidate.ts";
 import { type CachedPage, PageCache, type PageRender, filledOf } from "../src/page-cache.ts";
 
 const NONCE_A = "a".repeat(32);
@@ -329,5 +330,245 @@ describe("PageCache", () => {
 		const plain = "no marks here";
 		expect(filled.fill(plain)).toBe(plain);
 		expect(filledOf({ body: answer.body, status: 200 })).toBeUndefined();
+	});
+});
+
+/** A page tagged `tags` that says which render drew it. */
+function tagged(tags: readonly string[], hold?: CachedPage["hold"]) {
+	let renders = 0;
+	const draw: PageRender = async () => {
+		renders++;
+		return { body: `drawn ${renders}`, status: 200, tags, ...(hold ? { hold } : {}) };
+	};
+	return { draw, renders: () => renders };
+}
+
+const index = (cache: PageCache) => (cache as unknown as { byTag: Map<string, Set<string>> }).byTag;
+
+describe("PageCache tags", () => {
+	test("dropping a tag deletes only the pages that carry it", async () => {
+		const cache = new PageCache({ fresh: 60 });
+		const shoe = tagged(["product:shoe", "catalog"]);
+		const hat = tagged(["product:hat", "catalog"]);
+		const plain = renderer();
+		await cache.serve("/shoe", [], shoe.draw);
+		await cache.serve("/hat", [], hat.draw);
+		await cache.serve("/about", [NONCE_A, CSRF_A], plain.draw);
+		expect(cache.dropTags(["product:shoe", "unknown"], "delete")).toBe(1);
+		expect(cache.size).toBe(2);
+		expect((await cache.serve("/shoe", [], shoe.draw))?.body).toBe("drawn 2");
+		expect((await cache.serve("/hat", [], hat.draw))?.body).toBe("drawn 1");
+		expect(cache.dropTags(["catalog"], "delete")).toBe(2);
+		expect(cache.size).toBe(1);
+		expect(plain.renders()).toBe(1);
+	});
+
+	test("tags and hold are never part of an answer", async () => {
+		const cache = new PageCache();
+		const page = tagged(["catalog"], { fresh: 5, stale: 5 });
+		expect(await cache.serve("/p", [], page.draw)).toEqual({ body: "drawn 1", status: 200 });
+		expect(await cache.serve("/p", [], page.draw)).toEqual({ body: "drawn 1", status: 200 });
+		const once = await cache.serve("/q", [], async () => ({ body: "x", status: 200, keep: false, tags: ["catalog"] }));
+		expect(once).toEqual({ body: "x", status: 200 });
+	});
+
+	test("an expired page is served once more while it is drawn again, then the new one", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 60, stale: 30 });
+		const page = tagged(["product:shoe"]);
+		await cache.serve("/shoe", [], page.draw);
+		expect(cache.dropTags(["product:shoe"], "expire")).toBe(1);
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 1");
+		await Bun.sleep(0);
+		expect(page.renders()).toBe(2);
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 2");
+		expect(cache.counts).toEqual({ fresh: 1, stale: 1, rendered: 2 });
+		// Within its stale time only: past it the next visitor waits on a render.
+		cache.dropTags(["product:shoe"], "expire");
+		setSystemTime(new Date("2026-10-01T00:00:31Z"));
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 3");
+	});
+
+	test("expiring a page kept with no stale time forgets it", async () => {
+		const cache = new PageCache({ fresh: 60, stale: 0 });
+		const page = tagged(["catalog"]);
+		await cache.serve("/p", [], page.draw);
+		expect(cache.dropTags(["catalog"], "expire")).toBe(1);
+		expect(cache.size).toBe(0);
+		expect((await cache.serve("/p", [], page.draw))?.body).toBe("drawn 2");
+	});
+
+	test("a render under way when its tag drops answers who asked, and is not kept", async () => {
+		for (const mode of ["delete", "expire"] as const) {
+			const cache = new PageCache({ fresh: 60 });
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let renders = 0;
+			const draw: PageRender = async () => {
+				const n = ++renders;
+				if (n === 1) await gate;
+				return { body: `drawn ${n}`, status: 200, tags: ["product:shoe"] };
+			};
+			// Not kept yet, so nothing in the index names it: the drop still reaches it.
+			const first = cache.serve("/shoe", [], draw);
+			cache.dropTags(["product:shoe"], mode);
+			release();
+			expect((await first)?.body).toBe("drawn 1");
+			expect(cache.size).toBe(0);
+			expect((await cache.serve("/shoe", [], draw))?.body).toBe("drawn 2");
+			// A render under way for a page that draws other data is kept (the drop
+			// below deletes or expires /shoe again, and leaves /hat).
+			const other = tagged(["product:hat"]);
+			let open = () => {};
+			const wait = new Promise<void>((resolve) => {
+				open = resolve;
+			});
+			const hat = cache.serve("/hat", [], async (marks) => (await wait, other.draw(marks)));
+			cache.dropTags(["product:shoe"], mode);
+			open();
+			await hat;
+			expect(cache.size).toBe(mode === "delete" ? 1 : 2);
+			expect(cache.dropTags(["product:hat"], "delete")).toBe(1);
+		}
+	});
+
+	test("expiring voids a refresh already under way, which read the old data", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 10, stale: 30 });
+		let version = "old";
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const draw: PageRender = async () => {
+			const read = version;
+			if (read === "old" && cache.counts.rendered > 0) await gate;
+			return { body: read, status: 200, tags: ["doc:1"] };
+		};
+		await cache.serve("/doc", [], draw);
+		setSystemTime(new Date("2026-10-01T00:00:15Z"));
+		// A stale answer starts a refresh, which reads "old" and then waits.
+		expect((await cache.serve("/doc", [], draw))?.body).toBe("old");
+		version = "new";
+		cache.dropTags(["doc:1"], "expire");
+		release();
+		await Bun.sleep(0);
+		// The refresh was not kept; the next answer is still the old page, and starts a new refresh.
+		expect((await cache.serve("/doc", [], draw))?.body).toBe("old");
+		await Bun.sleep(0);
+		expect((await cache.serve("/doc", [], draw))?.body).toBe("new");
+	});
+
+	test("the tag index stays bounded as pages are pushed out and replaced", async () => {
+		const cache = new PageCache({ maxChars: 2000 });
+		for (let i = 0; i < 500; i++) {
+			await cache.serve(`/p/${i}`, [], async () => ({ body: "x".repeat(100), status: 200, tags: [`product:${i}`, "catalog"] }));
+		}
+		expect(cache.size).toBeLessThan(20);
+		expect(index(cache).size).toBe(cache.size + 1);
+		expect(index(cache).get("catalog")?.size).toBe(cache.size);
+		// A page drawn again with other tags leaves its old ones.
+		const last = "/p/499";
+		cache.delete(last);
+		await cache.serve(last, [], async () => ({ body: "y", status: 200, tags: ["other"] }));
+		expect(index(cache).has("product:499")).toBe(false);
+		cache.clear();
+		expect(index(cache).size).toBe(0);
+	});
+
+	test("a page with too many tags, or one that is not a tag, keeps none", async () => {
+		const cache = new PageCache({ fresh: 60 });
+		const many = Array.from({ length: 65 }, (_, i) => `t:${i}`);
+		await cache.serve("/many", [], tagged(many).draw);
+		await cache.serve("/bad", [], tagged(["catalog", "has space"]).draw);
+		const exactly = Array.from({ length: 64 }, (_, i) => `t:${i}`);
+		await cache.serve("/fits", [], tagged([...exactly, ...exactly]).draw);
+		expect(cache.size).toBe(3);
+		expect(cache.dropTags(["t:0", "catalog"], "delete")).toBe(1);
+		expect(cache.size).toBe(2);
+		expect(index(cache).size).toBe(0);
+	});
+
+	test("hold keeps a page for its own fresh and stale time", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 10, stale: 30 });
+		const long = tagged(["catalog"], { fresh: 300, stale: 600 });
+		const odd = tagged(["catalog"], { fresh: -1, stale: Number.NaN });
+		await cache.serve("/long", [], long.draw);
+		await cache.serve("/odd", [], odd.draw);
+		setSystemTime(new Date("2026-10-01T00:04:00Z"));
+		expect((await cache.serve("/long", [], long.draw))?.body).toBe("drawn 1");
+		expect(cache.counts.fresh).toBe(1);
+		// A hold that is not a number of seconds is the cache's own: long gone by now.
+		expect((await cache.serve("/odd", [], odd.draw))?.body).toBe("drawn 2");
+		setSystemTime(new Date("2026-10-01T00:14:00Z"));
+		expect((await cache.serve("/long", [], long.draw))?.body).toBe("drawn 1");
+		expect(cache.counts.stale).toBe(1);
+	});
+
+	test("expireAll makes every page old and caps how long it is served", async () => {
+		setSystemTime(new Date("2026-10-01T00:00:00Z"));
+		const cache = new PageCache({ fresh: 10, stale: 30 });
+		const long = tagged([], { fresh: 300, stale: 600 });
+		const plain = renderer();
+		await cache.serve("/long", [], long.draw);
+		await cache.serve("/plain", [NONCE_A, CSRF_A], plain.draw);
+		cache.expireAll(5);
+		setSystemTime(new Date("2026-10-01T00:00:04Z"));
+		expect((await cache.serve("/long", [], long.draw))?.body).toBe("drawn 1");
+		await Bun.sleep(0);
+		expect(long.renders()).toBe(2);
+		setSystemTime(new Date("2026-10-01T00:00:06Z"));
+		// Past the cap the old page is not served; the redrawn one is fresh again.
+		expect((await cache.serve("/plain", [NONCE_A, CSRF_A], plain.draw))?.body).toEndWith("page 2");
+		expect((await cache.serve("/long", [], long.draw))?.body).toBe("drawn 2");
+		expect(cache.counts.fresh).toBe(1);
+		cache.expireAll(0);
+		expect(cache.size).toBe(0);
+	});
+
+	test("a render under way when everything expires is not kept", async () => {
+		const cache = new PageCache({ fresh: 60 });
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const first = cache.serve("/p", [], async () => (await gate, { body: "before", status: 200 }));
+		cache.expireAll(30);
+		release();
+		expect((await first)?.body).toBe("before");
+		expect(cache.size).toBe(0);
+	});
+
+	test("with invalidate: true, a plain invalidation deletes and a soft one expires", async () => {
+		const cache = new PageCache({ fresh: 60, invalidate: true });
+		const page = tagged(["product:shoe"]);
+		await cache.serve("/shoe", [], page.draw);
+		invalidate("product:shoe", { soft: true });
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 1");
+		await Bun.sleep(0);
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 2");
+		invalidate(["product:shoe"], { remote: true });
+		expect(cache.size).toBe(0);
+		expect((await cache.serve("/shoe", [], page.draw))?.body).toBe("drawn 3");
+		cache.clear();
+	});
+
+	test("listen() does the same until it is stopped; a cache left alone hears nothing", async () => {
+		const deaf = new PageCache({ fresh: 60 });
+		const cache = new PageCache({ fresh: 60 });
+		const page = tagged(["doc:7"]);
+		await deaf.serve("/doc", [], page.draw);
+		await cache.serve("/doc", [], page.draw);
+		const stop = cache.listen();
+		invalidate("doc:7");
+		expect(cache.size).toBe(0);
+		expect(deaf.size).toBe(1);
+		await cache.serve("/doc", [], page.draw);
+		stop();
+		invalidate("doc:7");
+		expect(cache.size).toBe(1);
 	});
 });
