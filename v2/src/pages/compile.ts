@@ -1,0 +1,254 @@
+/**
+ * Page files, compiled: from `pages/**\/*.uwu` under an app directory to the
+ * route table, each file's server module, and what each one reads.
+ *
+ *   pages/index.uwu          /
+ *   pages/about.uwu          /about
+ *   pages/jobs/index.uwu     /jobs
+ *   pages/p/[slug].uwu       /p/:slug
+ *   pages/_layout.uwu        wraps every page in pages/ and below ({{> @child}})
+ *   pages/jobs/_layout.uwu   wraps the pages in jobs/, inside the one above
+ *   pages/_error.uwu         drawn for a 404/403/500 a page answers
+ *   pages/_bare.uwu          a layout a page picks by name: <page layout="_bare">
+ *
+ * A file or directory whose name starts with `_` is never a route.
+ *
+ * Templates are compiled once: `compilePages(dir, outDir)` writes them for a
+ * deploy, and `mountPages({ dir })` compiles them in memory at start (and
+ * again on change, in development). Either way the output is uwu's server
+ * module text, which natsu evaluates against uwu's runtime itself, so a build
+ * directory needs no module resolution of its own.
+ */
+
+import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { type PageBlock, splitPageBlock, textPaths } from "./block.ts";
+import { PageCompileError } from "./errors.ts";
+import { type Reads, type TplNode, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
+
+export type FileKind = "page" | "layout" | "error";
+
+/** What a name is read as, in a form that survives JSON (the build manifest). */
+export interface ReadInfo {
+	fields: string[];
+	line: number;
+}
+
+export interface CompiledFile {
+	/** Relative to `pages/`, with `/` separators. */
+	file: string;
+	kind: FileKind;
+	/** Pages only: the route pattern, `/p/:slug`. */
+	route?: string;
+	params: string[];
+	block: PageBlock | null;
+	/** Every top-level name the file reads (template, title, data arguments). */
+	reads: Record<string, ReadInfo>;
+	/** uwu's server module, as text. */
+	server: string;
+	css: string;
+	/** Partials (`{{> name}}`) the template includes: their reads are not seen here. */
+	partials: string[];
+}
+
+export interface PageManifest {
+	version: 1;
+	files: (Omit<CompiledFile, "server"> & { module: string })[];
+}
+
+/** The part of uwu's `compile` result natsu reads. */
+interface UwuCompiled {
+	server: string;
+	css: string;
+	sfc: { scripts: { content: string }[] };
+	template?: { nodes: unknown[] };
+}
+
+type UwuCompile = (source: string, options: { file?: string; componentId?: string }) => UwuCompiled;
+
+// Loaded by a specifier the type checker does not follow: uwu ships its
+// TypeScript sources, written to flags looser than natsu's, and checking
+// natsu should not mean checking uwu's compiler with them.
+const UWU = "uwu-template";
+const { compile } = (await import(UWU)) as { compile: UwuCompile };
+
+const SEGMENT = /^[\w.~-]+$/;
+const PARAM = /^\[([A-Za-z_][\w]*)\]$/;
+
+/** The route a page file answers, from its path under `pages/`. */
+export function routeOf(file: string): { route: string; params: string[] } {
+	const parts = file.replace(/\.uwu$/, "").split("/");
+	if (parts[parts.length - 1] === "index") parts.pop();
+	const params: string[] = [];
+	const out: string[] = [];
+	for (const part of parts) {
+		const param = PARAM.exec(part);
+		if (param) {
+			if (params.includes(param[1]!)) throw new PageCompileError(`pages/${file}`, 1, `the route names '${param[1]}' twice`);
+			params.push(param[1]!);
+			out.push(`:${param[1]}`);
+		} else if (SEGMENT.test(part)) out.push(part);
+		else {
+			throw new PageCompileError(
+				`pages/${file}`,
+				1,
+				`'${part}' cannot be part of a route: use letters, digits, '-', '_', '.', or [param] for a parameter`,
+			);
+		}
+	}
+	return { route: `/${out.join("/")}`, params };
+}
+
+function kindOf(file: string): FileKind {
+	const parts = file.split("/");
+	const base = parts[parts.length - 1]!;
+	if (base === "_error.uwu") return "error";
+	if (parts.some((part) => part.startsWith("_"))) return "layout";
+	return "page";
+}
+
+/** Every `.uwu` file under `pagesDir`, relative and sorted. */
+export function listPageFiles(pagesDir: string): string[] {
+	const out: string[] = [];
+	const walk = (dir: string): void => {
+		let entries;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const full = join(dir, entry.name);
+			if (entry.isDirectory()) walk(full);
+			else if (entry.name.endsWith(".uwu")) out.push(relative(pagesDir, full).split(sep).join("/"));
+		}
+	};
+	walk(pagesDir);
+	return out.sort();
+}
+
+/** Compile one page, layout or error file. `file` is relative to `pages/`. */
+export function compilePageFile(source: string, file: string): CompiledFile {
+	const shown = `pages/${file}`;
+	const kind = kindOf(file);
+	const { rest, block } = splitPageBlock(source, shown);
+	if (block && kind !== "page") {
+		const pageOnly = (["title", "description", "cache", "layout"] as const).find((key) => block[key] !== undefined);
+		if (pageOnly) {
+			throw new PageCompileError(shown, block.line, `<page ${pageOnly}> belongs on a page; a ${kind} file may only declare <data>`);
+		}
+	}
+
+	let result: UwuCompiled;
+	try {
+		// uwu derives the scope of a `<style>` from the component id, and its
+		// default is the same for every file: name each one, or their styles mix.
+		result = compile(rest, { file: shown, componentId: `pages/${file}` });
+	} catch (error) {
+		const loc = (error as { loc?: { line: number } }).loc;
+		throw new PageCompileError(shown, loc?.line ?? 1, (error as Error).message);
+	}
+	if (/^\s*import\s/m.test(result.server.replace(/^import\s*\{[^}]*\}\s*from\s*"@uwu\/runtime";?\s*$/m, ""))) {
+		throw new PageCompileError(shown, 1, "a page's <script> may not import modules: load data in a source and read it by name");
+	}
+
+	const partials: string[] = [];
+	const reads: Reads = collectReads((result.template?.nodes ?? []) as TplNode[], {
+		scriptNames: scriptDeclarations(result.sfc.scripts),
+		onPartial: (name) => partials.push(name),
+	});
+
+	// The block reads too: title holes, data arguments, service paths.
+	if (block) {
+		const at = { line: block.line, col: 1 };
+		for (const path of [...textPaths(block.title), ...textPaths(block.description)]) addRead(reads, path, at);
+		for (const decl of block.data) {
+			const where = { line: decl.line, col: 1 };
+			if (decl.from.t === "source") {
+				for (const arg of Object.values(decl.from.args)) if (arg.t === "path") addRead(reads, arg.segments, where);
+			} else for (const path of textPaths(decl.from.path)) addRead(reads, path, where);
+		}
+	}
+
+	const { route, params } = kind === "page" ? routeOf(file) : { route: undefined, params: [] };
+	const out: Record<string, ReadInfo> = {};
+	for (const [name, read] of reads) out[name] = { fields: fieldList(read), line: read.loc.line };
+	return { file, kind, route, params, block, reads: out, server: result.server, css: result.css, partials };
+}
+
+/** Compile every file under `<appDir>/pages`. */
+export function compileAll(appDir: string): CompiledFile[] {
+	const pagesDir = join(appDir, "pages");
+	const files = listPageFiles(pagesDir);
+	const compiled = files.map((file) => compilePageFile(readFileSync(join(pagesDir, file), "utf8"), file));
+	const routes = new Map<string, string>();
+	for (const page of compiled) {
+		if (page.kind !== "page") continue;
+		const other = routes.get(page.route!);
+		if (other) throw new PageCompileError(`pages/${page.file}`, 1, `answers ${page.route}, as pages/${other} already does`);
+		routes.set(page.route!, page.file);
+	}
+	return compiled;
+}
+
+/**
+ * Compile `<appDir>/pages` for a deploy: one ES module per file under
+ * `outDir/pages/`, the scoped CSS of all of them in `outDir/pages.css`, and
+ * `outDir/pages.json`, which `mountPages({ built: outDir })` loads.
+ */
+export function compilePages(appDir: string, outDir: string): PageManifest {
+	const compiled = compileAll(appDir);
+	const manifest: PageManifest = { version: 1, files: [] };
+	for (const { server, ...rest } of compiled) {
+		const module = `pages/${rest.file.replace(/\.uwu$/, ".js")}`;
+		mkdirSync(dirname(join(outDir, module)), { recursive: true });
+		writeFileSync(join(outDir, module), server);
+		manifest.files.push({ ...rest, module });
+	}
+	writeFileSync(join(outDir, "pages.css"), compiled.map((file) => file.css).filter(Boolean).join("\n"));
+	writeFileSync(join(outDir, "pages.json"), JSON.stringify(manifest, null, "\t"));
+	return manifest;
+}
+
+/** Load what `compilePages` wrote. */
+export function loadBuilt(outDir: string): CompiledFile[] {
+	const manifest = JSON.parse(readFileSync(join(outDir, "pages.json"), "utf8")) as PageManifest;
+	if (manifest.version !== 1) throw new Error(`natsu/pages: ${outDir}/pages.json is from another version of natsu`);
+	return manifest.files.map(({ module, ...rest }) => ({ ...rest, server: readFileSync(join(outDir, module), "utf8") }));
+}
+
+// --- evaluating a server module --------------------------------------------
+
+export type Render = (props: Record<string, unknown>, child?: string, opts?: Record<string, unknown>) => Promise<string>;
+
+let runtime: Promise<Record<string, unknown>> | undefined;
+
+/**
+ * uwu's runtime, found from where `uwu-template` itself lives: the compiled
+ * modules import `@uwu/runtime`, which is uwu-template's dependency, not
+ * natsu's, and need not be resolvable from the app.
+ */
+export function uwuRuntime(): Promise<Record<string, unknown>> {
+	return (runtime ??= (async () => {
+		const umbrella = realpathSync(Bun.resolveSync("uwu-template", import.meta.dir));
+		return (await import(Bun.resolveSync("@uwu/runtime", dirname(umbrella)))) as Record<string, unknown>;
+	})());
+}
+
+const RUNTIME_IMPORT = /^import\s*\{([^}]*)\}\s*from\s*"@uwu\/runtime";?\s*$/m;
+
+/** Turn a compiled server module's text into its `render` function. */
+export async function evaluateServer(text: string, file: string): Promise<Render> {
+	const rt = await uwuRuntime();
+	const imports = RUNTIME_IMPORT.exec(text);
+	let body = text.replace(RUNTIME_IMPORT, "");
+	const bindings = (imports?.[1] ?? "")
+		.split(",")
+		.map((part) => part.trim())
+		.filter(Boolean)
+		.map((part) => part.replace(/\s+as\s+/, ": "));
+	if (!/export\s+async\s+function\s+render\b/.test(body)) throw new Error(`natsu/pages: ${file} has no render export`);
+	body = body.replace(/export\s+async\s+function\s+render\b/, "async function render");
+	const code = `"use strict";\nconst { ${bindings.join(", ")} } = __rt;\n${body}\nreturn render;\n//# sourceURL=${file}`;
+	return new Function("__rt", code)(rt) as Render;
+}
