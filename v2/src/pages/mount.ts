@@ -30,7 +30,8 @@
  * the action. Then a 303 back to the page (or where the action said), with
  * its `flash` in a one-time cookie the page reads as `flash`; or, for a
  * refused form, the page drawn again (422) with `form.errors`,
- * `form.values` and `form.message`. With the runtime the same POST goes by
+ * `form.values` and `form.message`; or, for an answer shown once (a new
+ * key), the page drawn now with `form.shown`, never stored. With the runtime the same POST goes by
  * fetch with the page's key, and the answer is a part: the regions are
  * swapped, no reload.
  *
@@ -687,6 +688,15 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				else if (more) tags.push(...more);
 			}
 			invalidate(tags);
+
+			if (result.show) {
+				// Shown once: drawn into this answer only, never kept by a cache or the history's URL.
+				const out = await draw(ctx, state, secrets, {
+					form: { action: short, errors: {}, values: {}, message: result.flash ?? "", shown: result.show },
+				});
+				ctx.response.headers.set("cache-control", "no-store");
+				return answer(ctx, out);
+			}
 
 			if (result.flash) {
 				ctx.setCookie(FLASH_COOKIE, encodeFlash({ message: result.flash, ok: true }), { httpOnly: true, sameSite: "lax", secure: secure(), path: "/", maxAge: 60 });
