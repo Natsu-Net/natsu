@@ -8,6 +8,7 @@
 <body>
 <header>
   <a href="/">Jobs</a>
+  <a href="/board">Board</a>
   {{#each categories}}<a href="/?category={{slug}}">{{name}}</a>{{/each}}
   {{#if viewer}}<span>Hi {{viewer.name}}</span>{{#else}}<a href="/login">Sign in</a>{{/if}}
 </header>

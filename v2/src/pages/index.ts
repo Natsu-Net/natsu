@@ -4,7 +4,20 @@
  * each name comes from, block.ts for the `<page>` block.
  */
 
-export { compilePages, compilePageFile, routeOf, type CompiledFile, type PageManifest } from "./compile.ts";
+export {
+	Invalid,
+	action,
+	clearActions,
+	guard,
+	type ActionHandler,
+	type ActionInput,
+	type ActionOptions,
+	type ActionResult,
+	type AuthRule,
+	type Guard,
+	type GuardInput,
+} from "./actions.ts";
+export { compilePages, compilePageFile, routeOf, type CompiledFile, type CompileOptions, type PageManifest } from "./compile.ts";
 export {
 	clearSources,
 	defaultKind,

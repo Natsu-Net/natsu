@@ -1,0 +1,1 @@
+<template><li>{{text}} <button @click="action:notes.remove" data-id="{{id}}">remove</button></li></template>

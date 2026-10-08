@@ -432,10 +432,14 @@ export class Navigation {
 			if (headers.has("natsu-prefetch")) headers.delete("natsu-prefetch");
 			return false;
 		}
-		const prefetch = headers.get("natsu-prefetch") === "1";
+		// An action the runtime posts (`Natsu-Action: 1`) is answered as a visit
+		// is: its 303 back becomes a visit of the page, a refused form a part.
+		const action = ctx.method === "POST" && headers.get("natsu-action") === "1";
+		const prefetch = !action && headers.get("natsu-prefetch") === "1";
 		headers.delete("natsu-nav");
 		headers.delete("natsu-prefetch");
-		if (ctx.method !== "GET") return false;
+		headers.delete("natsu-action");
+		if (ctx.method !== "GET" && !action) return false;
 		// A browser navigation never carries the header; one that claims to is
 		// not the runtime, and gets the page.
 		if (headers.get("sec-fetch-mode") === "navigate" || headers.get("sec-fetch-dest") === "document") return false;

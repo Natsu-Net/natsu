@@ -9,14 +9,18 @@
  *                  and its `company` through a `<data>` line that waits
  *                  for `job`;
  * - `/p/:slug`     loads `product` and fetches `stock` from the
- *                  `inventory` service, falling back to null.
+ *                  `inventory` service, falling back to null;
+ * - `/board`       a live counter and a list of notes: buttons and a form
+ *                  run actions (with or without script), and every open
+ *                  copy of the page redraws when either changes. Each note
+ *                  is drawn by `_partials/note.uwu`.
  *
  * The layout reads `categories` (a source) and `viewer`. The data here is
  * in memory; the resolver is where the ORM plugin will plug in.
  */
 
 import { join } from "node:path";
-import { Application, Assets, NotFound, mountPages, registerModelResolver, setConfig, source } from "../index.ts";
+import { Application, Assets, Invalid, NotFound, action, mountPages, registerModelResolver, setConfig, source } from "../index.ts";
 
 const port = Number(process.env.PORT ?? 8084);
 setConfig({
@@ -34,7 +38,7 @@ const jobs = [
 	{ id: 2, title: "Designer", summary: "Make it look like it works.", companyId: 2 },
 ];
 
-source("categories", () => [{ slug: "dev", name: "Development" }, { slug: "design", name: "Design" }]);
+source("categories", () => [{ slug: "dev", name: "Development" }, { slug: "design", name: "Design" }], { live: false });
 source("companies.byId", ({ args }) => companies.find((c) => c.id === args.id) ?? new NotFound("no such company"));
 
 /** Only these fields may sort a list: the resolver decides, never the URL. */
@@ -60,6 +64,33 @@ registerModelResolver({
 	},
 });
 
+// The board: a counter and notes, live (every open copy redraws on a change).
+const counter = { value: 0 };
+let notes: { id: number; text: string }[] = [];
+let noteId = 0;
+source("counter", () => counter);
+source("notes", () => notes);
+action(
+	"counter.bump",
+	({ input }) => {
+		const by = Number(input.by);
+		counter.value += by === 10 ? 10 : 1;
+	},
+	{ touches: ["counter"] },
+);
+action(
+	"notes.add",
+	({ input }) => {
+		const text = String(input.text ?? "").trim();
+		if (!text) throw new Invalid({ text: "Write something first" });
+		if (text.length > 140) throw new Invalid({ text: "At most 140 characters" });
+		notes = [...notes, { id: ++noteId, text }].slice(-20);
+		return { flash: "Posted" };
+	},
+	{ touches: ["notes"] },
+);
+action("notes.remove", ({ input }) => void (notes = notes.filter((note) => String(note.id) !== input.id)), { touches: ["notes"] });
+
 // A stand-in inventory service.
 const inventory = Bun.serve({
 	port: 0,
@@ -83,6 +114,9 @@ const site = await mountPages({
 	services: { inventory: { base: `http://127.0.0.1:${inventory.port}`, cookie: false } },
 });
 await app.start();
-for (const route of site.routes) console.log(route.path, "<-", route.file, route.data.map((d) => `${d.name}:${d.kind}`).join(" "));
+for (const route of site.routes) {
+	const actions = route.actions.map((a) => (a.short === a.name ? a.name : `${a.short}=${a.name}`));
+	console.log(route.path, "<-", route.file, route.data.map((d) => `${d.name}:${d.kind}`).join(" "), actions.length ? `actions: ${actions.join(" ")}` : "");
+}
 
 export { app, site };

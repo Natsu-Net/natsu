@@ -143,8 +143,8 @@ interface Opened {
 	window: W;
 	document: W;
 	natsu: NatsuClient;
-	/** Requests made through fetch, as "path?query" with their headers. */
-	calls: { url: string; headers: Record<string, string> }[];
+	/** Requests made through fetch, as "path?query" with their headers (and a POST's method and body). */
+	calls: { url: string; headers: Record<string, string>; method?: string; body?: string }[];
 	/** Real loads: ["assign", url], ["replace", url], ["reload"]. */
 	loads: string[][];
 	/** Errors the runtime reported (a mount that threw). */
@@ -200,11 +200,12 @@ function open(o: Open): Opened {
 	Object.defineProperty(window.location, "assign", { value: (u: string) => loads.push(["assign", String(u)]) });
 	Object.defineProperty(window.location, "replace", { value: (u: string) => loads.push(["replace", String(u)]) });
 	Object.defineProperty(window.location, "reload", { value: () => loads.push(["reload"]) });
-	window.fetch = async (input: string, init: { headers?: Record<string, string> } = {}) => {
+	window.fetch = async (input: string, init: { headers?: Record<string, string>; method?: string; body?: unknown } = {}) => {
 		const url = new URL(String(input), window.location.href);
 		const headers = { ...init.headers };
-		calls.push({ url: url.pathname + url.search, headers });
-		const route = o.routes?.[url.pathname + url.search];
+		const post = init.method && init.method !== "GET";
+		calls.push({ url: url.pathname + url.search, headers, ...(post ? { method: init.method, body: String(init.body) } : {}) });
+		const route = o.routes?.[(post ? `${init.method} ` : "") + url.pathname + url.search];
 		const answer = () => (route ? route(headers) : new Response("not found", { status: 404, headers: { "content-type": "text/plain" } }));
 		if (!headers["Natsu-Prefetch"]) return answer();
 		// A prefetch is over once the runtime has read its body and, a task later, settled its own chain.
@@ -2676,9 +2677,142 @@ describe("types", () => {
 	});
 });
 
+describe("actions", () => {
+	const form = `<form id="f" method="post" data-uwu-action="add" data-uwu-event="submit" data-list="7"><input type="hidden" name="_action" value="add"><input type="hidden" name="_csrf" value="T0KEN"><input name="title" value="milk"><button id="go">Add</button></form>`;
+	const button = `<button id="done" data-uwu-action="done" data-uwu-event="click" data-todo-id="3">Done</button>`;
+	const back = () => control({ "natsu-location": "/a" });
+
+	test("a submit posts the form with the page's key; the 303 back is a visit that swaps the regions", async () => {
+		const p = open({
+			html: page({ main: `<h1>Todos</h1>${form}` }),
+			routes: { "POST /a": back, "/a": () => answer(part({ main: "<h1>Todos</h1><p>milk</p>" })) },
+		});
+		const header = p.document.getElementById("hdr");
+		expect(p.submit("#f", "#go")).toBe(true);
+		await settle();
+		expect(p.calls[0]).toEqual({
+			url: "/a",
+			method: "POST",
+			headers: { "Natsu-Action": "1", "Natsu-Nav": "k1.s1" },
+			body: "_action=add&_csrf=T0KEN&title=milk&list=7",
+		});
+		expect(p.calls[1]).toEqual({ url: "/a", headers: { "Natsu-Nav": "k1.s1" } });
+		expect(p.loads).toEqual([]);
+		expect(text(p, "main p")).toBe("milk");
+		expect(p.document.getElementById("hdr")).toBe(header);
+		expect(path(p)).toBe("/a");
+		// The page shown is the same entry, not a new one.
+		expect(p.window.history.length).toBe(1);
+	});
+
+	test("a click posts the element's data and the cookie's token; a refused form comes back as a part", async () => {
+		const p = open({
+			html: page({ main: `<h1>Todos</h1>${button}` }),
+			before: (w) => (w.document.cookie = "natsu_csrf=C00KIE"),
+			routes: { "POST /a": () => answer(part({ main: "<h1>Todos</h1><p class=err>no</p>" }), 422) },
+		});
+		expect(p.click("#done")).toBe(true);
+		await settle();
+		expect(p.calls).toEqual([
+			{ url: "/a", method: "POST", headers: { "Natsu-Action": "1", "Natsu-Nav": "k1.s1" }, body: "todoId=3&_action=done&_csrf=C00KIE" },
+		]);
+		expect(text(p, "main .err")).toBe("no");
+		expect(p.loads).toEqual([]);
+	});
+
+	test("a redirect elsewhere is a visit there; one post at a time per element", async () => {
+		const p = open({
+			html: page({ main: `<h1>Todos</h1>${button}` }),
+			routes: {
+				"POST /a": async () => (await tick(5), control({ "natsu-location": "/b" })),
+				"/b": () => answer(part()),
+			},
+		});
+		p.click("#done");
+		expect(p.document.getElementById("done").getAttribute("aria-busy")).toBe("true");
+		p.click("#done");
+		await settle();
+		expect(p.calls.filter((c) => c.method === "POST").length).toBe(1);
+		expect(path(p)).toBe("/b");
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(p.window.history.length).toBe(2);
+	});
+
+	test("a reload answer is a real load of the page: the post is never sent twice", async () => {
+		const p = open({ html: page({ main: button }), routes: { "POST /a": () => control({ "natsu-reload": "shell" }) } });
+		p.click("#done");
+		await settle();
+		expect(p.calls.length).toBe(1);
+		// The page again is a reload, which fetches it with GET: the post is not sent again.
+		expect(p.loads).toEqual([["reload"]]);
+	});
+
+	test("without a key a form is the browser's; a click posts, then reloads", async () => {
+		const p = open({ html: page({ key: "", main: `${form}${button}` }), routes: { "POST /a": () => new Response("ok") } });
+		expect(p.submit("#f")).toBe(false);
+		expect(p.click("#done")).toBe(true);
+		await settle();
+		expect(p.calls[0]!.headers).toEqual({ "Natsu-Action": "1" });
+		expect(p.loads).toEqual([["reload"]]);
+	});
+});
+
+describe("live data", () => {
+	class FakeSocket {
+		static last: FakeSocket | undefined;
+		readyState = 0;
+		sent: string[] = [];
+		onopen?: () => void;
+		onmessage?: (e: { data: string }) => void;
+		onclose?: () => void;
+		constructor(public url: string) {
+			FakeSocket.last = this;
+		}
+		send(data: string) {
+			this.sent.push(data);
+		}
+		open() {
+			this.readyState = 1;
+			this.onopen?.();
+		}
+	}
+	const live = (tags: string) => `<meta name="natsu-live" content="${tags}">`;
+
+	test("a page with live tags watches them, and refreshes its regions when one is invalidated", async () => {
+		FakeSocket.last = undefined;
+		let n = 0;
+		const p = open({
+			html: page({ head: live("todos|SIG") }),
+			before: (w) => (w.WebSocket = FakeSocket),
+			routes: { "/a": () => answer(part({ head: live("todos|SIG"), main: `<h1>A ${++n}</h1>` })), "/b": () => answer(part()) },
+		});
+		const ws = FakeSocket.last!;
+		expect(ws.url).toBe("wss://shop.test/_uwu/socket");
+		ws.open();
+		expect(ws.sent).toEqual([JSON.stringify({ t: "watch", tags: "todos|SIG" })]);
+		ws.onmessage!({ data: JSON.stringify({ t: "invalidate", tag: "todos" }) });
+		ws.onmessage!({ data: JSON.stringify({ t: "invalidate", tag: "todos" }) });
+		await tick(60);
+		await settle();
+		// Two frames, one refresh.
+		expect(p.calls).toEqual([{ url: "/a", headers: { "Natsu-Nav": "k1.s1" } }]);
+		expect(text(p, "main h1")).toBe("A 1");
+		// A page without tags stops watching.
+		p.click("#to-b");
+		await settle();
+		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: "" }));
+	});
+
+	test("a page without tags opens no socket", () => {
+		FakeSocket.last = undefined;
+		open({ html: page(), before: (w) => (w.WebSocket = FakeSocket) });
+		expect(FakeSocket.last).toBeUndefined();
+	});
+});
+
 describe("size", () => {
-	test("the minified runtime stays within 4 KiB of brotli", () => {
+	test("the minified runtime, actions and live data included, stays within 5 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(4096);
+		expect(br).toBeLessThanOrEqual(5120);
 	});
 });
