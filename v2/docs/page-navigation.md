@@ -51,7 +51,9 @@ safe becomes an ordinary page load.
    around a `navigable()` handler hides the mark unless the wrapper is
    `navigable()` too. Leave out pages that must load for real: checkout
    steps that hand over to a payment page, OAuth callbacks, links from
-   emails that carry one-time tokens.
+   emails that carry one-time tokens. Page files (`mountPages`) are
+   navigable on their own; such a page says `<page navigate="off">`, and
+   its forms still post with the runtime.
 
 That is all. Every page now goes out with the runtime's
 `<script src="/_a/natsu-navigate.….js" defer>` in its head, and every page
