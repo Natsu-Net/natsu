@@ -932,6 +932,26 @@ describe("answers", () => {
 		expect(drawn).toBe(2);
 	});
 
+	test("ctx.nav.stale() never refuses an action's post: it runs, and its answer is checked after", async () => {
+		let posts = 0;
+		const policy = (ctx: Context) => (ctx.method === "POST" ? "script-src 'nonce-n0' https://ads.test" : "script-src 'nonce-n0'");
+		const handler: Handler = (ctx) => {
+			if (ctx.nav.stale(new Headers({ "content-security-policy": policy(ctx) }))) return;
+			if (ctx.method === "POST") posts++;
+			ctx.response.headers.set("content-security-policy", policy(ctx));
+			return page();
+		};
+		new Router().get("/p", navigable(handler));
+		new Router().post("/p", navigable(handler));
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/p");
+		const posted = await get(app, "/p", { "natsu-nav": key, "natsu-action": "1" }, "POST");
+		expect(posts).toBe(1);
+		// The document differs: a real load, after the post ran.
+		expect(posted.status).toBe(204);
+		expect(posted.headers.get("natsu-reload")).toBe("document");
+	});
+
 	test("shown() runs at once on a page, on a part, and never on a refusal; other cookies always go out", async () => {
 		let shellText = "Site";
 		new Router().get("/p", navigable((ctx) => {

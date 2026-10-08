@@ -120,7 +120,7 @@ export interface Nav {
 	 * the document headers this answer will carry (its CSP), and any it lacks
 	 * are read from what the response already holds. True when they differ
 	 * from the document the visitor is on: return without rendering, and natsu
-	 * answers a full load.
+	 * answers a full load. Always false for an action's post, which must run.
 	 */
 	stale(headers: Headers): boolean;
 	/**
@@ -359,6 +359,8 @@ class NavRequest implements Nav {
 		public readonly doc: string,
 		public readonly shell: string,
 		public readonly prefetch: boolean,
+		/** An action the runtime posted: it always runs (see stale()). */
+		public readonly action = false,
 	) {}
 
 	/** The first decision stands: a later call cannot turn a refusal into a part. */
@@ -378,6 +380,11 @@ class NavRequest implements Nav {
 	}
 
 	public stale(headers: Headers): boolean {
+		// An action's post always runs: refused before it, the runtime's real
+		// load that follows would be a GET, and the post lost. Its answer is
+		// still checked after the route, as any page's, and a different
+		// document becomes a real load then.
+		if (this.action) return false;
 		const response = this.ctx.response;
 		const own = response.headersInitialized ? response.headers : undefined;
 		const doc = this.navigation.docHash((name) => headers.get(name) ?? own?.get(name) ?? null);
@@ -463,7 +470,7 @@ export class Navigation {
 		if (headers.get("sec-fetch-mode") === "navigate" || headers.get("sec-fetch-dest") === "document") return false;
 		if (!KEY.test(value)) return false;
 		const dot = value.indexOf(".");
-		const nav = new NavRequest(this, ctx, value.slice(0, dot), value.slice(dot + 1), prefetch);
+		const nav = new NavRequest(this, ctx, value.slice(0, dot), value.slice(dot + 1), prefetch, action);
 		ctx.nav = nav;
 		if (prefetch && !this.prefetch) {
 			nav.decide({ kind: "skip", detail: "prefetches are off (navigate.prefetch: false)" });
