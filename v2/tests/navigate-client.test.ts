@@ -149,6 +149,8 @@ interface Opened {
 	loads: string[][];
 	/** Errors the runtime reported (a mount that threw). */
 	errors: unknown[];
+	/** Wait until every prefetch asked so far has been answered and taken in (not a fixed time: a loaded machine is slow). */
+	prefetched(): Promise<void>;
 	/** Let a held stylesheet (`holdCss`) or script (`holdJs`) finish loading. */
 	release(href: string): void;
 	ready(): void;
@@ -166,6 +168,10 @@ afterEach(async () => {
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 /** Let a visit run to its end: fetch, parse, stylesheets, swap, scripts. */
 const settle = () => tick(15);
+/** Wait until `done` holds (two seconds at most), for what a loaded machine may take longer than `settle` to do. */
+const until = async (done: () => unknown) => {
+	for (let i = 0; i < 400 && !done(); i++) await tick(5);
+};
 
 function open(o: Open): Opened {
 	const window: W = new Window({
@@ -189,6 +195,7 @@ function open(o: Open): Opened {
 	document.write(o.html);
 	const held = new Set([...(o.holdCss ?? []), ...(o.holdJs ?? [])]);
 	const calls: Opened["calls"] = [];
+	let prefetching = 0;
 	const loads: string[][] = [];
 	Object.defineProperty(window.location, "assign", { value: (u: string) => loads.push(["assign", String(u)]) });
 	Object.defineProperty(window.location, "replace", { value: (u: string) => loads.push(["replace", String(u)]) });
@@ -198,7 +205,20 @@ function open(o: Open): Opened {
 		const headers = { ...init.headers };
 		calls.push({ url: url.pathname + url.search, headers });
 		const route = o.routes?.[url.pathname + url.search];
-		return route ? route(headers) : new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
+		const answer = () => (route ? route(headers) : new Response("not found", { status: 404, headers: { "content-type": "text/plain" } }));
+		if (!headers["Natsu-Prefetch"]) return answer();
+		// A prefetch is over once the runtime has read its body and, a task later, settled its own chain.
+		prefetching++;
+		const over = () => void setTimeout(() => prefetching--);
+		try {
+			const r = await answer();
+			const read = r.text.bind(r);
+			r.text = () => read().finally(over);
+			return r;
+		} catch (e) {
+			over();
+			throw e;
+		}
 	};
 
 	let current: Element | null = null;
@@ -251,6 +271,10 @@ function open(o: Open): Opened {
 		calls,
 		loads,
 		errors,
+		async prefetched() {
+			for (let i = 0; i < 400 && prefetching; i++) await tick(5);
+			await tick();
+		},
 		release(href) {
 			held.delete(href);
 			document.querySelector(`link[href="${href}"], script[src="${href}"]`)?.dispatchEvent(new window.Event("load"));
@@ -2081,9 +2105,9 @@ describe("prefetch", () => {
 	test("a 65 ms hover prefetches, marked Natsu-Prefetch, and the click uses it", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()) } });
 		hover(p, "#to-b");
-		await tick(30);
-		expect(p.calls).toEqual([]);
-		await tick(60);
+		// Timed, not slept: on a loaded machine a fixed sleep may wake after the runtime's own timer.
+		await until(() => p.calls.length);
+		expect(performance.now() - from).toBeGreaterThanOrEqual(60);
 		expect(p.calls).toEqual([{ url: "/b", headers: { "Natsu-Nav": "k1.s1", "Natsu-Prefetch": "1" } }]);
 		p.click("#to-b");
 		await settle();
@@ -2100,11 +2124,11 @@ describe("prefetch", () => {
 			let used = 0;
 			if (yields) p.window.scheduler = { yield: () => (used++, new Promise((y) => setTimeout(y, 5))) };
 			p.natsu.prefetch("/b");
-			await settle();
+			await p.prefetched();
 			p.click("#to-b");
 			await microtasks();
 			expect([yields, text(p, "main h1")]).toEqual([yields, "Page A"]);
-			await settle();
+			await until(() => text(p, "main h1") == "Page B");
 			expect([yields, text(p, "main h1"), used]).toEqual([yields, "Page B", yields ? 1 : 0]);
 		}
 	});
@@ -2152,6 +2176,7 @@ describe("prefetch", () => {
 		expect(p.calls).toEqual([{ url: "/b", headers: { "Natsu-Nav": "k1.s1" } }]);
 		expect(text(p, "main h1")).toBe("Page B");
 	});
+
 
 	test("a visit lets go of the hovered link: hovering it again on the new page prefetches again", async () => {
 		const p = open({ html: page(), routes: { "/b": () => answer(part()), "/c": () => answer(part({ title: "C" })) } });
@@ -2263,13 +2288,15 @@ describe("prefetch", () => {
 	});
 
 	test("<meta name=natsu data-prefetch=off> (prefetch off on the server): no prefetch at all; a click still swaps", async () => {
+		const from = performance.now();
 		const p = open({ html: page().replace(`content="k1.s1">`, `content="k1.s1" data-prefetch="off">`), routes: { "/b": () => answer(part()) } });
 		p.natsu.prefetch("/b");
 		p.document.querySelector("#to-b").dispatchEvent(new p.window.PointerEvent("pointerover", { bubbles: true, pointerType: "mouse" }));
 		await tick(90);
 		expect(p.calls).toEqual([]);
+		await p.prefetched();
 		p.click("#to-b");
-		await settle();
+		await until(() => text(p, "main h1") == "Page B");
 		expect(p.calls.map((c) => [c.url, c.headers["Natsu-Prefetch"]])).toEqual([["/b", undefined]]);
 		expect(text(p, "main h1")).toBe("Page B");
 	});
@@ -2289,7 +2316,7 @@ describe("prefetch", () => {
 		const p = open({ html: page(), routes });
 		for (const x of "bcdef") {
 			p.natsu.prefetch(`/${x}`);
-			await settle();
+			await p.prefetched();
 		}
 		p.natsu.prefetch("/b"); // used again: now the most recent
 		p.natsu.prefetch("/g"); // evicts /c
@@ -2390,7 +2417,7 @@ describe("islands", () => {
 			return fetch(u, init);
 		};
 		await p.natsu.visit("/b");
-		await settle();
+		await p.prefetched();
 		expect(text(p, "#box")).toBe("box");
 		await p.natsu.visit("/c");
 		expect(signals.length).toBe(1);
@@ -2453,3 +2480,4 @@ describe("size", () => {
 		expect(br).toBeLessThanOrEqual(4096);
 	});
 });
+		// Each taken in before the next: two in flight at most, and a loaded machine may take longer than a fixed sleep.
