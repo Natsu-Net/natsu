@@ -76,6 +76,7 @@ export class Application {
 	private chain: ((ctx: Context, terminal: Terminal) => Promise<void>) | undefined;
 	private serverRef: NatsuServer | undefined;
 	private errorHandler: ErrorHandler | undefined;
+	private notFoundHandler: Handler | undefined;
 	private readonly cwd: string;
 
 	constructor(options: ApplicationOptions = {}) {
@@ -108,6 +109,17 @@ export class Application {
 
 	public onError(handler: ErrorHandler): this {
 		this.errorHandler = handler;
+		return this;
+	}
+
+	/**
+	 * What answers a request nothing else did: no route, no static file, or a
+	 * route that wrote nothing. Runs after both, inside the middleware (the
+	 * session, the access log and Assets see its answer). `mountPages` sets it
+	 * to draw `pages/_error.uwu` with a 404. Pass undefined to remove it.
+	 */
+	public notFound(handler: Handler | undefined): this {
+		this.notFoundHandler = handler;
 		return this;
 	}
 
@@ -206,6 +218,11 @@ export class Application {
 
 		// A guard that refused, or a handler that wrote nothing, still owes the
 		// client an answer.
+		if (ctx.response.body === undefined && !ctx.response.statusSet) await this.answerNotFound(ctx);
+	}
+
+	private async answerNotFound(ctx: Context): Promise<void> {
+		if (this.notFoundHandler) await this.invoke(this.notFoundHandler, ctx);
 		if (ctx.response.body === undefined && !ctx.response.statusSet) {
 			ctx.response.status = 404;
 			ctx.response.body = "Not Found";
@@ -223,10 +240,7 @@ export class Application {
 		// No route: a static file or the 404 is never a page in the visitor's shell.
 		if ((ctx.nav.requested || isIslandRequest(ctx)) && refuseWithoutRoute(ctx)) return;
 		if (this.statics && !this.config.Static.beforeRoutes && (await this.statics.serve(ctx))) return;
-		if (ctx.response.body === undefined && !ctx.response.statusSet) {
-			ctx.response.status = 404;
-			ctx.response.body = "Not Found";
-		}
+		if (ctx.response.body === undefined && !ctx.response.statusSet) await this.answerNotFound(ctx);
 	}
 
 	private async handleError(error: unknown, ctx: Context): Promise<void> {
