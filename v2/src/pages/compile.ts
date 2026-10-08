@@ -10,8 +10,14 @@
  *   pages/jobs/_layout.uwu   wraps the pages in jobs/, inside the one above
  *   pages/_error.uwu         drawn for a 404/403/500 a page answers
  *   pages/_bare.uwu          a layout a page picks by name: <page layout="_bare">
+ *   pages/_partials/card.uwu {{> card}} (or another directory: `partials`)
  *
  * A file or directory whose name starts with `_` is never a route.
+ *
+ * A partial renders with its caller's data where it is included, so its
+ * reads are walked there: `{{> card}}` inside `{{#each products}}` makes
+ * `card`'s `{{name}}` a read of `products.name`. A partial registered only
+ * at render time (`mountPages({ render: { partials } })`) is not seen.
  *
  * Templates are compiled once: `compilePages(dir, outDir)` writes them for a
  * deploy, and `mountPages({ dir })` compiles them in memory at start (and
@@ -24,9 +30,17 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { type PageBlock, splitPageBlock, textPaths } from "./block.ts";
 import { PageCompileError } from "./errors.ts";
-import { type Reads, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
+import { type Reads, type TplNode, addRead, collectReads, fieldList, scriptDeclarations } from "./reads.ts";
 
-export type FileKind = "page" | "layout" | "error";
+export type FileKind = "page" | "layout" | "error" | "partial";
+
+/** Where partials live by default, relative to the app directory. */
+export const PARTIALS_DIR = "pages/_partials";
+
+export interface CompileOptions {
+	/** The partials directory, relative to the app directory (default `pages/_partials`). */
+	partials?: string;
+}
 
 /** What a name is read as, in a form that survives JSON (the build manifest). */
 export interface ReadInfo {
@@ -47,8 +61,14 @@ export interface CompiledFile {
 	/** uwu's server module, as text. */
 	server: string;
 	css: string;
-	/** Partials (`{{> name}}`) the template includes: their reads are not seen here. */
+	/** Partials (`{{> name}}`) the template includes, through other partials too. */
 	partials: string[];
+	/** Of those, the ones no partial file provides: their reads are not seen here. */
+	unresolved: string[];
+	/** `@event="action:name"` in the template (and its partials), first use of each. */
+	actions: { name: string; line: number }[];
+	/** A partial file: the name it is included by. */
+	partial?: string;
 }
 
 export interface PageManifest {
@@ -129,15 +149,37 @@ export function listPageFiles(pagesDir: string): string[] {
 	return out.sort();
 }
 
+/** A partial's tree, as the reads walker takes it. */
+export interface PartialTree {
+	nodes: readonly TplNode[];
+	scriptNames: ReadonlySet<string>;
+}
+
+interface Compiled {
+	file: CompiledFile;
+	tree: PartialTree;
+}
+
 /** Compile one page, layout or error file. `file` is relative to `pages/`. */
-export function compilePageFile(source: string, file: string): CompiledFile {
+export function compilePageFile(
+	source: string,
+	file: string,
+	options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string } = {},
+): CompiledFile {
+	return compileOne(source, file, options).file;
+}
+
+function compileOne(source: string, file: string, options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string }): Compiled {
 	const shown = `pages/${file}`;
-	const kind = kindOf(file);
+	const kind = options.partial !== undefined ? "partial" : kindOf(file);
 	const { rest, block } = splitPageBlock(source, shown);
+	if (block && kind === "partial") {
+		throw new PageCompileError(shown, block.line, "a partial has no <page> block: it reads its caller's data; declare <data> and <action> on the page or a layout");
+	}
 	if (block && kind !== "page") {
 		const pageOnly = (["title", "description", "cache", "layout"] as const).find((key) => block[key] !== undefined);
 		if (pageOnly) {
-			throw new PageCompileError(shown, block.line, `<page ${pageOnly}> belongs on a page; a ${kind} file may only declare <data>`);
+			throw new PageCompileError(shown, block.line, `<page ${pageOnly}> belongs on a page; a ${kind} file may only declare <data> and <action>`);
 		}
 	}
 
@@ -153,10 +195,25 @@ export function compilePageFile(source: string, file: string): CompiledFile {
 		throw new PageCompileError(shown, 1, "a page's <script> may not import modules: load data in a source and read it by name");
 	}
 
-	const partials: string[] = [];
-	const reads: Reads = collectReads(result.template?.nodes ?? [], {
-		scriptNames: scriptDeclarations(result.sfc.scripts),
-		onPartial: (name) => partials.push(name),
+	const partials = new Set<string>();
+	const unresolved = new Set<string>();
+	const actions = new Map<string, number>();
+	const scriptNames = scriptDeclarations(result.sfc.scripts);
+	const nodes = result.template?.nodes ?? [];
+	const reads: Reads = collectReads(nodes, {
+		scriptNames,
+		partial: (name) => {
+			const tree = options.partials?.get(name);
+			if (tree) partials.add(name);
+			return tree;
+		},
+		onPartial: (name) => {
+			partials.add(name);
+			unresolved.add(name);
+		},
+		onAction: (name, loc) => {
+			if (!actions.has(name)) actions.set(name, loc.line);
+		},
 	});
 
 	// The block reads too: title holes, data arguments, service paths.
@@ -174,14 +231,48 @@ export function compilePageFile(source: string, file: string): CompiledFile {
 	const { route, params } = kind === "page" ? routeOf(file) : { route: undefined, params: [] };
 	const out: Record<string, ReadInfo> = {};
 	for (const [name, read] of reads) out[name] = { fields: fieldList(read), line: read.loc.line };
-	return { file, kind, route, params, block, reads: out, server: result.server, css: result.css, partials };
+	return {
+		file: {
+			file,
+			kind,
+			route,
+			params,
+			block,
+			reads: out,
+			server: result.server,
+			css: result.css,
+			partials: [...partials],
+			unresolved: [...unresolved],
+			actions: [...actions].map(([name, line]) => ({ name, line })),
+			...(options.partial !== undefined ? { partial: options.partial } : {}),
+		},
+		tree: { nodes, scriptNames },
+	};
 }
 
-/** Compile every file under `<appDir>/pages`. */
-export function compileAll(appDir: string): CompiledFile[] {
+/**
+ * Compile every file under `<appDir>/pages`, and the partials directory:
+ * the partials first, so every other file walks them where it includes them.
+ */
+export function compileAll(appDir: string, options: CompileOptions = {}): CompiledFile[] {
 	const pagesDir = join(appDir, "pages");
-	const files = listPageFiles(pagesDir);
-	const compiled = files.map((file) => compilePageFile(readFileSync(join(pagesDir, file), "utf8"), file));
+	const partialsDir = join(appDir, options.partials ?? PARTIALS_DIR);
+	const inPages = relative(pagesDir, partialsDir).split(sep).join("/");
+	const outside = inPages.startsWith("..") || inPages === "";
+	const files = listPageFiles(pagesDir).filter((file) => outside || !file.startsWith(`${inPages}/`));
+	const partialFiles = listPageFiles(partialsDir).map((name) => ({ name: name.replace(/\.uwu$/, ""), file: relative(pagesDir, join(partialsDir, name)).split(sep).join("/") }));
+
+	const trees = new Map<string, PartialTree>();
+	const partials = partialFiles.map(({ name, file }) => {
+		const source = readFileSync(join(pagesDir, file), "utf8");
+		trees.set(name, compileOne(source, file, { partial: name }).tree);
+		return { name, file, source };
+	});
+	// Again, now that every partial's tree is known: a partial including another.
+	const compiled = [
+		...partials.map(({ name, file, source }) => compileOne(source, file, { partial: name, partials: trees }).file),
+		...files.map((file) => compileOne(readFileSync(join(pagesDir, file), "utf8"), file, { partials: trees }).file),
+	];
 	const routes = new Map<string, string>();
 	for (const page of compiled) {
 		if (page.kind !== "page") continue;
@@ -197,8 +288,8 @@ export function compileAll(appDir: string): CompiledFile[] {
  * `outDir/pages/`, the scoped CSS of all of them in `outDir/pages.css`, and
  * `outDir/pages.json`, which `mountPages({ built: outDir })` loads.
  */
-export function compilePages(appDir: string, outDir: string): PageManifest {
-	const compiled = compileAll(appDir);
+export function compilePages(appDir: string, outDir: string, options: CompileOptions = {}): PageManifest {
+	const compiled = compileAll(appDir, options);
 	const manifest: PageManifest = { version: 1, files: [] };
 	for (const { server, ...rest } of compiled) {
 		const module = `pages/${rest.file.replace(/\.uwu$/, ".js")}`;

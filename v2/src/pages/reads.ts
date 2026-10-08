@@ -45,15 +45,26 @@ type Mode = "value" | "truth";
 export interface CollectOptions {
 	/** Names declared in the file's `<script>` blocks: never data. */
 	scriptNames?: ReadonlySet<string>;
-	/** Called for a partial (`{{> name}}`): its reads are invisible from here. */
+	/**
+	 * A partial's tree, when natsu compiled the file: walked where it is
+	 * included, against the data there (a partial renders with its caller's
+	 * current data, so `{{name}}` in one included inside `{{#each products}}`
+	 * reads `products`, field `name`).
+	 */
+	partial?: (name: string) => { nodes: readonly TplNode[]; scriptNames: ReadonlySet<string> } | undefined;
+	/** Called for a partial `partial` does not know: its reads are invisible from here. */
 	onPartial?: (name: string, loc: Loc) => void;
+	/** Called for every `@event="action:name"` in the template (and its partials). */
+	onAction?: (name: string, loc: Loc) => void;
 }
 
 export function collectReads(nodes: readonly TplNode[], options: CollectOptions = {}): Reads {
 	const reads: Reads = new Map();
 	const frames: Frame[] = [{ root: true }];
 	const locals: string[] = [];
-	const scriptNames = options.scriptNames ?? new Set<string>();
+	let scriptNames = options.scriptNames ?? new Set<string>();
+	/** Partials being walked, to stop one that includes itself. */
+	const including: string[] = [];
 
 	const record = (name: string, rest: readonly string[], mode: Mode, loc: Loc): void => {
 		let fields = rest;
@@ -96,6 +107,7 @@ export function collectReads(nodes: readonly TplNode[], options: CollectOptions 
 			if (attr.t === "dynamic") {
 				for (const part of attr.parts) if (part.t === "interp") expr(part.expr, "value", loc);
 			} else if (attr.t === "can") expr(attr.recordExpr, "value", loc);
+			else if (attr.t === "action") options.onAction?.(attr.name, loc);
 		}
 	};
 
@@ -136,9 +148,21 @@ export function collectReads(nodes: readonly TplNode[], options: CollectOptions 
 				case "component":
 					for (const value of Object.values(node.props)) expr(value, "value", node.loc);
 					break;
-				case "layout":
-					if (node.name !== "@child") options.onPartial?.(node.name, node.loc);
+				case "layout": {
+					if (node.name === "@child") break;
+					const included = including.includes(node.name) ? undefined : options.partial?.(node.name);
+					if (!included) {
+						if (!including.includes(node.name)) options.onPartial?.(node.name, node.loc);
+						break;
+					}
+					const outer = scriptNames;
+					including.push(node.name);
+					scriptNames = included.scriptNames;
+					walk(included.nodes);
+					scriptNames = outer;
+					including.pop();
 					break;
+				}
 				case "element":
 					attrs(node.attrs, node.loc);
 					walk(node.children);
