@@ -76,7 +76,7 @@ import {
 import type { DataDecl } from "./block.ts";
 import { type CompileOptions, type CompiledFile, type Render, compileAll, evaluateServer, loadBuilt, uwuRuntime } from "./compile.ts";
 import { REQUEST_NAMES, type Plan, type ServiceConfig, type UsedData, buildPlan, resolvePlan } from "./data.ts";
-import { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
+import { Forbidden, HttpError, NotFound, PageCompileError, Redirect } from "./errors.ts";
 import { type PageMeta, escapeHtml, fillText, firstHeading, headTags } from "./meta.ts";
 
 export interface PagesOptions {
@@ -132,6 +132,13 @@ export interface PagesOptions {
 	render?: { helpers?: Record<string, unknown>; components?: Record<string, unknown>; partials?: Record<string, unknown> };
 	/** The most bytes an action's POST may carry (default 1 MB). */
 	maxBody?: number;
+	/**
+	 * An existing app's own errors, as natsu's: a source or an action that
+	 * calls the app's code may throw what that code throws (its "not found",
+	 * its redirect), and this says which `NotFound`, `Redirect` or
+	 * `HttpError` it means. Anything it returns undefined for is what it was.
+	 */
+	errors?: (error: unknown) => HttpError | undefined;
 }
 
 interface Loaded extends CompiledFile {
@@ -205,6 +212,7 @@ interface Out {
 	status: number;
 	html: boolean;
 	tags?: Set<string>;
+	location?: string;
 }
 
 const SECRET = /^[\w.~+/=-]*$/;
@@ -482,10 +490,15 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			};
 			const html = await drawPage(state, values, meta, "", signTags(tags));
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
-		} catch (error) {
+		} catch (thrown) {
+			const error = known(thrown);
+			if (error instanceof Redirect) return { body: "", status: error.status, html: false, location: sameSitePath(error.location) ?? "/" };
 			return drawError(ctx, state, state.error, secrets, error);
 		}
 	};
+
+	/** The app's own error as natsu's, when `options.errors` knows it. */
+	const known = (error: unknown): unknown => options.errors?.(error) ?? error;
 
 	const drawError = async (ctx: Context, state: { path: string; page: Loaded }, page: Drawn | undefined, secrets: Record<string, string>, error: unknown): Promise<Out> => {
 		const status = error instanceof HttpError ? error.status : 500;
@@ -504,7 +517,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return { body: status === 404 ? "Not Found" : status === 403 ? "Forbidden" : message, status, html: false };
 	};
 
-	const answer = (ctx: Context, out: { body: string; status: number; html?: boolean; headers?: Record<string, string> }): string => {
+	const answer = (ctx: Context, out: { body: string; status: number; html?: boolean; headers?: Record<string, string>; location?: string }): string => {
+		const location = out.location ?? out.headers?.location;
+		if (location !== undefined) {
+			ctx.response.redirect(location, out.status);
+			return "";
+		}
 		ctx.response.status = out.status;
 		if (out.html ?? out.headers?.["content-type"]?.startsWith("text/html")) ctx.response.type = "text/html; charset=utf-8";
 		else ctx.response.type = "text/plain; charset=utf-8";
@@ -563,7 +581,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 						return {
 							body: out.body,
 							status: out.status,
-							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8" },
+							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
 							keep: out.status === 200,
 						};
 					},
@@ -608,7 +626,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (!target || !entry || typeof short !== "string") return plain(404, "Unknown action");
 
 			const secrets = secretsFor(ctx, state);
-			const refuse = async (error: unknown): Promise<string> => answer(ctx, await drawError(ctx, state, state.error, secrets, error));
+			const refuse = async (thrown: unknown): Promise<string> => {
+				const error = known(thrown);
+				// Sent elsewhere (a sign-in first, a step the app asks for): a 303, as a success is.
+				if (error instanceof Redirect) return answer(ctx, { body: "", status: 303, location: sameSitePath(error.location) ?? "/" });
+				return answer(ctx, await drawError(ctx, state, state.error, secrets, error));
+			};
 			if (entry.options.csrf !== false && !csrfOk(ctx, form)) {
 				return refuse(new HttpError(403, "This form has expired: reload the page and try again."));
 			}

@@ -35,6 +35,22 @@ export class Forbidden extends HttpError {
 }
 
 /**
+ * Go elsewhere instead: a page that has moved, or one that needs a sign-in
+ * first. A page answers it with its status (302 unless given) and the
+ * location; a soft visit is told where to go; an action's post goes there
+ * with a 303. The location must be a path on this site.
+ */
+export class Redirect extends HttpError {
+	public readonly location: string;
+
+	constructor(location: string, status = 302) {
+		super(status, "Redirect");
+		this.name = "Redirect";
+		this.location = location;
+	}
+}
+
+/**
  * A page file natsu cannot serve: a bad `<page>` block, a name nothing
  * provides, a template uwu refuses. Thrown when the pages are compiled or
  * mounted, never per request; the message names the file and the line.
