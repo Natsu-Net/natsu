@@ -103,8 +103,9 @@
  *     as markup, so `<noscript><style>` would become a live style, and a
  *     `</div>` inside would let the rest out of it. A part that cannot be
  *     parsed (Trusted Types refuses `DOMParser`), or still holds a
- *     `<noscript>` or a declarative shadow root (`<template shadowrootmode>`,
- *     which DOMParser leaves inert), is a real load. An answer already in hand (prefetched)
+ *     `<noscript>`, is a real load. A region with a declarative shadow root
+ *     (`<template shadowrootmode>`, which DOMParser leaves inert) is never
+ *     sent as a part: the server answers with a real load. An answer already in hand (prefetched)
  *     yields a frame first, so the click's own frame paints.
  *  2. Its region ids must equal the current ones, in order.
  *  3. Its stylesheets go in before the current ones and must load first
@@ -704,15 +705,16 @@ if (!first && KEY && regions(D)[0]) {
 				.map((p) => [new URL(p.get("src")!, f).href, p] as const);
 			const now = regions(D);
 			const next = regions(doc);
-			// DOMParser leaves a declarative shadow root an inert <template>; a real
-			// load attaches it. And it reads a <noscript> with scripting off, as
-			// markup: the server drops them, and one left (in svg, say) is refused.
-			if (ids(now) != ids(next) || doc.querySelector("noscript,template[shadowrootmode]")) {
+			// DOMParser reads a <noscript> with scripting off, as markup: the server
+			// drops them, and one left (in svg, say) is refused. (A declarative
+			// shadow root, which DOMParser would leave an inert <template>, the
+			// server never sends: a region with one is a real load.)
+			if (ids(now) != ids(next) || doc.querySelector("noscript")) {
 				if (DEV)
 					why(
 						...(ids(now) != ids(next)
 							? ["regions differ:", now.map((e) => e.id), "->", next.map((e) => e.id)]
-							: ["a <noscript> or a declarative shadow root in the part:", doc.querySelector("noscript,template[shadowrootmode]")]),
+							: ["a <noscript> in the part:", doc.querySelector("noscript")]),
 					);
 				return full(u, h);
 			}

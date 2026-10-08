@@ -557,6 +557,8 @@ describe("regions", () => {
 		for (const spelling of ['shadowrootmode="open"', "shadowRootMode=closed"]) {
 			expect(scanPage(shell(`<main id="m" data-natsu-region><div><template ${spelling}><p>x</p></template></div></main>`))).toMatchObject({ reason: "regions" });
 		}
+		// In svg too: inside a foreignObject a browser reads it as HTML.
+		expect(scanPage(shell('<main id="m" data-natsu-region><svg><foreignObject><template shadowrootmode="open">x</template></foreignObject></svg></main>'))).toMatchObject({ reason: "regions" });
 		// Outside the regions, or only mentioned, it is no reason.
 		const outside = scanPage(shell('<header><template shadowrootmode="open">x</template></header><main id="m" data-natsu-region><p>use shadowrootmode="open"</p><code title="a shadowrootmode b">x</code></main>'));
 		expect(outside === null || "reason" in outside).toBe(false);

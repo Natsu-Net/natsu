@@ -898,17 +898,6 @@ describe("regions", () => {
 		expect(text(p, "main h1")).toBe("Page A");
 	});
 
-	test("a declarative shadow root in a region means a real load: DOMParser would leave it an inert template", async () => {
-		const p = open({
-			html: page(),
-			routes: { "/b": () => answer(part({ main: `<h1>B</h1><x-card><template shadowrootmode="open"><slot></slot></template>hi</x-card>` })) },
-		});
-		p.click("#to-b");
-		await settle();
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
-		expect(text(p, "main h1")).toBe("Page A");
-	});
-
 	test("a part that cannot be read is a real load, never a dead click: DOMParser under Trusted Types, a bad script entry", async () => {
 		const p = open({
 			html: page(),

@@ -1107,7 +1107,10 @@ interface Markup {
 	unsure: number;
 	/** `<head`, past its `>`, `</head`, past its `>`; -1 for each not found. */
 	head: [number, number, number, number];
-	/** Where each `<template` start tag is, in order (a declarative shadow root is one). */
+	/**
+	 * Where each `<template` start tag is, in order (a declarative shadow root
+	 * is one), in svg and math too: one in a `foreignObject` is HTML.
+	 */
 	templates: number[];
 	/**
 	 * The head's first script that runs after the page is parsed (one with a
@@ -1201,6 +1204,8 @@ function readMarkup(html: string, headOnly = false): Markup {
 					if (templates === 0) inert.push(inertFrom, lt);
 					continue;
 				}
+				// Noted here too: in a foreignObject it is HTML, a declarative shadow root.
+				if (name === "template") starts.push(lt);
 				if (closed) {
 					// `<path/>`: nothing opens.
 				} else if (SWITCHES.has(name)) {
