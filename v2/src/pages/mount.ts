@@ -234,6 +234,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			let keys = kept.get(tag);
 			if (!keys) kept.set(tag, (keys = new Set()));
 			keys.add(`${seconds}\0${key}`);
+			// PageCache forgets pages on its own; this forgets the oldest names past a bound.
+			if (keys.size > 4096) keys.delete(keys.values().next().value as string);
 		}
 	};
 	const stopListening = onInvalidate((tags) => {
