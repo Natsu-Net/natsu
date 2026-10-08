@@ -53,6 +53,14 @@ export const PARTIALS_DIR = "pages/_partials";
 export interface CompileOptions {
 	/** The partials directory, relative to the app directory (default `pages/_partials`). */
 	partials?: string;
+	/**
+	 * Rewrites a file's source before it compiles: the `<page>` block is
+	 * already cut out (its lines kept blank), so this sees the template. For an
+	 * app's own preprocessing, a minifier or text includes; `file` is relative
+	 * to `pages/`. It should keep the file's lines where it can, or errors point
+	 * at the wrong line.
+	 */
+	transform?: (source: string, file: string) => string;
 }
 
 /** What a name is read as, in a form that survives JSON (the build manifest). */
@@ -184,12 +192,12 @@ interface Compiled {
 export function compilePageFile(
 	source: string,
 	file: string,
-	options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string } = {},
+	options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string; transform?: CompileOptions["transform"] } = {},
 ): CompiledFile {
 	return compileOne(source, file, options).file;
 }
 
-function compileOne(source: string, file: string, options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string }): Compiled {
+function compileOne(source: string, file: string, options: { partials?: ReadonlyMap<string, PartialTree>; partial?: string; transform?: CompileOptions["transform"] }): Compiled {
 	const shown = `pages/${file}`;
 	const kind = options.partial !== undefined ? "partial" : kindOf(file);
 	const { rest, block } = splitPageBlock(source, shown);
@@ -206,7 +214,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 	let result: UwuCompiled;
 	try {
 		// uwu derives the scope of a `<style>` from the file's path.
-		result = compile(rest, { file: shown });
+		result = compile(options.transform ? options.transform(rest, file) : rest, { file: shown });
 	} catch (error) {
 		const loc = (error as { loc?: { line: number } }).loc;
 		throw new PageCompileError(shown, loc?.line ?? 1, (error as Error).message);
@@ -288,13 +296,13 @@ export function compileAll(appDir: string, options: CompileOptions = {}): Compil
 	const trees = new Map<string, PartialTree>();
 	const partials = partialFiles.map(({ name, file }) => {
 		const source = readFileSync(join(pagesDir, file), "utf8");
-		trees.set(name, compileOne(source, file, { partial: name }).tree);
+		trees.set(name, compileOne(source, file, { partial: name, transform: options.transform }).tree);
 		return { name, file, source };
 	});
 	// Again, now that every partial's tree is known: a partial including another.
 	const compiled = [
-		...partials.map(({ name, file, source }) => compileOne(source, file, { partial: name, partials: trees }).file),
-		...files.map((file) => compileOne(readFileSync(join(pagesDir, file), "utf8"), file, { partials: trees }).file),
+		...partials.map(({ name, file, source }) => compileOne(source, file, { partial: name, partials: trees, transform: options.transform }).file),
+		...files.map((file) => compileOne(readFileSync(join(pagesDir, file), "utf8"), file, { partials: trees, transform: options.transform }).file),
 	];
 	const routes = new Map<string, string>();
 	for (const page of compiled) {

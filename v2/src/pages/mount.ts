@@ -74,7 +74,7 @@ import {
 	valuesOf,
 } from "./actions.ts";
 import type { DataDecl } from "./block.ts";
-import { type CompiledFile, type Render, compileAll, evaluateServer, loadBuilt, uwuRuntime } from "./compile.ts";
+import { type CompileOptions, type CompiledFile, type Render, compileAll, evaluateServer, loadBuilt, uwuRuntime } from "./compile.ts";
 import { REQUEST_NAMES, type Plan, type ServiceConfig, type UsedData, buildPlan, resolvePlan } from "./data.ts";
 import { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
 import { type PageMeta, escapeHtml, fillText, firstHeading, headTags } from "./meta.ts";
@@ -84,6 +84,8 @@ export interface PagesOptions {
 	dir?: string;
 	/** Or a directory `compilePages` wrote. */
 	built?: string;
+	/** Rewrites each file's source before it compiles (see `CompileOptions.transform`); `dir` only. */
+	transform?: CompileOptions["transform"];
 	/** The partials directory, relative to `dir` (default `pages/_partials`). */
 	partials?: string;
 	/** Watch `dir/pages` and recompile on change (default false). */
@@ -96,6 +98,24 @@ export interface PagesOptions {
 	services?: Record<string, ServiceConfig>;
 	/** Who is asking, as templates read `viewer` (default: the session's `viewer` or `user`, else null). */
 	viewer?: (ctx: Context) => unknown;
+	/**
+	 * Names the app answers for each request, beside natsu's own (`params`,
+	 * `viewer`, …): the frame an existing app's layouts read (its header, its
+	 * CSP nonce, its own `session`). Each getter is called once per page, when
+	 * the page or a layout reads the name, and may return a promise. One of
+	 * natsu's own names (`session`, `flash`) here replaces natsu's value. A page
+	 * that reads any of them is drawn for each visitor, never kept.
+	 */
+	request?: Record<string, (ctx: Context) => unknown>;
+	/**
+	 * Runs around every page, action and not-found answer, which it starts with
+	 * `next()` and whose result it returns: what an existing app does around
+	 * its own routes (a gate that may answer first, a request scope its
+	 * sources read, response headers). It may answer without calling `next()`.
+	 * An error a source throws is drawn by `_error.uwu` before `next()`
+	 * returns; `around` sees only its own.
+	 */
+	around?: (ctx: Context, next: () => Promise<unknown>) => Promise<unknown>;
 	/**
 	 * Per-visitor secrets a page may carry (a CSP nonce), read as
 	 * `secrets.<name>`. A page kept by PageCache is drawn with marks in their
@@ -210,6 +230,16 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	setPublicOrigin(publicUrl);
 	const secure = (): boolean => publicUrl().startsWith("https:");
 
+	const appNames = new Set(Object.keys(options.request ?? {}));
+	const around = options.around;
+	/** The handler, inside the app's `around` when there is one. */
+	const wrapped = (inner: Handler): Handler => {
+		if (!around) return inner;
+		const outer: Handler = (ctx) => around(ctx, async () => inner(ctx)) as ReturnType<Handler>;
+		Object.defineProperty(outer, "name", { value: inner.name });
+		return outer;
+	};
+
 	const viewerOf = options.viewer ?? ((ctx: Context): unknown => {
 		if (!ctx.sessionLoaded) return null;
 		const data = ctx.session.data;
@@ -290,7 +320,10 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			const requestNames = new Set([...REQUEST_NAMES].filter((name) => name !== "error" && name !== "secrets"));
 			if (options.secrets) requestNames.add("secrets");
 			for (const name of extra) requestNames.add(name);
+			for (const name of appNames) requestNames.add(name);
 			const plan = buildPlan({ path, params, reads, decls, services: options.services ?? {}, requestNames });
+			// What the app answers is about this visitor: never kept.
+			if (plan.names.some((name) => appNames.has(name))) plan.personal = true;
 			// The partials' styles go with the files that include them.
 			const included = [...new Set([...layouts, page].flatMap((file) => file.partials))].map((name) => partials.get(name)?.css ?? "");
 			const styles = [...layouts].reverse().concat(page).map((file) => file.css).concat(included).filter(Boolean).join("\n");
@@ -388,10 +421,10 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (registered.has(path)) continue;
 			registered.add(path);
 			added = true;
-			router.get(path, navigable(handlerFor(path)));
+			router.get(path, navigable(wrapped(handlerFor(path))));
 			// Every page takes its actions' posts. A post is never prefetched,
 			// and with the runtime its answer is a part like a visit's.
-			router.post(path, navigable(actionHandlerFor(path), { prefetch: false }));
+			router.post(path, navigable(wrapped(actionHandlerFor(path)), { prefetch: false }));
 		}
 		if (added && options.app?.running) options.app.reload();
 	};
@@ -406,6 +439,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			["form", () => EMPTY_FORM],
 			["flash", () => decodeFlash(ctx.cookies.get(FLASH_COOKIE))],
 		]);
+		for (const [name, get] of Object.entries(options.request ?? {})) request.set(name, () => get(ctx));
 		for (const [name, value] of Object.entries(extra)) request.set(name, () => value);
 		return { ctx, request, services: options.services ?? {}, path: state.path, params: state.page.params };
 	};
@@ -637,16 +671,17 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return handler;
 	}
 
-	const notFound: Handler = async (ctx) => {
+	const notFound: Handler = wrapped(async (ctx) => {
 		const page = notFoundPage;
 		if (!page) return undefined;
 		const secrets = options.secrets ? options.secrets(ctx) : NO_SECRETS;
 		return answer(ctx, await drawError(ctx, { path: "/", page: page.page }, page, secrets, new NotFound()));
-	};
+	});
 
 	// --- loading ----------------------------------------------------------------
 
-	const compileNow = (): CompiledFile[] => (options.built ? loadBuilt(options.built) : compileAll(options.dir!, { partials: options.partials }));
+	const compileOptions: CompileOptions = { partials: options.partials, transform: options.transform };
+	const compileNow = (): CompiledFile[] => (options.built ? loadBuilt(options.built) : compileAll(options.dir!, compileOptions));
 	await build(compileNow());
 	options.app?.notFound(notFound);
 
@@ -657,7 +692,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			clearTimeout(timer);
 			timer = setTimeout(() => {
 				Promise.resolve()
-					.then(() => build(compileAll(options.dir!, { partials: options.partials })))
+					.then(() => build(compileAll(options.dir!, compileOptions)))
 					.then(
 						() => log.info(`[<green>pages</green>] recompiled`),
 						(error: Error) => log.error(`[<red>pages</red>] ${error.message} (still serving the last good build)`),
