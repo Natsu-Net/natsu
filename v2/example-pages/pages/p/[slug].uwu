@@ -1,0 +1,8 @@
+<page cache="60">
+  <data stock="inventory:GET /stock/{{params.slug}}" fallback="null">
+</page>
+<template>
+<h1>{{product.name}}</h1>
+<p>{{product.price}} EUR</p>
+{{#if stock}}<p>{{stock.count}} in stock</p>{{#else}}<p>Stock unknown</p>{{/if}}
+</template>

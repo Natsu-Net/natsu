@@ -1,0 +1,18 @@
+<template>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+{{{page.head}}}
+</head>
+<body>
+<header>
+  <a href="/">Jobs</a>
+  {{#each categories}}<a href="/?category={{slug}}">{{name}}</a>{{/each}}
+  {{#if viewer}}<span>Hi {{viewer.name}}</span>{{#else}}<a href="/login">Sign in</a>{{/if}}
+</header>
+<main id="main" data-natsu-region>{{> @child}}</main>
+<footer id="foot" data-natsu-region>{{page.title}}</footer>
+</body>
+</html>
+</template>
