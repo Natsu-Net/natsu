@@ -114,12 +114,16 @@ export function collectReads(nodes: readonly TplNode[], options: CollectOptions 
 			} else if (attr.t === "can") expr(attr.recordExpr, "value", loc);
 			else if (attr.t === "action") options.onAction?.(attr.name, loc);
 			else if (attr.t === "spaLink") {
-				// uwu keeps the value as written and reads each hole as a dotted
-				// path from the data in scope (`/p/{{slug}}` inside an each reads
-				// the item's `slug`), so the holes are reads like any other.
-				for (const m of attr.value.matchAll(HOLE)) {
-					const path = m[1]!.trim();
-					if (path) expr({ t: "path", segments: path.split("."), parentDepth: 0 }, "value", loc);
+				// The holes are reads like any other attribute's: uwu parses them
+				// (`../x`, `this`, `@index` included) into `parts`. An older uwu
+				// keeps only the raw value, read as dotted paths.
+				if (attr.parts) {
+					for (const part of attr.parts) if (part.t === "interp") expr(part.expr, "value", loc);
+				} else {
+					for (const m of attr.value.matchAll(HOLE)) {
+						const path = m[1]!.trim();
+						if (path) expr({ t: "path", segments: path.split("."), parentDepth: 0 }, "value", loc);
+					}
 				}
 				if (including.length === 0) options.onLink?.(attr.value, loc);
 			}
