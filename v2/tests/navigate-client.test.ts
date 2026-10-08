@@ -520,6 +520,18 @@ describe("which clicks", () => {
 		expect(p.calls.map((c) => c.url)).toEqual(["/a"]);
 		expect(p.window.history.length).toBe(length);
 	});
+
+	test("the target comes from the first <base> that has one, as the browser reads it: a later <base target=_blank> still opens a new tab", async () => {
+		const head = `<base href="/"><base target="_blank">`;
+		const p = open({
+			html: page({ head, shell: LINKS + `<form id="f" action="/b"></form>` }),
+			routes: { "/b": () => answer(part({ head })) },
+		});
+		// Chromium opens /b in a new tab for both and leaves this one on /a.
+		expect([p.click("#to-b"), p.submit("#f")]).toEqual([false, false]);
+		await settle();
+		expect(p.calls).toEqual([]);
+	});
 });
 
 describe("GET forms", () => {
@@ -623,6 +635,31 @@ describe("GET forms", () => {
 		p.submit("#get", "#go");
 		await settle();
 		expect(p.calls).toEqual([]);
+	});
+
+	test("a form with no action goes to the page's own URL, not the <base href>, as the browser sends it", async () => {
+		const p = open({
+			url: `${ORIGIN}/shop/list`,
+			html: page({ head: `<base href="/shop/">`, shell: LINKS + `<form id="filter"><input name="q" value="x"></form>` }),
+			routes: { "/shop/list?q=x": () => answer(part({ title: "Filtered", head: `<base href="/shop/">` })), "/shop/?q=x": () => answer(part({ title: "Shop home", head: `<base href="/shop/">` })) },
+		});
+		expect(p.submit("#filter")).toBe(true);
+		await settle();
+		// Chromium: http://host/shop/list?q=x (the form's action is the document's URL when it has none).
+		expect([path(p), p.document.title]).toEqual(["/shop/list?q=x", "Filtered"]);
+	});
+
+	test("a GET form with no field to send goes to its action with an empty query, as the browser does: a new entry", async () => {
+		const p = open({
+			url: `${ORIGIN}/search`,
+			html: page({ shell: LINKS + `<form id="all" action="/search"><button id="show">Show all</button></form>` }),
+			routes: { "/search?": () => answer(part({ title: "All" })), "/search": () => answer(part({ title: "All" })) },
+		});
+		const length = p.window.history.length;
+		expect(p.submit("#all", "#show")).toBe(true);
+		await settle();
+		// Chromium: http://host/search? (pushed: it is not the URL shown).
+		expect([p.window.location.href, p.window.history.length]).toEqual([`${ORIGIN}/search?`, length + 1]);
 	});
 });
 
@@ -2216,6 +2253,30 @@ describe("history", () => {
 		await settle();
 		// A browser restores each entry's own scroll: /a was left at 100.
 		expect([path(p), p.window.scrollY]).toEqual(["/a", 100]);
+	});
+
+	test("while a Back is on its way, a relative link on a page with <base href> still goes where the base says", async () => {
+		const head = `<base href="/shop/">`;
+		const p = open({
+			url: `${ORIGIN}/shop/home`,
+			html: page({ head, shell: `<a id="list" href="products/list">list</a><a id="cart" href="cart">cart</a>` }),
+			routes: {
+				// Still on its way when the link is clicked.
+				"/shop/home": () => new Promise(() => {}),
+				"/shop/products/list": () => answer(part({ head, title: "List" })),
+				"/shop/cart": () => answer(part({ head, title: "Cart" })),
+			},
+		});
+		p.click("#list");
+		await settle();
+		expect(path(p)).toBe("/shop/products/list");
+		p.window.history.back();
+		await settle();
+		expect(p.click("#cart")).toBe(true);
+		await settle();
+		// The browser resolves href="cart" against the base: /shop/cart.
+		expect(p.calls.map((c) => c.url)).toEqual(["/shop/products/list", "/shop/home", "/shop/cart"]);
+		expect([path(p), p.document.title]).toEqual(["/shop/cart", "Cart"]);
 	});
 });
 

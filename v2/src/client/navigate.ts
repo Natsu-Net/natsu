@@ -497,14 +497,16 @@ if (!first && KEY && regions(D)[0]) {
 		u.origin == L.origin &&
 		!flag(el, "reload") &&
 		!/\.(?!html?$)\w+$/i.test(u.pathname);
-	/** A target other than this tab: the element's own, else `<base target>`. */
-	const other = (t?: string | null) => (t ||= D.querySelector("base")?.target) && t != "_self";
+	/** A target other than this tab: the element's own, else the first `<base target>`. */
+	const other = (t?: string | null) => (t ||= D.querySelector<HTMLBaseElement>("base[target]")?.target) && t != "_self";
+	/** The page on screen's URL, and what its links resolve against: its `<base href>`, read against it while `away`. */
+	const here = () => (away ? rendered : L.href);
+	const base = () => new URL(D.querySelector("base[href]")?.getAttribute("href") || "", here());
 	const link = (e: Event, click?: 1) => {
 		const a = (e.target as Element).closest?.("a[href]");
 		// A link in an editor is not followed: a click there places the caret.
 		if (!(a instanceof HTMLAnchorElement) || a.isContentEditable || other(a.target) || a.hasAttribute("download")) return;
-		// Read against the page it belongs to, while `away`.
-		const u = new URL(a.getAttribute("href")!, away ? rendered : D.baseURI);
+		const u = new URL(a.getAttribute("href")!, base());
 		// The same page with a hash is the browser's own jump to an anchor, and
 		// the scroll it makes belongs to the entry it pushes: the one left keeps
 		// where it is now.
@@ -544,11 +546,13 @@ if (!first && KEY && regions(D)[0]) {
 			/[^utf8-]/i.test(attr("accept-charset") || "")
 		)
 			return;
-		const u = new URL(attr("action") || "", away ? rendered : D.baseURI);
+		// No action is the page's own URL, never the base.
+		const u = new URL(attr("action") || here(), base());
 		if (!ok(form, u) || (by && !ok(by, u))) return;
 		// A file goes as its name, and a line break as CRLF, as the browser sends them in a query.
+		// "?" first: with no field the query is empty, not gone, as the browser sends it.
 		u.search =
-			"" + new URLSearchParams([...new FormData(form, by)].map(([k, v]) => [k, (v as File).name ?? (v as string).replace(/\r?\n/g, "\r\n")]));
+			"?" + new URLSearchParams([...new FormData(form, by)].map(([k, v]) => [k, (v as File).name ?? (v as string).replace(/\r?\n/g, "\r\n")]));
 		e.preventDefault();
 		visit(u);
 	});
