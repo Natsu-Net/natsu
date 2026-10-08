@@ -27,6 +27,7 @@
  */
 
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, relative, sep } from "node:path";
 import { type PageBlock, splitPageBlock, textPaths } from "./block.ts";
 import { PageCompileError } from "./errors.ts";
@@ -92,7 +93,12 @@ interface UwuCompiled {
 // The tree's types come from `uwu-template/ast`, a file of types alone.
 const UWU = "uwu-template";
 const UWU_RUNTIME = "uwu-template/runtime";
-const { compile } = (await import(UWU)) as { compile: (source: string, options: { file?: string }) => UwuCompiled };
+type UwuCompile = (source: string, options: { file?: string }) => UwuCompiled;
+// Loaded on the first compile, not on import: an app that serves pages compiled
+// at build never loads the compiler (nor the CSS tools it brings).
+let uwuCompile: UwuCompile | undefined;
+const compile: UwuCompile = (source, options) =>
+	(uwuCompile ??= (createRequire(import.meta.url)(UWU) as { compile: UwuCompile }).compile)(source, options);
 
 const SEGMENT = /^[\w.~-]+$/;
 const PARAM = /^\[([A-Za-z_][\w]*)\]$/;
