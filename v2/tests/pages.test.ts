@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import * as natsu from "../index.ts";
 import { Assets } from "../src/assets.ts";
+import { clearActions } from "../src/pages/actions.ts";
 import { splitPageBlock } from "../src/pages/block.ts";
 import { compilePageFile, compilePages, linkProblem, routeOf } from "../src/pages/compile.ts";
 import { clearSources, defaultKind, registerModelResolver, source } from "../src/pages/data.ts";
@@ -27,6 +28,7 @@ let site: PageSite | undefined;
 beforeEach(() => {
 	reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test" } });
 	clearSources();
+	clearActions();
 	dir = mkdtempSync(join(tmpdir(), "natsu-pages-"));
 });
 
@@ -659,6 +661,103 @@ describe("caching", () => {
 		const { get } = await serve({ "index.uwu": `<template>{{n}}</template>` }, { cache: false });
 		expect(await (await get("/")).text()).toBe("1");
 		expect(await (await get("/")).text()).toBe("2");
+	});
+});
+
+describe("inside an existing app", () => {
+	test("request names: the app's own values, read like any name, never kept", async () => {
+		let loads = 0;
+		source("n", () => ++loads);
+		const { get } = await serve(
+			{
+				"_layout.uwu": `<template><header>{{header.who}}</header>{{> @child}}</template>`,
+				"index.uwu": `<template>{{n}} {{session.id}}</template>`,
+			},
+			{
+				request: {
+					header: async (ctx) => ({ who: ctx.headers.get("x-user") ?? "guest" }),
+					session: (ctx) => ({ id: ctx.headers.get("x-session") ?? "none" }),
+				},
+			},
+		);
+		expect(await (await get("/")).text()).toBe("<header>guest</header>1 none");
+		expect(await (await get("/", { headers: { "x-user": "ann", "x-session": "s1" } })).text()).toBe("<header>ann</header>2 s1");
+		// Read by a layout or the page, it is this visitor's: drawn every time.
+		expect(await (await get("/")).text()).toBe("<header>guest</header>3 none");
+		expect(site!.routes[0]!.data).toContainEqual({ name: "header", kind: "request", from: "header" });
+	});
+
+	test("a page that reads none of them is still kept", async () => {
+		let loads = 0;
+		source("n", () => ++loads);
+		const { get } = await serve({ "index.uwu": `<template>{{n}}</template>` }, { request: { header: () => "h" } });
+		expect(await (await get("/")).text()).toBe("1");
+		expect(await (await get("/")).text()).toBe("1");
+	});
+
+	test("around runs around pages, actions and the 404, and may answer first", async () => {
+		const seen: string[] = [];
+		natsu.action("t.ping", () => ({ flash: "pong" }));
+		const around: PagesOptions["around"] = async (ctx, next) => {
+			seen.push(`${ctx.method} ${ctx.path}`);
+			if (ctx.headers.get("x-gate") === "closed") {
+				ctx.response.status = 503;
+				return "closed";
+			}
+			const out = await next();
+			ctx.response.headers.set("x-around", "1");
+			return out;
+		};
+		const { get } = await serve(
+			{
+				"index.uwu": `<page><action ping="t.ping"></page><template><form @submit="action:ping"><button>go</button></form></template>`,
+				"_error.uwu": `<template>missing {{error.status}}</template>`,
+			},
+			{ around },
+		);
+		const page = await get("/");
+		expect(page.headers.get("x-around")).toBe("1");
+		const html = await page.text();
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "ping", _csrf: token });
+		const posted = await get("/", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posted.headers.get("x-around")).toBe("1");
+
+		const missing = await get("/nope");
+		expect(missing.status).toBe(404);
+		expect(await missing.text()).toBe("missing 404");
+		expect(missing.headers.get("x-around")).toBe("1");
+
+		const closed = await get("/", { headers: { "x-gate": "closed" } });
+		expect(closed.status).toBe(503);
+		expect(await closed.text()).toBe("closed");
+		expect(seen).toEqual(["GET /", "POST /", "GET /nope", "GET /"]);
+	});
+
+	test("transform rewrites every file before it compiles: pages, layouts and partials", async () => {
+		const files = {
+			"_layout.uwu": `<template><main>[[> @child]]</main></template>`,
+			"_partials/hi.uwu": `<template><b>[[name]]</b></template>`,
+			"index.uwu": `<page title="Home"></page>\n<template>[[> hi]] [[page.title]]</template>`,
+		};
+		const seen: string[] = [];
+		const transform = (text: string, file: string): string => {
+			seen.push(file);
+			return text.replaceAll("[[", "{{").replaceAll("]]", "}}");
+		};
+		source("name", () => "Ann");
+		const { get } = await serve(files, { transform });
+		expect(await (await get("/")).text()).toBe("<main><b>Ann</b> Home</main>");
+		expect([...new Set(seen)].sort()).toEqual(["_layout.uwu", "_partials/hi.uwu", "index.uwu"]);
+		// The block is cut out first: transform sees its lines blank.
+		const out = mkdtempSync(join(tmpdir(), "natsu-built-"));
+		try {
+			compilePages(dir, out, { transform });
+		} finally {
+			rmSync(out, { recursive: true, force: true });
+		}
 	});
 });
 
