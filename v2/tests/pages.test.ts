@@ -148,6 +148,17 @@ describe("links (@href)", () => {
 		expect(asked).toEqual(["name", "slug", "vendor"]);
 	});
 
+	test("@href holes read like any value: a parent's field through ../, encoded into the URL", async () => {
+		let asked: string[] = [];
+		source("shops", ({ fields }) => ((asked = fields), [{ vendor: "a b/c", products: [{ slug: "s?1" }] }]));
+		const { get } = await serve({
+			"index.uwu": `<template>{{#each shops}}{{#each products}}<a @href="/p/{{../vendor}}/{{slug}}">x</a>{{/each}}{{/each}}</template>`,
+			"p/[vendor]/[slug].uwu": `<template>{{params.slug}}</template>`,
+		});
+		expect(await (await get("/")).text()).toBe(`<a href="/p/a%20b%2Fc/s%3F1" data-uwu-link>x</a>`);
+		expect(asked).toEqual(["products.slug", "vendor"]);
+	});
+
 	test("an @href no page answers fails at compile, naming the file and line; so does one in a layout, the error page or a partial", async () => {
 		const cases: [Record<string, string>, RegExp][] = [
 			[{ "index.uwu": `<template>\n<p>\n<a @href="/jobz/{{id}}">x</a></p></template>` }, /pages\/index.uwu:3: @href="\/jobz\/\{\{id\}\}" matches no page: no file under pages\/ answers \/jobz\/:…/],
