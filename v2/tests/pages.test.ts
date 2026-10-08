@@ -736,6 +736,49 @@ describe("inside an existing app", () => {
 		expect(seen).toEqual(["GET /", "POST /", "GET /nope", "GET /"]);
 	});
 
+	test("errors: the app's own, as natsu's, from a source and from an action", async () => {
+		class Gone extends Error {}
+		class SignIn extends Error {}
+		const errors: PagesOptions["errors"] = (error) =>
+			error instanceof Gone ? new natsu.NotFound() : error instanceof SignIn ? new natsu.Redirect("/login?next=%2F") : undefined;
+		source("thing", ({ query }) => {
+			if (query.gone) throw new Gone();
+			if (query.who === undefined) throw new SignIn();
+			if (query.far) throw new natsu.Redirect("//evil.test/x");
+			return query.who;
+		});
+		natsu.action("t.save", () => {
+			throw new SignIn();
+		});
+		const { get } = await serve(
+			{
+				"index.uwu": `<page><action save="t.save"></page><template>{{thing}}<form @submit="action:save"><button>go</button></form></template>`,
+				"_error.uwu": `<template>missing {{error.status}}</template>`,
+			},
+			{ errors },
+		);
+		const page = await get("/?who=ann");
+		expect(await page.text()).toContain("ann");
+		const gone = await get("/?gone=1&who=ann");
+		expect(gone.status).toBe(404);
+		expect(await gone.text()).toBe("missing 404");
+		const away = await get("/", { redirect: "manual" });
+		expect(away.status).toBe(302);
+		expect(away.headers.get("location")).toBe("/login?next=%2F");
+		expect(await away.text()).toBe("");
+		// A location off this site is never followed.
+		const far = await get("/?who=ann&far=1", { redirect: "manual" });
+		expect(far.headers.get("location")).toBe("/");
+
+		const again = await get("/?who=ann");
+		const token = /name="_csrf" value="([^"]+)"/.exec(await again.text())![1]!;
+		const cookie = again.headers.get("set-cookie")?.split(";")[0] ?? `natsu_csrf=${token}`;
+		const body = new URLSearchParams({ _action: "save", _csrf: token });
+		const posted = await get("/?who=ann", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posted.headers.get("location")).toBe("/login?next=%2F");
+	});
+
 	test("transform rewrites every file before it compiles: pages, layouts and partials", async () => {
 		const files = {
 			"_layout.uwu": `<template><main>[[> @child]]</main></template>`,
