@@ -1,0 +1,31 @@
+<page title="Board">
+  <action post="notes.add">
+</page>
+<template>
+<h1>Board</h1>
+{{#if flash}}<p class="flash">{{flash.message}}</p>{{/if}}
+
+<p>
+  Clicked <strong>{{counter.value}}</strong> times
+  <button @click="action:counter.bump" data-by="1">+1</button>
+  <button @click="action:counter.bump" data-by="10">+10</button>
+</p>
+
+<ul>
+{{#each notes}}
+  {{> note}}
+{{#else}}
+  <li>No notes yet.</li>
+{{/each}}
+</ul>
+
+<form @submit="action:post">
+  <label>Note <input name="text" value="{{form.values.text}}" maxlength="140"></label>
+  {{#if form.errors.text}}<b class="error">{{form.errors.text}}</b>{{/if}}
+  <button>Post</button>
+</form>
+</template>
+<style>
+.flash { background: #efe; }
+.error { color: #b00; }
+</style>
