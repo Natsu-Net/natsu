@@ -239,7 +239,10 @@ export class Application {
 	private async fallbackTerminal(ctx: Context): Promise<void> {
 		// No route: a static file or the 404 is never a page in the visitor's shell.
 		if ((ctx.nav.requested || isIslandRequest(ctx)) && refuseWithoutRoute(ctx)) return;
-		if (this.statics && !this.config.Static.beforeRoutes && (await this.statics.serve(ctx))) return;
+		// With `beforeRoutes` the files are tried ahead of a matched route; a
+		// path no route matches has not been tried yet, so it is tried here
+		// either way.
+		if (this.statics && (await this.statics.serve(ctx))) return;
 		if (ctx.response.body === undefined && !ctx.response.statusSet) await this.answerNotFound(ctx);
 	}
 
