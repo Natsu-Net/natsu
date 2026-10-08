@@ -112,6 +112,7 @@ export interface PageLocals {
 }
 
 const SECRET = /^[\w.~+/=-]*$/;
+const NO_SECRETS: Record<string, string> = Object.freeze({}) as Record<string, string>;
 
 export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	if (!options.dir && !options.built) throw new TypeError("natsu/pages: mountPages needs { dir } or { built }");
@@ -244,9 +245,9 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	// --- a request -------------------------------------------------------------
 
 	const scopeFor = (ctx: Context, state: RouteState, secrets: Record<string, string>, extra: Record<string, unknown> = {}) => {
-		let viewer: Promise<unknown> | undefined;
+		let viewer: { v: unknown } | undefined;
 		const request = new Map<string, () => unknown>([
-			["viewer", () => (viewer ??= Promise.resolve(viewerOf(ctx)))],
+			["viewer", () => (viewer ??= { v: viewerOf(ctx) }).v],
 			["secrets", () => secrets],
 		]);
 		for (const [name, value] of Object.entries(extra)) request.set(name, () => value);
@@ -256,12 +257,11 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const pageValue = (meta: PageMeta, styles: string) => ({ ...meta, meta, head: headTags(meta) + (styles ? `<style>${styles}</style>` : ""), styles });
 
 	const drawPage = async (drawn: Drawn, values: Record<string, unknown>, meta: PageMeta, fallbackTitle: string): Promise<string> => {
-		values.page = pageValue(meta, drawn.styles);
+		// The page itself sees `page` without the <h1> title (that comes from what it draws).
+		if ("page" in drawn.page.reads) values.page = pageValue(meta, drawn.styles);
 		const html = await renderToString(drawn.page.render, values, renderOptions);
-		if (!meta.title) {
-			meta = { ...meta, title: firstHeading(html) || fallbackTitle };
-			values.page = pageValue(meta, drawn.styles);
-		}
+		if (!meta.title) meta.title = firstHeading(html) || fallbackTitle;
+		values.page = pageValue(meta, drawn.styles);
 		let out = html;
 		for (const layout of drawn.layouts) out = await renderToString(layout.render, values, { ...renderOptions, child: out });
 		return out;
@@ -309,8 +309,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			const state = routes.get(path);
 			if (!state) return undefined; // removed in development: a 404
 
-			const secrets = options.secrets?.(ctx) ?? {};
-			const names = Object.keys(secrets).sort();
+			const secrets = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+			const names = options.secrets ? Object.keys(secrets).sort() : [];
 			const answer = (out: { body: string; status: number; html?: boolean; headers?: Record<string, string> }): string => {
 				ctx.response.status = out.status;
 				if (out.html ?? out.headers?.["content-type"]?.startsWith("text/html")) ctx.response.type = "text/html; charset=utf-8";

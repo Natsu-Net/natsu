@@ -179,6 +179,8 @@ export type Loader =
 			fallback?: { v: unknown };
 			when?: "session";
 			fields: string[];
+			/** The arguments, when every one is a literal and nothing is needed first: called at once. */
+			ready?: Record<string, unknown>;
 	  }
 	| { t: "one"; name: string; param: string; fields: string[] }
 	| { t: "many"; name: string; fields: string[] }
@@ -202,6 +204,8 @@ export interface Plan {
 	personal: boolean;
 	/** Where each name is first read, for errors. */
 	readAt: Map<string, string>;
+	/** What each load that is not a request name comes from. */
+	used: UsedData[];
 }
 
 export interface PlanInput {
@@ -297,7 +301,14 @@ export function buildPlan(input: PlanInput): Plan {
 
 	for (const [name, read] of input.reads) add(name, read.at);
 	checkCycles(loaders, readAt);
-	return { names: order, loaders, personal, readAt };
+	const used: UsedData[] = [];
+	for (const loader of loaders.values()) {
+		if (loader.t === "source" && loader.needs.length === 0 && Object.values(loader.args).every((arg) => arg.t === "literal")) {
+			loader.ready = Object.fromEntries(Object.entries(loader.args).map(([key, arg]) => [key, (arg as { v: unknown }).v]));
+		}
+		if (loader.t !== "request") used.push({ name: loader.name, kind: loader.t, from: loader.t === "source" ? loader.source : loader.t === "api" ? loader.service : loader.name });
+	}
+	return { names: order, loaders, personal, readAt, used };
 }
 
 function splitAt(at: string): [string, number] {
@@ -355,60 +366,81 @@ function walk(value: unknown, segments: readonly string[]): unknown {
 	return current;
 }
 
-/** Load every name of a plan, in parallel; the first NotFound/Forbidden/error rejects. */
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+	value !== null && (typeof value === "object" || typeof value === "function") && typeof (value as PromiseLike<unknown>).then === "function";
+
+/**
+ * Load every name of a plan, in parallel; the first NotFound/Forbidden/error
+ * rejects. A value that is ready (a request name, a source that answers
+ * without awaiting) is taken as it is: no promise, no microtask.
+ */
 export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Resolved> {
 	const { ctx } = scope;
-	const memo = new Map<string, Promise<unknown>>();
-	const used: UsedData[] = [];
+	/** A value, or a promise of one, by name. */
+	const memo = new Map<string, unknown>();
+	let used = plan.used;
 
-	const get = (name: string): Promise<unknown> => {
-		let pending = memo.get(name);
-		if (pending) return pending;
-		const loader = plan.loaders.get(name) ?? lateLoader(name, scope);
-		pending = run(loader);
-		// Every load is awaited by someone or by Promise.all below; this keeps a
-		// load that fails after another already did from being "unhandled".
-		pending.catch(() => {});
-		memo.set(name, pending);
-		return pending;
+	const get = (name: string): unknown => {
+		if (memo.has(name)) return memo.get(name);
+		let loader = plan.loaders.get(name);
+		if (!loader) {
+			loader = lateLoader(name, scope);
+			if (loader.t !== "request") used = [...used, { name, kind: loader.t, from: loader.t === "source" ? loader.source : loader.name }];
+		}
+		let value: unknown;
+		try {
+			value = run(loader);
+		} catch (error) {
+			value = Promise.reject(error);
+		}
+		// Every load is awaited by someone or below; this keeps a load that
+		// fails after another already did from being reported "unhandled".
+		if (value instanceof Promise) value.catch(() => {});
+		memo.set(name, value);
+		return value;
 	};
+	const need = (name: string): Promise<unknown> => Promise.resolve(get(name));
 
 	const value = async (arg: Arg): Promise<unknown> => (arg.t === "literal" ? arg.v : walk(await get(arg.segments[0]!), arg.segments.slice(1)));
 
 	const settle = (loader: Loader & { required: boolean; fallback?: { v: unknown } }, result: unknown): unknown => {
-		if (result instanceof HttpError) throw result;
+		if (result instanceof HttpError) {
+			if (loader.fallback && !(result instanceof Forbidden)) return loader.fallback.v;
+			throw result;
+		}
 		if (result === null || result === undefined) {
 			if (loader.fallback) return loader.fallback.v;
 			if (loader.required) throw new NotFound(`${loader.name} not found`);
-			return result ?? null;
+			return null;
 		}
 		return result;
 	};
 
-	const guarded = async (loader: Loader & { required: boolean; fallback?: { v: unknown }; when?: "session" }, load: () => Promise<unknown>): Promise<unknown> => {
+	/** `load()`, settled; a fallback stands in for a load that failed or found nothing, a refusal stays a refusal. */
+	const guarded = (loader: Loader & { required: boolean; fallback?: { v: unknown }; when?: "session" }, load: () => unknown): unknown => {
 		if (loader.when === "session" && !ctx.sessionLoaded) return loader.fallback ? loader.fallback.v : null;
-		try {
-			return settle(loader, await load());
-		} catch (error) {
-			// A fallback stands in for a load that failed or found nothing; a refusal stays a refusal.
+		const rescue = (error: unknown): unknown => {
 			if (loader.fallback && !(error instanceof Forbidden)) return loader.fallback.v;
 			throw error;
+		};
+		try {
+			const result = load();
+			if (isThenable(result)) return Promise.resolve(result).then((v) => settle(loader, v), rescue);
+			return settle(loader, result);
+		} catch (error) {
+			return rescue(error);
 		}
 	};
 
-	const run = async (loader: Loader): Promise<unknown> => {
+	const run = (loader: Loader): unknown => {
 		switch (loader.t) {
 			case "request":
 				return requestValue(loader.name, scope);
 			case "source": {
 				const registered = sources.get(loader.source);
 				if (!registered) throw new Error(`natsu/pages: source '${loader.source}' was removed`);
-				used.push({ name: loader.name, kind: "source", from: loader.source });
-				return guarded(loader, async () => {
-					await Promise.all(loader.needs.map(get));
-					const args: Record<string, unknown> = {};
-					for (const [key, arg] of Object.entries(loader.args)) args[key] = await value(arg);
-					return registered.fn({
+				const call = (args: Record<string, unknown>): unknown =>
+					registered.fn({
 						name: loader.name,
 						params: ctx.params,
 						query: ctx.query,
@@ -416,41 +448,50 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 						ctx,
 						args,
 						fields: loader.fields,
-						need: get,
+						need,
 					});
+				if (loader.ready) return guarded(loader, () => call({ ...loader.ready }));
+				return guarded(loader, async () => {
+					await Promise.all(loader.needs.map(need));
+					const args: Record<string, unknown> = {};
+					for (const [key, arg] of Object.entries(loader.args)) args[key] = await value(arg);
+					return call(args);
 				});
 			}
 			case "one": {
 				if (!resolver) throw new Error("natsu/pages: the model resolver was removed");
-				used.push({ name: loader.name, kind: "one", from: loader.name });
-				const result = await resolver.one(loader.name, {
+				const found = (result: unknown): unknown => {
+					if (result instanceof HttpError) throw result;
+					if (result === null || result === undefined) throw new NotFound(`${loader.name} not found`);
+					return result;
+				};
+				const result = resolver.one(loader.name, {
 					params: ctx.params,
 					param: loader.param,
 					value: ctx.params[loader.param] ?? "",
 					fields: loader.fields,
 					ctx,
 				});
-				if (result instanceof HttpError) throw result;
-				if (result === null || result === undefined) throw new NotFound(`${loader.name} not found`);
-				return result;
+				return isThenable(result) ? Promise.resolve(result).then(found) : found(result);
 			}
 			case "many": {
 				if (!resolver) throw new Error("natsu/pages: the model resolver was removed");
-				used.push({ name: loader.name, kind: "many", from: loader.name });
 				const query = ctx.query;
 				const page = Number.parseInt(query.page ?? "1", 10);
-				const result = await resolver.many(loader.name, {
+				const listed = (result: unknown): unknown => {
+					if (result instanceof HttpError) throw result;
+					return result ?? [];
+				};
+				const result = resolver.many(loader.name, {
 					query,
 					sort: query.sort,
 					page: Number.isFinite(page) && page > 0 ? page : 1,
 					fields: loader.fields,
 					ctx,
 				});
-				if (result instanceof HttpError) throw result;
-				return result ?? [];
+				return isThenable(result) ? Promise.resolve(result).then(listed) : listed(result);
 			}
 			case "api": {
-				used.push({ name: loader.name, kind: "api", from: loader.service });
 				return guarded(loader, async () => {
 					let path = "";
 					for (const part of loader.path) {
@@ -466,9 +507,21 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 		}
 	};
 
-	await Promise.all(plan.names.map(get));
 	const values: Record<string, unknown> = {};
-	for (const name of plan.names) values[name] = await memo.get(name);
+	const names = plan.names;
+	let waiting: unknown[] | undefined;
+	let waitingFor: string[] | undefined;
+	for (const name of names) {
+		const v = get(name);
+		if (isThenable(v)) {
+			(waiting ??= []).push(v);
+			(waitingFor ??= []).push(name);
+		} else values[name] = v;
+	}
+	if (waiting) {
+		const resolved = await Promise.all(waiting);
+		for (let i = 0; i < resolved.length; i++) values[waitingFor![i]!] = resolved[i];
+	}
 	return { values, used };
 }
 
