@@ -45,7 +45,7 @@ export { grantRoom, hasRoom, revokeRoom, revokeSession };
 export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
-export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, action, compilePages, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
+export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, action, compilePages, evaluateServer, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
 export type {
 	ActionHandler,
 	ActionInput,
@@ -58,6 +58,7 @@ export type {
 	PageMeta,
 	PageSite,
 	PagesOptions,
+	Render as TemplateRender,
 	ServiceConfig,
 	SourceFn,
 	SourceInput,
