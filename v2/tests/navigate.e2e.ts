@@ -715,6 +715,84 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
+	e2e("a page the back/forward cache kept while a Back was on its way: restored, it shows the page its URL names", async () => {
+		if (!full) return console.warn("skipped: the headless shell never uses the back/forward cache");
+		const page = await open("/a");
+		const cdp = await page.context().newCDPSession(page);
+		await cdp.send("Page.enable");
+		let why = "";
+		cdp.on("Page.backForwardCacheNotUsed", (e: { notRestoredExplanations: unknown }) => (why = JSON.stringify(e.notRestoredExplanations)));
+		await page.click("#to-b");
+		await title(page, "B");
+		// The part for /a comes back in 100 ms; the answer for /plain (a real load: not navigable) in 300 ms.
+		const hold = (ms: number) => async (r: any) => {
+			if (r.request().headers()["natsu-nav"]) await new Promise((y) => setTimeout(y, ms));
+			await r.continue();
+		};
+		await page.route(/\/a$/, hold(100));
+		await page.route(/\/plain$/, hold(300));
+		// Back, and while /a is on its way, a click on B's header link to /plain.
+		await page.evaluate(() => {
+			addEventListener("popstate", () => setTimeout(() => document.getElementById("to-plain")!.click(), 10), { once: true });
+			history.back();
+		});
+		await title(page, "Plain");
+		await page.goBack({ waitUntil: "commit" });
+		await new Promise((r) => setTimeout(r, 1000));
+		const got = await page.evaluate(() => ({
+			restored: (window as any).__restored,
+			url: location.pathname,
+			h1: document.querySelector("main h1")?.textContent,
+		}));
+		if (!got.restored) console.warn(`not restored from the back/forward cache: ${why}`);
+		expect(got.url == "/a" ? got.h1 : "Page A").toBe("Page A");
+		await page.context().close();
+	});
+
+	e2e("refresh() that the server answers with a real load (the shell changed after an action) reloads the page and keeps the scroll, as location.reload() does", async () => {
+		const results: unknown[] = [];
+		for (const hash of [false, true]) {
+			const page = await open("/a");
+			if (hash) {
+				await page.click("#jump");
+				await page.waitForFunction(() => location.hash === "#results");
+			}
+			await scrollTo(page, 1500);
+			await new Promise((r) => setTimeout(r, 300));
+			// An action signed the visitor in: the header (shell) differs, so the server answers the refresh with a real load.
+			fixture.state.banner = "Signed in";
+			try {
+				await page.evaluate(() => (window as any).natsu.refresh());
+				await new Promise((r) => setTimeout(r, 1500));
+				await page.waitForFunction(() => document.readyState === "complete");
+				const got = await page.evaluate(() => ({
+					loads: (window as any).__loads,
+					banner: document.getElementById("banner")?.textContent ?? null,
+					y: scrollY,
+				}));
+				results.push({ hash, ...got });
+			} finally {
+				fixture.state.banner = "";
+				await page.context().close();
+			}
+		}
+		expect(results).toEqual([
+			{ hash: false, loads: 2, banner: "Signed in", y: 1500 },
+			{ hash: true, loads: 2, banner: "Signed in", y: 1500 },
+		]);
+	});
+
+	e2e("a redirect whose target's natsu:visit is cancelled leaves no html[data-natsu-loading]", async () => {
+		const page = await open("/a");
+		await page.evaluate(() => {
+			document.addEventListener("natsu:visit", (e: any) => new URL(e.detail.url).pathname === "/c" && e.preventDefault());
+		});
+		await page.click("#to-old");
+		await page.waitForTimeout(700);
+		expect(await page.evaluate(() => [location.pathname, document.documentElement.hasAttribute("data-natsu-loading")])).toEqual(["/a", false]);
+		await page.context().close();
+	});
+
 	e2e("an inline <style nonce> in the head: kept when unchanged, and a page's own applies after a soft visit", async () => {
 		const page = await open("/account");
 		const color = (id: string) => page.evaluate((id: string) => getComputedStyle(document.getElementById(id)!).color, id);

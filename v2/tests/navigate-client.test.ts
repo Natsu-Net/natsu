@@ -1462,6 +1462,31 @@ describe("events and attributes", () => {
 		expect(p.loads).toEqual([["reload"]]);
 	});
 
+	test("a redirect whose target's natsu:visit is cancelled leaves no loading mark", async () => {
+		const p = open({
+			html: page({ shell: LINKS + `<a id="acct" href="/account">acct</a>` }),
+			routes: { "/account": () => tick(350).then(() => control({ "natsu-location": `${ORIGIN}/login` })), "/login": () => answer(part({ title: "Login" })) },
+		});
+		// The app opens a sign-in dialog instead of visiting /login.
+		p.document.addEventListener("natsu:visit", (e: W) => new URL(e.detail.url).pathname == "/login" && e.preventDefault());
+		const html = p.document.documentElement;
+		expect(p.click("#acct")).toBe(true);
+		await tick(500);
+		expect(p.calls.map((c) => c.url)).toEqual(["/account"]);
+		expect(path(p)).toBe("/a");
+		expect(html.hasAttribute("data-natsu-loading")).toBe(false);
+
+		// Fast answer: the 300 ms timer must not fire after the visit ended.
+		const q = open({
+			html: page({ shell: LINKS + `<a id="acct" href="/account">acct</a>` }),
+			routes: { "/account": () => control({ "natsu-location": `${ORIGIN}/login` }) },
+		});
+		q.document.addEventListener("natsu:visit", (e: W) => new URL(e.detail.url).pathname == "/login" && e.preventDefault());
+		q.click("#acct");
+		await tick(400);
+		expect(q.document.documentElement.hasAttribute("data-natsu-loading")).toBe(false);
+	});
+
 	test("<html data-natsu-reload> makes every visit a real load: links, forms, back/forward, visit, refresh, and no prefetch", async () => {
 		const p = open({
 			html: page({ shell: LINKS + `<form id="f" action="/search"><input name="q" value="1"></form>` }),
@@ -1478,7 +1503,8 @@ describe("events and attributes", () => {
 		p.window.history.back();
 		await settle();
 		expect(p.calls.map((c) => c.url)).toEqual(["/b"]);
-		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`], ["replace", `${ORIGIN}/b`], ["reload"]]);
+		// refresh() is this page again: a reload, as without the runtime.
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/c`], ["reload"], ["reload"]]);
 		// Turned off again ("false" or "off"), the document swaps.
 		p.document.documentElement.setAttribute("data-natsu-reload", "off");
 		expect(p.click("#to-c")).toBe(true);
@@ -1977,6 +2003,83 @@ describe("history", () => {
 		const p = open({ html: page(), before: (w) => w.history.replaceState({ natsu: { id: 1, p: 2, y: 450 } }, "") });
 		expect(p.window.scrollY).toBe(0);
 		expect(p.window.history.state.natsu).toMatchObject({ id: 1, y: 450 });
+	});
+	test("refresh() answered with a real load reloads the page, on a URL with a hash too", async () => {
+		for (const url of [`${ORIGIN}/a`, `${ORIGIN}/a#results`]) {
+			const p = open({ html: page(), url, routes: { "/a": () => control({ "natsu-reload": "shell" }) } });
+			await p.natsu.refresh();
+			expect([url, p.loads]).toEqual([url, [["reload"]]]);
+		}
+	});
+
+	test("refresh() that the server redirects to another page shows that page from its top, as a reload that redirects does", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/a": () => control({ "natsu-location": "/login" }),
+				"/login": () => answer(part({ title: "Sign in", main: "<h1>Sign in</h1>" })),
+			},
+		});
+		p.scroll(1500);
+		await p.natsu.refresh();
+		expect([path(p), text(p, "main h1")]).toEqual(["/login", "Sign in"]);
+		expect([p.window.scrollY, text(p, '[role="status"]'), p.document.activeElement?.textContent]).toEqual([0, "Sign in", "Sign in"]);
+	});
+
+	test("a hash jump while a visit is on its way does not cancel the visit (the browser still loads the page)", async () => {
+		let release!: () => void;
+		const anchors = `<h1>Page A</h1><a id="jump" href="#results">results</a><div class="tall"></div><div id="results">r</div>`;
+		const p = open({ html: page({ main: anchors }), routes: { "/b": () => new Promise((y) => (release = () => y(answer(part())))) } });
+		p.click("#to-b");
+		await tick(5);
+		jump(p, "#jump", 4000);
+		release();
+		await settle();
+		expect([path(p), text(p, "main h1")]).toEqual(["/b", "Page B"]);
+	});
+
+	test("a hash jump on the new page while its script still loads: natsu:load still fires", async () => {
+		const main = `<h1>Page B</h1><a id="jump" href="#results">results</a><div id="results">r</div>`;
+		const p = open({
+			html: page(),
+			routes: { "/b": () => answer(part({ main, scripts: ["/js/b.js"] })) },
+			scripts: { "/js/b.js": (w) => w.natsu.mount("main", () => {}) },
+			holdJs: ["/js/b.js"],
+		});
+		const loaded: string[] = [];
+		p.document.addEventListener("natsu:load", (e: CustomEvent<NatsuLoadDetail>) => loaded.push(new URL(e.detail.url).pathname));
+		p.click("#to-b");
+		await settle();
+		jump(p, "#jump", 300);
+		p.release("/js/b.js");
+		await settle();
+		expect(loaded).toEqual(["/b"]);
+	});
+
+	test("an entry a script pushed with no state keeps its own scroll: Back to the entry before it restores that entry's", async () => {
+		const p = open({
+			html: page(),
+			routes: {
+				"/a": () => answer(part({ title: "A", main: "<h1>Page A</h1>" })),
+				"/a?f=1": () => answer(part({ title: "A1", main: "<h1>Page A filtered</h1>" })),
+				"/b": () => answer(part()),
+			},
+		});
+		p.scroll(100);
+		await tick(250);
+		// A filter widget: a new entry for its state, with no state of natsu's.
+		p.window.history.pushState(null, "", "/a?f=1");
+		p.scroll(900);
+		await tick(250);
+		p.click("#to-b");
+		await settle();
+		p.window.history.back();
+		await settle();
+		expect([path(p), p.window.scrollY]).toEqual(["/a?f=1", 900]);
+		p.window.history.back();
+		await settle();
+		// A browser restores each entry's own scroll: /a was left at 100.
+		expect([path(p), p.window.scrollY]).toEqual(["/a", 100]);
 	});
 });
 

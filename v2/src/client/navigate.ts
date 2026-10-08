@@ -426,7 +426,8 @@ if (!first && KEY && regions(D)[0]) {
 	 */
 	let away: unknown;
 	const ys = new Map<number, number>();
-	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: cur, p: page, y } }, "", url);
+	/** Ours into the entry shown; one a script pushed with no state of ours gets an id of its own first. */
+	const put = (y?: number, url?: string) => HI.replaceState({ ...HI.state, natsu: { id: st() ? cur : (cur = ++id), p: page, y } }, "", url);
 	// The browser restores scroll, on a reload too, until a swap makes the
 	// entries manual. A reload keeps that, and leaves the scroll to us: now,
 	// and again at load (images, fonts) unless the visitor scrolled meanwhile.
@@ -443,6 +444,7 @@ if (!first && KEY && regions(D)[0]) {
 	on(
 		"scroll",
 		() => {
+			frozen || away || st() || put();
 			frozen == cur || ys.set(cur, scrollY);
 			// Into the entry too, once the scroll settles: Back or Forward leaves
 			// it with no event of its own, and the document may be gone before
@@ -455,7 +457,9 @@ if (!first && KEY && regions(D)[0]) {
 	);
 	// Back from the back/forward cache after a visit became a real load: no
 	// longer loading, and a loading timer frozen with the page must not fire.
-	on("pageshow", (e: PageTransitionEvent) => e.persisted && idle());
+	// Kept while a Back or Forward was on its way, the page on screen is not
+	// the one in the address bar: that one loads.
+	on("pageshow", (e: PageTransitionEvent) => e.persisted && (idle(), away && L.reload()));
 	// A replaceState in pagehide is lost on a reload; one in beforeunload is kept.
 	on("beforeunload", save);
 	on("pagehide", () => {
@@ -466,9 +470,9 @@ if (!first && KEY && regions(D)[0]) {
 		const s = st();
 		const y = s && (ys.get(s.id) ?? s.y);
 		away = s ? s.p != page : !frozen && bare(L) != rendered;
-		// Whatever was on its way is over: this entry is what shows now.
-		++seq;
-		idle();
+		// Whatever was on its way is over: this entry is what shows now. Not
+		// after a hash link's own jump, which the browser lets a load go on past.
+		frozen || (++seq, idle());
 		frozen = 0;
 		if (away) return visit(L.href, { history: "none", scroll: y });
 		// The same page (a hash link's entry, or one made from this page): the
@@ -616,7 +620,9 @@ if (!first && KEY && regions(D)[0]) {
 	 * unsure. Not loading any more: one that never leaves the page (a
 	 * download, a 204) must not leave the mark on it.
 	 */
-	const full = (u: URL, h?: string) => (idle(), h == "none" ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
+	const full = (u: URL, h?: string) =>
+		// This page again (refresh) is a reload: a replace of a URL with a hash would only jump, and one without would lose the scroll.
+		(idle(), h == "none" || (h == "replace" && u.href == L.href) ? L.reload() : L[h == "replace" ? "replace" : "assign"](u.href));
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
@@ -629,7 +635,8 @@ if (!first && KEY && regions(D)[0]) {
 		// Cancelled: nothing happens, unless the URL already changed (back/forward).
 		if (!fire("visit", { url: u.href })) {
 			if (DEV && "none" == h) why("natsu:visit was cancelled", u.href);
-			return "none" == h ? full(u, h) : undefined;
+			// A redirect's hop owns the loading timer its first visit started.
+			return "none" == h ? full(u, h) : void (o.hops && idle());
 		}
 		if (unsafe() || u.origin != L.origin || refused.has(u.pathname)) return full(u, h);
 		// The page already shown: the browser too replaces rather than pushes.
@@ -662,7 +669,8 @@ if (!first && KEY && regions(D)[0]) {
 		if (to) {
 			const v = new URL(to, u);
 			v.hash ||= u.hash;
-			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: -~o.hops! };
+			// Another page: "keep" was for the one asked for.
+			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: -~o.hops!, scroll: o.scroll == "keep" && v.pathname != u.pathname ? undefined : o.scroll };
 			return next.hops! < 6 ? visit(v, next) : (DEV && why("redirect to", v.href), full(v, next.history));
 		}
 		if (!head.has("natsu-part")) {
