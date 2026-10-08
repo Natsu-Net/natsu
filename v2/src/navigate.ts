@@ -935,7 +935,8 @@ export interface Part {
 
 /**
  * The part: a small document with the page's head less its scripts, the key
- * and the regions in order; the script list goes in a header.
+ * and the regions in order, all less their `<noscript>`s; the script list
+ * goes in a header.
  *
  * Nothing in the part's markup ever becomes a script or gets the document's
  * nonce on the server's word alone, because a browser can read markup in a
@@ -976,7 +977,7 @@ export function partOf(
 			lt = html.indexOf("<", raw[r + 1]!);
 			continue;
 		}
-		if (rawStart === lt && isScriptAt(html, lt)) {
+		if (rawStart === lt && (isScriptAt(html, lt) || isNoscriptAt(html, lt))) {
 			head += html.slice(from, lt);
 			from = raw[r + 1]!;
 			lt = html.indexOf("<", from);
@@ -995,8 +996,19 @@ export function partOf(
 		lt = html.indexOf("<", rawStart === lt ? raw[r + 1]! : tag ? tag.end : lt + 1);
 	}
 	head += html.slice(from, headClose);
+	// A <noscript> goes too: the runtime parses with scripting off, which reads
+	// its content as markup (a `</div>` in it would close the region's own),
+	// and with scripting on a browser never shows it anyway.
 	let regions = "";
-	for (const region of scan.regions) regions += html.slice(region.start, region.end);
+	for (const region of scan.regions) {
+		let at = region.start;
+		for (let i = firstAtOrAfter(raw, at); i < raw.length && raw[i]! < region.end; i += 2) {
+			if (!isNoscriptAt(html, raw[i]!)) continue;
+			regions += html.slice(at, raw[i]);
+			at = Math.min(raw[i + 1]!, region.end);
+		}
+		regions += html.slice(at, region.end);
+	}
 	const scripts: string[] = [];
 	for (const tag of scan.scripts) {
 		if (runtime && tag.src === runtime) continue;
@@ -1099,7 +1111,10 @@ interface Markup {
 	unsure: number;
 	/** `<head`, past its `>`, `</head`, past its `>`; -1 for each not found. */
 	head: [number, number, number, number];
-	/** Where each `<template` start tag is, in order (a declarative shadow root is one). */
+	/**
+	 * Where each `<template` start tag is, in order (a declarative shadow root
+	 * is one), in svg and math too: one in a `foreignObject` is HTML.
+	 */
 	templates: number[];
 	/**
 	 * The head's first script that runs after the page is parsed (one with a
@@ -1193,6 +1208,8 @@ function readMarkup(html: string, headOnly = false): Markup {
 					if (templates === 0) inert.push(inertFrom, lt);
 					continue;
 				}
+				// Noted here too: in a foreignObject it is HTML, a declarative shadow root.
+				if (name === "template") starts.push(lt);
 				if (closed) {
 					// `<path/>`: nothing opens.
 				} else if (SWITCHES.has(name)) {
@@ -1565,6 +1582,11 @@ function isAttributeEnd(code: number): boolean {
 /** Whether a `<script` start tag (in any case) begins at `at`. */
 function isScriptAt(html: string, at: number): boolean {
 	return html.charCodeAt(at) === 60 && html.slice(at + 1, at + 7).toLowerCase() === "script" && isTagEnd(html.charCodeAt(at + 7));
+}
+
+/** Whether a `<noscript` start tag (in any case) begins at `at`. */
+function isNoscriptAt(html: string, at: number): boolean {
+	return html.charCodeAt(at) === 60 && namedAt(html, at + 1, "noscript") && isTagEnd(html.charCodeAt(at + 9));
 }
 
 function isLetter(code: number): boolean {
