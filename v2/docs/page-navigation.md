@@ -215,6 +215,26 @@ only from an answer that says `Natsu-Island: 1` back, which only an
 Islands are fetched from your own site only. If your pages show HTML your
 users wrote, strip `data-natsu-*` attributes from it in your sanitizer.
 
+### Live islands
+
+An island can be live on its own. Give `island()` the tags its answer
+depends on, and when one is invalidated the runtime fetches that island
+again and redraws only it; the page around it, a playing video, an open
+menu, all stay as they are.
+
+```ts
+Routes.get("/api/bell", island(bell, { tags: (ctx) => [`bell:${userOf(ctx)}`] }));
+
+// wherever a notification is written:
+invalidate(`bell:${userId}`);
+```
+
+The tags travel signed in a `Natsu-Live` header on the island's answer, the
+same way a page's travel in its `natsu-live` meta, so a visitor can only
+watch what the server handed them. A tag the page itself depends on still
+redraws the page. Live islands need the live socket (`/_uwu/socket`),
+which page files with a live source already open.
+
 ## Links in page files
 
 In a page file (`pages/**/*.uwu`), write links to other pages with uwu's

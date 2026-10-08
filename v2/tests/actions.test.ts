@@ -362,6 +362,23 @@ describe("live data", () => {
 		expect(frames.length).toBe(1);
 		ws.close();
 	});
+
+	test("a socket can watch several signed lists at once, the page's and its islands'; a forged one is dropped alone", async () => {
+		await serve({ "_layout.uwu": LAYOUT, "index.uwu": `<template>hi</template>` });
+		const ws = new WebSocket(`${running!.base.replace("http", "ws")}/_uwu/socket`);
+		const frames: string[] = [];
+		ws.onmessage = (e) => frames.push(String(e.data));
+		await new Promise((resolve) => (ws.onopen = resolve));
+		ws.send(JSON.stringify({ t: "watch", tags: [signTags(["page:1"]), "forged|x", signTags(["bell:7"])] }));
+		await Bun.sleep(30);
+		invalidate(["x", "bell:7", "page:1"]);
+		await Bun.sleep(30);
+		expect(frames.sort()).toEqual([
+			JSON.stringify({ t: "invalidate", tag: "bell:7" }),
+			JSON.stringify({ t: "invalidate", tag: "page:1" }),
+		]);
+		ws.close();
+	});
 });
 
 describe("partials", () => {

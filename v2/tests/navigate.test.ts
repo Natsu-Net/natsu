@@ -21,6 +21,7 @@ import type { Context, Handler } from "../src/context.ts";
 import { setLogLevel, setLogSink } from "../src/logger.ts";
 import { Controller } from "../src/controller.ts";
 import { inertNav, island, navigable, partOf, scanPage, shellOf } from "../src/navigate.ts";
+import { verifyTags } from "../src/invalidate.ts";
 import { PageCache } from "../src/page-cache.ts";
 import { Get, Island, Navigable, Router } from "../src/router.ts";
 import { Application } from "../src/server.ts";
@@ -1152,8 +1153,8 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		// 5.5 KiB: see the size test in navigate-client.test.ts for what the last 512 bytes bought.
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5632);
+		// 5.6 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5734);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {
@@ -1343,6 +1344,16 @@ describe("islands", () => {
 		const text = await answer.text();
 		expect(text).not.toContain("natsu-navigate");
 		expect(text).not.toContain('name="natsu"');
+	});
+
+	test("an island given tags answers with them signed, for the client to watch", async () => {
+		new Router().get("/bell", island(() => "<b>3</b>", { tags: (ctx) => ["bell:" + ctx.query.u] }));
+		new Router().get("/plain-isle", island(() => "<b>0</b>"));
+		const { app } = await pipeline();
+		const answer = await get(app, "/bell?u=7", { "natsu-island": "1" });
+		expect(answer.status).toBe(200);
+		expect(verifyTags(answer.headers.get("natsu-live")!)).toEqual(["bell:7"]);
+		expect((await get(app, "/plain-isle", { "natsu-island": "1" })).headers.get("natsu-live")).toBeNull();
 	});
 
 	test("any other route is refused before its handler runs: an island named in user content cannot pull in a page", async () => {
