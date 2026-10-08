@@ -17,7 +17,7 @@ export {
 	type Guard,
 	type GuardInput,
 } from "./actions.ts";
-export { compilePages, compilePageFile, routeOf, type CompiledFile, type CompileOptions, type PageManifest } from "./compile.ts";
+export { compilePages, compilePageFile, evaluateServer, routeOf, type CompiledFile, type Render, type CompileOptions, type PageManifest } from "./compile.ts";
 export {
 	clearSources,
 	defaultKind,
