@@ -183,6 +183,9 @@
  * With no key or no region the runtime stays inert: `mount` still works and
  * `visit` is `location.assign`.
  *
+ * **Actions and live data** (`data-uwu-action`, `<meta name="natsu-live">`)
+ * are built in too: see the section of that name below.
+ *
  * Built as a classic script. `define: { NATSU_DEV: "true" }` gives the
  * development build, which says in the console why each visit became a
  * real load; any other build leaves those lines out.
@@ -198,8 +201,9 @@ const why = (...a: unknown[]) => console.info("natsu: real load,", ...a);
 type Reg = [string, (el: Element, signal: AbortSignal) => unknown, string];
 /** An element and the registrations already mounted on it. */
 type Mounted = Element & { natsu?: Set<Reg> };
-type Opts = NatsuVisitOptions & { hops?: number };
 type Answer = [Response, string];
+/** `a`: the answer already on its way (an action's post), used instead of a GET. */
+type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer> };
 
 const D = document;
 const H = D.documentElement;
@@ -371,6 +375,118 @@ const boot = () => {
 		fire("load", { url: L.href, regions: regions(D) });
 	}
 };
+
+// --- actions and live data ---------------------------------------------------
+
+/**
+ * The browser half of actions and live data, built into the runtime.
+ *
+ * **Actions.** uwu draws `@submit="action:add"` as a form with
+ * `data-uwu-action="add" data-uwu-event="submit"` (a POST to the page,
+ * `_action` in a hidden field) and `@click="action:done"` as an element with
+ * `data-uwu-action="done" data-uwu-event="click"`. A mount on
+ * `[data-uwu-action]` listens for that event and posts the form's fields
+ * and the element's `data-*` (by dataset name; a form field of the same name
+ * wins), `_action`, and the CSRF token (the form's, else the `natsu_csrf`
+ * cookie), with `Natsu-Action: 1`. On a page with a key the post also
+ * carries `Natsu-Nav`, and its answer is handled as a visit's: a 303 back
+ * becomes a visit of the page (its regions swapped, scroll and focus kept),
+ * a refused form comes back as a part with its errors. Without a key a form
+ * is left to the browser, and a click reloads the page once it is done.
+ * While a post is on its way its element is `aria-busy` and takes no other.
+ *
+ * **Live data.** A page that drew live data has
+ * `<meta name="natsu-live" content="<tags>|<signature>">`. Its tags go to
+ * the server over `/_uwu/socket` (`{ t: "watch", tags }`, again on every
+ * page shown, "" when a page has none), and an `invalidate` frame refreshes
+ * the page, unless an action is on its way (its own answer redraws the
+ * page). A dropped socket reconnects, waiting longer each time up to 30 s,
+ * and refreshes the page once back, for what it missed.
+ */
+
+/** Posts on their way. */
+let acting = 0;
+
+const send = (url: string, body: FormData | URLSearchParams, key?: string) =>
+	fetch(url, { method: "POST", body, headers: { "Natsu-Action": "1", ...(key && { "Natsu-Nav": key }) } });
+
+/**
+ * `act(url, body)` runs the post and redraws the page; `key` is the
+ * document key (forms go by the browser without one).
+ */
+const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParams) => unknown, key?: string) =>
+	regs.push([
+		"[data-uwu-action]",
+		(el, signal) => {
+			const d = (el as HTMLElement).dataset;
+			el.addEventListener(
+				d.uwuEvent || "click",
+				async (e) => {
+					const form = el instanceof HTMLFormElement && el;
+					if (e.defaultPrevented || (form && !key)) return;
+					e.preventDefault();
+					if (el.hasAttribute("aria-busy")) return;
+					const by = (e as SubmitEvent).submitter;
+					const fd = form ? new FormData(form, by) : new FormData();
+					for (const k in d) /^uwu[A-Z]/.test(k) || fd.has(k) || fd.set(k, d[k]!);
+					fd.set("_action", d.uwuAction!);
+					fd.has("_csrf") || fd.set("_csrf", /(?:^|; )natsu_csrf=([^;]*)/.exec(document.cookie)?.[1] || "");
+					const to = form ? new URL(by?.getAttribute("formaction") || form.getAttribute("action") || "", document.baseURI).href : location.href;
+					el.setAttribute("aria-busy", "true");
+					acting++;
+					try {
+						await act(to, [...fd.values()].some((v) => typeof v != "string") ? fd : new URLSearchParams(fd as unknown as string[][]));
+					} finally {
+						acting--;
+						el.removeAttribute("aria-busy");
+					}
+				},
+				{ signal },
+			);
+		},
+		"",
+	]);
+
+/** Watch the page's live tags; `refresh` redraws it. */
+const watchLive = (refresh: () => unknown) => {
+	let ws: WebSocket | 0 = 0;
+	let want = "";
+	let wait = 1e3;
+	let back = 0;
+	let t: ReturnType<typeof setTimeout>;
+	const say = () => ws && ws.readyState == 1 && ws.send(JSON.stringify({ t: "watch", tags: want }));
+	const open = () => {
+		const s = (ws = new WebSocket(location.origin.replace(/^http/, "ws") + "/_uwu/socket"));
+		s.onopen = () => {
+			wait = 1e3;
+			say();
+			// Back after a drop: whatever changed meanwhile was not heard.
+			back && refresh();
+		};
+		s.onmessage = (e) => {
+			try {
+				JSON.parse(e.data).t == "invalidate" && !acting && (clearTimeout(t), (t = setTimeout(refresh, 30)));
+			} catch {}
+		};
+		s.onclose = () => {
+			ws = 0;
+			back = 1;
+			want && setTimeout(() => want && !ws && open(), (wait = Math.min(wait * 2, 3e4)));
+		};
+	};
+	document.addEventListener("natsu:load", () => {
+		const n = document.querySelector<HTMLMetaElement>('meta[name="natsu-live"]')?.content || "";
+		if (n != want) (want = n), ws ? say() : n && open();
+	});
+};
+
+/** An action's post, and the page drawn again: without a key, a reload once it is done (a page with one swaps instead). */
+let act = (u: string, body: FormData | URLSearchParams): Promise<unknown> =>
+	send(u, body).then((r) => (r.url && r.url != L.href ? L.assign(r.url) : L.reload()));
+if (!first) {
+	actions(regs, (u, body) => act(u, body), KEY && regions(D)[0] ? KEY : undefined);
+	watchLive(() => api.refresh());
+}
 
 if (!first && KEY && regions(D)[0]) {
 	(status = D.createElement("p")).setAttribute("role", "status");
@@ -641,14 +757,15 @@ if (!first && KEY && regions(D)[0]) {
 		const n = ++seq;
 		let a: Answer | undefined;
 		try {
-			if (o.scroll != "keep") a = await fresh(bare(u))?.p;
+			if (o.a) a = await o.a;
+			else if (o.scroll != "keep") a = await fresh(bare(u))?.p;
 			// In hand already (prefetched): the swap would run in the click's own
 			// task and hold its frame back, so it yields first.
 			if (a)
 				await new Promise(
 					(y) => (window as { scheduler?: { yield?(): Promise<void> } }).scheduler?.yield?.().then(y) ?? requestAnimationFrame(() => setTimeout(y)),
 				);
-			else a = await get(u);
+			if (!a && !o.a) a = await get(u);
 		} catch {}
 		if (n != seq) return;
 		if (!a) {
@@ -661,7 +778,9 @@ if (!first && KEY && regions(D)[0]) {
 		if (to) {
 			const v = new URL(to, u);
 			v.hash ||= u.hash;
-			const next: Opts = { ...o, history: h == "none" ? "replace" : h, hops: -~o.hops! };
+			const next: Opts = { ...o, a: undefined, history: h == "none" ? "replace" : h, hops: -~o.hops! };
+			// An action that sent the visitor elsewhere is a visit there, not a refresh.
+			if (o.a && bare(v) != bare(L)) next.history = next.scroll = undefined;
 			return next.hops! < 6 ? visit(v, next) : (DEV && why("redirect to", v.href), full(v, next.history));
 		}
 		if (!head.has("natsu-part")) {
@@ -863,6 +982,7 @@ if (!first && KEY && regions(D)[0]) {
 
 	api.visit = visit;
 	api.refresh = () => visit(L.href, { history: "replace", scroll: "keep" });
+	act = (u, body) => visit(L.href, { history: "replace", scroll: "keep", a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) });
 	api.prefetch = prefetch;
 }
 // Last, so that a runtime added after load boots with all of the above set up.
