@@ -61,11 +61,12 @@ A visit starts from a plain left click on a link to your site, or from the
 submit of a GET form. The browser keeps the rest, as it would without
 natsu: a click with Ctrl, Shift, Meta or Alt (on a submit button too, which
 opens the result in a new tab or window), a link or form with a target
-other than `_self` (its own, or the page's `<base target>`), `download`, a
+other than `_self` (its own, or the page's first `<base target>`), `download`, a
 link to a file (an extension other than `.html`), a link inside an editor
 (`contenteditable`), and a form whose `accept-charset` is not UTF-8. A
-form's query is built as the browser builds it, a file as its name and a
-line break as CRLF. Scroll comes back on Back, Forward and a reload, and
+form's URL and query are built as the browser builds them: no action is
+the page's own URL (never the `<base href>`), no field to send is
+`action?`, a file goes as its name and a line break as CRLF. Scroll comes back on Back, Forward and a reload, and
 every scroll the runtime makes is a jump, whatever `scroll-behavior` says.
 
 ## Page scripts
@@ -83,7 +84,11 @@ natsu.mount("[data-clock]", (el, signal) => {
 
 - A mount runs for every element that matches now, and for every match in a
   region swapped in later, while the page on screen lists the script that
-  registered it.
+  registered it. It stops when its region goes (also when your code moved
+  the element out of it, a modal portalled to `<body>`), or, on an element
+  of the shell, when a page that does not list the script is shown. A
+  script that a loader creates (`document.createElement("script")`) is
+  listed by no page, so its mounts apply everywhere.
 - Load page scripts with `defer` (or as modules), at the end of the body or
   in the head: the runtime is placed before the head's first deferred
   script, so `natsu` exists when they run. A classic script without `defer`
@@ -99,7 +104,8 @@ natsu.mount("[data-clock]", (el, signal) => {
   on. A script that
   needs no mount (analytics, a tag manager, a polyfill) says so with
   `data-natsu-once`; a script that such a script adds later counts too,
-  from the next visit on, so tag it where it is created. Left out: data
+  from the next visit on, so tag it where it is created. A script that
+  removes its own tag still counts. Left out: data
   blocks, `nomodule` and any other type the browser does not run (a consent
   manager's `type="text/plain"`), and a classic script in the head without
   `defer` or `async`, which runs once per document like the shell. A
@@ -110,8 +116,10 @@ natsu.mount("[data-clock]", (el, signal) => {
   (`type="application/json"`, JSON-LD) are fine.
 
 Also on `natsu` (a global): `visit(url, { history, scroll })`, `refresh()`
-(draw the current page again after an action, scroll and focus kept),
-`prefetch(url)` and `island(el)`. Events on `document`: `natsu:visit`
+(draw the current page again after an action, scroll and focus kept; when
+it cannot swap it reloads, as `location.reload()` does, and a redirect to
+another page shows that page from its top), `prefetch(url)` and
+`island(el)` (only the answer to an island's latest fetch goes in). Events on `document`: `natsu:visit`
 (cancelable; a cancelled Back or Forward loads the page for real),
 `natsu:before-swap`, and `natsu:load`, once per page shown (at boot and
 after each visit) with `detail: { url, regions }`.

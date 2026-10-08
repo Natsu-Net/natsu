@@ -557,6 +557,8 @@ describe("regions", () => {
 		for (const spelling of ['shadowrootmode="open"', "shadowRootMode=closed"]) {
 			expect(scanPage(shell(`<main id="m" data-natsu-region><div><template ${spelling}><p>x</p></template></div></main>`))).toMatchObject({ reason: "regions" });
 		}
+		// In svg too: inside a foreignObject a browser reads it as HTML.
+		expect(scanPage(shell('<main id="m" data-natsu-region><svg><foreignObject><template shadowrootmode="open">x</template></foreignObject></svg></main>'))).toMatchObject({ reason: "regions" });
 		// Outside the regions, or only mentioned, it is no reason.
 		const outside = scanPage(shell('<header><template shadowrootmode="open">x</template></header><main id="m" data-natsu-region><p>use shadowrootmode="open"</p><code title="a shadowrootmode b">x</code></main>'));
 		expect(outside === null || "reason" in outside).toBe(false);
@@ -722,6 +724,20 @@ describe("the script list", () => {
 		const part = await answer.text();
 		expect(part).toContain(`<style nonce="${nonce}">.b{}</style><link rel="preload" href="/f.woff2" as="font"><style nonce=${nonce}>.c{}</style>`);
 		expect(part).not.toContain("stale");
+	});
+
+	test("drops every <noscript>, in the head and the regions, which a parser with scripting off would read as markup", () => {
+		const html = page({
+			head: '<noscript><base href="/evil/"></noscript><NoScript><link rel="stylesheet" href="/n.css"></NoScript>',
+			main: '<h1>A</h1><div><noscript></div><p id="escaped">x</p></noscript></div><!-- <noscript>kept</noscript> --><p title="<noscript>">t</p>',
+		});
+		const scan = scanPage(html);
+		if (scan === null || "reason" in scan) throw new Error("no scan");
+		const part = partOf(html, scan, "k.k", ["n1"]).html;
+		expect(part).not.toContain("evil");
+		expect(part).not.toContain("/n.css");
+		expect(part).not.toContain("escaped");
+		expect(part).toContain('<main id="main" data-natsu-region><h1>A</h1><div></div><!-- <noscript>kept</noscript> --><p title="<noscript>">t</p></main>');
 	});
 
 	test("a bare nonce, or one in the title's text, never passes for this response's", () => {
