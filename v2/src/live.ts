@@ -11,8 +11,13 @@
  *   client -> server  { t: "hello", stores: string[] }
  *                     { t: "set",  store, key, value }
  *                     { t: "call", store, method, args }
+ *                     { t: "watch", tags: "<signed tags>" }   (natsu's own runtime)
  *   server -> client  { t: "sync",  store, value }
  *                     { t: "patch", store, patches: [{ path, value }] }
+ *                     { t: "invalidate", tag }
+ *
+ * `watch` is live data (see invalidate.ts): the tags a page drew, signed by
+ * the server that drew it; each `watch` replaces the connection's last one.
  *
  * **A frame never names a scope.** It names a store by its class key; which
  * instance that is comes from the connection — the session it authenticated
@@ -41,6 +46,7 @@ export interface LiveServer {
 }
 
 import type { NatsuSocketData } from "./context.ts";
+import { onInvalidate, tagTopic, verifyTags } from "./invalidate.ts";
 import { log } from "./logger.ts";
 import {
 	type Caller,
@@ -72,6 +78,8 @@ export interface LiveSocketData {
 	session?: CallerSession;
 	/** Topics this connection is subscribed to, so close can undo them. */
 	topics: Set<string>;
+	/** Live-data tag topics, which the next `watch` replaces. */
+	tags?: Set<string>;
 }
 
 interface ClientFrame {
@@ -82,6 +90,7 @@ interface ClientFrame {
 	method?: unknown;
 	args?: unknown;
 	stores?: unknown;
+	tags?: unknown;
 }
 
 /**
@@ -95,6 +104,12 @@ let liveServer: LiveServer | undefined;
 export function setLiveServer(server: LiveServer): void {
 	liveServer = server;
 }
+
+// Live data: an invalidated tag is one frame to every socket watching it.
+onInvalidate((tags) => {
+	if (!liveServer) return;
+	for (const tag of tags) liveServer.publish(tagTopic(tag), JSON.stringify({ t: "invalidate", tag }));
+});
 
 /**
  * Patch fan-out, one subscription per (class, scope) pair.
@@ -252,6 +267,24 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 					ws.data.topics.add(topic);
 					ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
 				}
+				return;
+			}
+
+			if (frame.t === "watch") {
+				// Signed by the server that drew the page: a socket watches what a
+				// page listed, never a tag it made up. Anything else clears the list.
+				const tags = verifyTags(frame.tags) ?? [];
+				const next = new Set(tags.map(tagTopic));
+				for (const topic of ws.data.tags ?? []) {
+					if (next.has(topic)) continue;
+					ws.unsubscribe(topic);
+					ws.data.topics.delete(topic);
+				}
+				for (const topic of next) {
+					ws.subscribe(topic);
+					ws.data.topics.add(topic);
+				}
+				ws.data.tags = next;
 				return;
 			}
 

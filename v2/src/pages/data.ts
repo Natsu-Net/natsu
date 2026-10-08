@@ -56,6 +56,18 @@ export interface SourceOptions {
 	 * cookie, a header): pages that read it are never kept by PageCache.
 	 */
 	personal?: boolean;
+	/**
+	 * Pages that read it are told when it changes (default true): they carry
+	 * its tags and refresh their regions on `invalidate` of one. `false` for
+	 * data that never changes while a page is open, or changes too often.
+	 */
+	live?: boolean;
+	/**
+	 * Tags for one load, beside the source's own name (always a tag of a
+	 * live source): `({ args }) => [\`product:${args.slug}\`]`, so that
+	 * `invalidate("product:blue-shoe")` refreshes that product's pages only.
+	 */
+	tags?: (input: { name: string; args: Record<string, unknown>; params: Record<string, string>; query: Record<string, string> }) => string | readonly string[];
 }
 
 interface RegisteredSource {
@@ -120,6 +132,8 @@ export interface ModelManyInput {
  */
 export interface ModelResolver {
 	kind?(name: string, route: { path: string; params: readonly string[] }): ModelKind | null | undefined;
+	/** Live-data tags for a load (a model is not live without them): `job:7`, `jobs`. */
+	tags?(name: string, input: { kind: "one" | "many"; params: Record<string, string>; query: Record<string, string> }): string | readonly string[];
 	/** One row; null or undefined is a 404. */
 	one(name: string, input: ModelOneInput): unknown;
 	many(name: string, input: ModelManyInput): unknown;
@@ -165,7 +179,7 @@ export interface ServiceConfig {
 // --- plans ---------------------------------------------------------------------
 
 /** Names the request itself answers. */
-export const REQUEST_NAMES = new Set(["params", "query", "viewer", "session", "secrets", "page", "error"]);
+export const REQUEST_NAMES = new Set(["params", "query", "viewer", "session", "secrets", "page", "error", "form", "flash"]);
 
 export type Loader =
 	| { t: "request"; name: string }
@@ -355,6 +369,8 @@ export interface ResolveScope {
 export interface Resolved {
 	values: Record<string, unknown>;
 	used: UsedData[];
+	/** Live-data tags of everything loaded (see invalidate.ts). */
+	tags: Set<string>;
 }
 
 function walk(value: unknown, segments: readonly string[]): unknown {
@@ -379,6 +395,11 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 	/** A value, or a promise of one, by name. */
 	const memo = new Map<string, unknown>();
 	let used = plan.used;
+	const tags = new Set<string>();
+	const tag = (more: string | readonly string[] | undefined): void => {
+		if (typeof more === "string") tags.add(more);
+		else if (more) for (const t of more) tags.add(t);
+	};
 
 	const get = (name: string): unknown => {
 		if (memo.has(name)) return memo.get(name);
@@ -439,8 +460,12 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 			case "source": {
 				const registered = sources.get(loader.source);
 				if (!registered) throw new Error(`natsu/pages: source '${loader.source}' was removed`);
-				const call = (args: Record<string, unknown>): unknown =>
-					registered.fn({
+				const call = (args: Record<string, unknown>): unknown => {
+					if (registered.options.live !== false) {
+						tags.add(loader.source);
+						if (registered.options.tags) tag(registered.options.tags({ name: loader.name, args, params: ctx.params, query: ctx.query }));
+					}
+					return registered.fn({
 						name: loader.name,
 						params: ctx.params,
 						query: ctx.query,
@@ -450,6 +475,7 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 						fields: loader.fields,
 						need,
 					});
+				};
 				if (loader.ready) return guarded(loader, () => call({ ...loader.ready }));
 				return guarded(loader, async () => {
 					await Promise.all(loader.needs.map(need));
@@ -460,6 +486,7 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 			}
 			case "one": {
 				if (!resolver) throw new Error("natsu/pages: the model resolver was removed");
+				if (resolver.tags) tag(resolver.tags(loader.name, { kind: "one", params: ctx.params, query: ctx.query }));
 				const found = (result: unknown): unknown => {
 					if (result instanceof HttpError) throw result;
 					if (result === null || result === undefined) throw new NotFound(`${loader.name} not found`);
@@ -476,6 +503,7 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 			}
 			case "many": {
 				if (!resolver) throw new Error("natsu/pages: the model resolver was removed");
+				if (resolver.tags) tag(resolver.tags(loader.name, { kind: "many", params: ctx.params, query: ctx.query }));
 				const query = ctx.query;
 				const page = Number.parseInt(query.page ?? "1", 10);
 				const listed = (result: unknown): unknown => {
@@ -522,7 +550,7 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 		const resolved = await Promise.all(waiting);
 		for (let i = 0; i < resolved.length; i++) values[waitingFor![i]!] = resolved[i];
 	}
-	return { values, used };
+	return { values, used, tags };
 }
 
 /** A name a source `need`s that no template reads: found by the same rules, minus `<data>`. */
