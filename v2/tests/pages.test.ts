@@ -706,6 +706,27 @@ describe("inside an existing app", () => {
 		expect(await refused.text()).toContain("[name: no x]");
 	});
 
+	test("an answer shown once is drawn into the action's answer, never kept", async () => {
+		let rotations = 0;
+		natsu.action("t.rotate", () => ({ flash: "Rotated", show: { key: `k${++rotations}` } }));
+		const { get } = await serve({
+			"index.uwu": `<page><action rotate="t.rotate"></page><template>[{{form.shown.key}}|{{form.message}}]<form @submit="action:rotate"><button>go</button></form></template>`,
+		});
+		const page = await get("/");
+		const html = await page.text();
+		expect(html).toContain("[|]");
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "rotate", _csrf: token });
+		const shown = await get("/", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(shown.status).toBe(200);
+		expect(shown.headers.get("cache-control")).toBe("no-store");
+		expect(shown.headers.get("set-cookie") ?? "").not.toContain("natsu_flash");
+		expect(await shown.text()).toContain("[k1|Rotated]");
+		// The page after it is the plain one again.
+		expect(await (await get("/", { headers: { cookie } })).text()).toContain("[|]");
+	});
+
 	test("a page that reads none of them is still kept", async () => {
 		let loads = 0;
 		source("n", () => ++loads);
