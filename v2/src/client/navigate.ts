@@ -506,13 +506,14 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 
 /**
  * What was typed, picked or ticked in a form (never a hidden field, a
- * password or a file), and how to put it back in the form of the same action
+ * password, a one-time code or a file), and how to put it back in the form of the same action
  * at the same place on the page once a refusal has drawn it again: whatever the
  * server wrote in its fields, the visitor's own text is what they fix.
  */
 const typed = (form: HTMLFormElement) => {
 	const i = [...D.forms].indexOf(form);
-	const of = (f?: HTMLFormElement) => [...(f?.elements || [])].filter((e) => !/^(hi|pa|fi|su|bu)/.test((e as HTMLInputElement).type)) as HTMLInputElement[];
+	const of = (f?: HTMLFormElement) =>
+		[...(f?.elements || [])].filter((e) => !/^(hi|pa|fi|su|bu)/.test((e as HTMLInputElement).type) && (e as HTMLInputElement).autocomplete != "one-time-code") as HTMLInputElement[];
 	const was = of(form).map((e) => [e.value, e.checked] as const);
 	return () => {
 		const now = of(D.forms[i]);
@@ -1098,15 +1099,16 @@ if (!first && KEY && regions(D)[0]) {
 					unmount(el);
 					el.replaceWith(next[i]!);
 				});
-				// A refused form: what the visitor typed is put back.
-				r.status == 422 && o.k?.();
+				// A refused form: what the visitor typed is put back, and the first field
+				// the server marked invalid takes the focus, so its reason is read out.
+				const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);
+				const bad = r.status == 422 && (o.k?.(), pick("[aria-invalid=true]"));
 				const s = o.scroll;
-				if (s == "keep") fid && D.getElementById(fid)?.focus(QUIET);
+				if (s == "keep") (bad || D.getElementById(fid || ""))?.focus(QUIET);
 				else {
 					const t = anchor(f);
 					// A y (back/forward), else the hash target, else the top.
 					t && s == null ? t.scrollIntoView(INSTANT) : go(+s! || 0);
-					const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);
 					const auto = pick("[autofocus]");
 					const el = auto || pick("h1") || (next[0] as HTMLElement);
 					auto || el.hasAttribute("tabindex") || (el.tabIndex = -1);

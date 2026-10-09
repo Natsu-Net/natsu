@@ -2985,6 +2985,24 @@ describe("actions", () => {
 		expect(p.document.querySelector("[name=title]").value).toBe("");
 	});
 
+	test("a refused form puts the focus on the field marked invalid, and never puts back a one-time code", async () => {
+		const drawn = (bad: boolean) =>
+			`<form id="f" method="post" data-uwu-action="verify" data-uwu-event="submit"><input type="hidden" name="_action" value="verify"><input id="who" name="who"><input id="code" name="code" autocomplete="one-time-code"${bad ? ' aria-invalid="true"' : ""}><button id="go">Go</button></form>`;
+		const p = open({
+			html: page({ main: `<h1>Verify</h1>${drawn(false)}` }),
+			routes: { "POST /a": () => answer(part({ main: `<h1>Verify</h1><p class=err>no</p>${drawn(true)}` }), 422) },
+		});
+		p.document.querySelector("#who").value = "me";
+		p.document.querySelector("#code").value = "000000";
+		p.document.querySelector("#go").focus();
+		p.submit("#f", "#go");
+		await settle();
+		expect(text(p, "main .err")).toBe("no");
+		expect(p.document.querySelector("#who").value).toBe("me");
+		expect(p.document.querySelector("#code").value).toBe("");
+		expect(p.document.activeElement?.id).toBe("code");
+	});
+
 	test("a redirect elsewhere is a visit there; one post at a time per element", async () => {
 		const p = open({
 			html: page({ main: `<h1>Todos</h1>${button}` }),
