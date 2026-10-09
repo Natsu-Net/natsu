@@ -30,7 +30,8 @@
  * the action. Then a 303 back to the page (or where the action said), with
  * its `flash` in a one-time cookie the page reads as `flash`; or, for a
  * refused form, the page drawn again (422) with `form.errors`,
- * `form.values` and `form.message`. With the runtime the same POST goes by
+ * `form.values` and `form.message`; or, for an answer shown once (a new
+ * key), the page drawn now with `form.shown`, never stored. With the runtime the same POST goes by
  * fetch with the page's key, and the answer is a part: the regions are
  * swapped, no reload.
  *
@@ -55,6 +56,7 @@ import {
 	CSRF_COOKIE,
 	CSRF_FIELD,
 	EMPTY_FORM,
+	type FormState,
 	FLASH_COOKIE,
 	type ActionInput,
 	type ActionResult,
@@ -74,9 +76,9 @@ import {
 	valuesOf,
 } from "./actions.ts";
 import type { DataDecl } from "./block.ts";
-import { type CompiledFile, type Render, compileAll, evaluateServer, loadBuilt, uwuRuntime } from "./compile.ts";
+import { type CompileOptions, type CompiledFile, type Render, compileAll, evaluateServer, loadBuilt, uwuRuntime } from "./compile.ts";
 import { REQUEST_NAMES, type Plan, type ServiceConfig, type UsedData, buildPlan, resolvePlan } from "./data.ts";
-import { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
+import { Forbidden, HttpError, NotFound, PageCompileError, Redirect } from "./errors.ts";
 import { type PageMeta, escapeHtml, fillText, firstHeading, headTags } from "./meta.ts";
 
 export interface PagesOptions {
@@ -84,6 +86,8 @@ export interface PagesOptions {
 	dir?: string;
 	/** Or a directory `compilePages` wrote. */
 	built?: string;
+	/** Rewrites each file's source before it compiles (see `CompileOptions.transform`); `dir` only. */
+	transform?: CompileOptions["transform"];
 	/** The partials directory, relative to `dir` (default `pages/_partials`). */
 	partials?: string;
 	/** Watch `dir/pages` and recompile on change (default false). */
@@ -96,6 +100,26 @@ export interface PagesOptions {
 	services?: Record<string, ServiceConfig>;
 	/** Who is asking, as templates read `viewer` (default: the session's `viewer` or `user`, else null). */
 	viewer?: (ctx: Context) => unknown;
+	/**
+	 * Names the app answers for each request, beside natsu's own (`params`,
+	 * `viewer`, …): the frame an existing app's layouts read (its header, its
+	 * CSP nonce, its own `session`). Each getter is called once per page, when
+	 * the page or a layout reads the name, and may return a promise. One of
+	 * natsu's own names (`session`, `flash`) here replaces natsu's value. A page
+	 * that reads any of them is drawn for each visitor, never kept. The second
+	 * argument holds the `form` a refused action draws the page again with
+	 * (empty otherwise), for an app whose layouts show a refusal their own way.
+	 */
+	request?: Record<string, (ctx: Context, drawn: { form: FormState }) => unknown>;
+	/**
+	 * Runs around every page, action and not-found answer, which it starts with
+	 * `next()` and whose result it returns: what an existing app does around
+	 * its own routes (a gate that may answer first, a request scope its
+	 * sources read, response headers). It may answer without calling `next()`.
+	 * An error a source throws is drawn by `_error.uwu` before `next()`
+	 * returns; `around` sees only its own.
+	 */
+	around?: (ctx: Context, next: () => Promise<unknown>) => Promise<unknown>;
 	/**
 	 * Per-visitor secrets a page may carry (a CSP nonce), read as
 	 * `secrets.<name>`. A page kept by PageCache is drawn with marks in their
@@ -112,6 +136,13 @@ export interface PagesOptions {
 	render?: { helpers?: Record<string, unknown>; components?: Record<string, unknown>; partials?: Record<string, unknown> };
 	/** The most bytes an action's POST may carry (default 1 MB). */
 	maxBody?: number;
+	/**
+	 * An existing app's own errors, as natsu's: a source or an action that
+	 * calls the app's code may throw what that code throws (its "not found",
+	 * its redirect), and this says which `NotFound`, `Redirect` or
+	 * `HttpError` it means. Anything it returns undefined for is what it was.
+	 */
+	errors?: (error: unknown) => HttpError | undefined;
 }
 
 interface Loaded extends CompiledFile {
@@ -185,6 +216,7 @@ interface Out {
 	status: number;
 	html: boolean;
 	tags?: Set<string>;
+	location?: string;
 }
 
 const SECRET = /^[\w.~+/=-]*$/;
@@ -209,6 +241,16 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const publicUrl = (): string => options.baseUrl ?? config.General.url;
 	setPublicOrigin(publicUrl);
 	const secure = (): boolean => publicUrl().startsWith("https:");
+
+	const appNames = new Set(Object.keys(options.request ?? {}));
+	const around = options.around;
+	/** The handler, inside the app's `around` when there is one. */
+	const wrapped = (inner: Handler): Handler => {
+		if (!around) return inner;
+		const outer: Handler = (ctx) => around(ctx, async () => inner(ctx)) as ReturnType<Handler>;
+		Object.defineProperty(outer, "name", { value: inner.name });
+		return outer;
+	};
 
 	const viewerOf = options.viewer ?? ((ctx: Context): unknown => {
 		if (!ctx.sessionLoaded) return null;
@@ -290,7 +332,10 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			const requestNames = new Set([...REQUEST_NAMES].filter((name) => name !== "error" && name !== "secrets"));
 			if (options.secrets) requestNames.add("secrets");
 			for (const name of extra) requestNames.add(name);
+			for (const name of appNames) requestNames.add(name);
 			const plan = buildPlan({ path, params, reads, decls, services: options.services ?? {}, requestNames });
+			// What the app answers is about this visitor: never kept.
+			if (plan.names.some((name) => appNames.has(name))) plan.personal = true;
 			// The partials' styles go with the files that include them.
 			const included = [...new Set([...layouts, page].flatMap((file) => file.partials))].map((name) => partials.get(name)?.css ?? "");
 			const styles = [...layouts].reverse().concat(page).map((file) => file.css).concat(included).filter(Boolean).join("\n");
@@ -388,10 +433,13 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (registered.has(path)) continue;
 			registered.add(path);
 			added = true;
-			router.get(path, navigable(handlerFor(path)));
+			// `<page navigate="off">`: a soft visit to it is answered "load it for real".
+			const own = wrapped(handlerFor(path));
+			router.get(path, next.get(path)?.page.block?.navigate === "off" ? own : navigable(own));
 			// Every page takes its actions' posts. A post is never prefetched,
-			// and with the runtime its answer is a part like a visit's.
-			router.post(path, navigable(actionHandlerFor(path), { prefetch: false }));
+			// and with the runtime its answer is a part like a visit's (and the
+			// page it goes back to, when that is navigate="off", a real load).
+			router.post(path, navigable(wrapped(actionHandlerFor(path)), { prefetch: false }));
 		}
 		if (added && options.app?.running) options.app.reload();
 	};
@@ -406,6 +454,9 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			["form", () => EMPTY_FORM],
 			["flash", () => decodeFlash(ctx.cookies.get(FLASH_COOKIE))],
 		]);
+		// The app's names see the form a refusal draws again with (its own flash may show it).
+		const form = "form" in extra ? extra.form : EMPTY_FORM;
+		for (const [name, get] of Object.entries(options.request ?? {})) request.set(name, () => get(ctx, { form: form as FormState }));
 		for (const [name, value] of Object.entries(extra)) request.set(name, () => value);
 		return { ctx, request, services: options.services ?? {}, path: state.path, params: state.page.params };
 	};
@@ -448,10 +499,15 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			};
 			const html = await drawPage(state, values, meta, "", signTags(tags));
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
-		} catch (error) {
+		} catch (thrown) {
+			const error = known(thrown);
+			if (error instanceof Redirect) return { body: "", status: error.status, html: false, location: sameSitePath(error.location) ?? "/" };
 			return drawError(ctx, state, state.error, secrets, error);
 		}
 	};
+
+	/** The app's own error as natsu's, when `options.errors` knows it. */
+	const known = (error: unknown): unknown => options.errors?.(error) ?? error;
 
 	const drawError = async (ctx: Context, state: { path: string; page: Loaded }, page: Drawn | undefined, secrets: Record<string, string>, error: unknown): Promise<Out> => {
 		const status = error instanceof HttpError ? error.status : 500;
@@ -470,7 +526,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return { body: status === 404 ? "Not Found" : status === 403 ? "Forbidden" : message, status, html: false };
 	};
 
-	const answer = (ctx: Context, out: { body: string; status: number; html?: boolean; headers?: Record<string, string> }): string => {
+	const answer = (ctx: Context, out: { body: string; status: number; html?: boolean; headers?: Record<string, string>; location?: string }): string => {
+		const location = out.location ?? out.headers?.location;
+		if (location !== undefined) {
+			ctx.response.redirect(location, out.status);
+			return "";
+		}
 		ctx.response.status = out.status;
 		if (out.html ?? out.headers?.["content-type"]?.startsWith("text/html")) ctx.response.type = "text/html; charset=utf-8";
 		else ctx.response.type = "text/plain; charset=utf-8";
@@ -529,7 +590,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 						return {
 							body: out.body,
 							status: out.status,
-							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8" },
+							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
 							keep: out.status === 200,
 						};
 					},
@@ -574,7 +635,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (!target || !entry || typeof short !== "string") return plain(404, "Unknown action");
 
 			const secrets = secretsFor(ctx, state);
-			const refuse = async (error: unknown): Promise<string> => answer(ctx, await drawError(ctx, state, state.error, secrets, error));
+			const refuse = async (thrown: unknown): Promise<string> => {
+				const error = known(thrown);
+				// Sent elsewhere (a sign-in first, a step the app asks for): a 303, as a success is.
+				if (error instanceof Redirect) return answer(ctx, { body: "", status: 303, location: sameSitePath(error.location) ?? "/" });
+				return answer(ctx, await drawError(ctx, state, state.error, secrets, error));
+			};
 			if (entry.options.csrf !== false && !csrfOk(ctx, form)) {
 				return refuse(new HttpError(403, "This form has expired: reload the page and try again."));
 			}
@@ -626,6 +692,15 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			}
 			invalidate(tags);
 
+			if (result.show) {
+				// Shown once: drawn into this answer only, never kept by a cache or the history's URL.
+				const out = await draw(ctx, state, secrets, {
+					form: { action: short, errors: {}, values: {}, message: result.flash ?? "", shown: result.show },
+				});
+				ctx.response.headers.set("cache-control", "no-store");
+				return answer(ctx, out);
+			}
+
 			if (result.flash) {
 				ctx.setCookie(FLASH_COOKIE, encodeFlash({ message: result.flash, ok: true }), { httpOnly: true, sameSite: "lax", secure: secure(), path: "/", maxAge: 60 });
 			}
@@ -637,16 +712,17 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return handler;
 	}
 
-	const notFound: Handler = async (ctx) => {
+	const notFound: Handler = wrapped(async (ctx) => {
 		const page = notFoundPage;
 		if (!page) return undefined;
 		const secrets = options.secrets ? options.secrets(ctx) : NO_SECRETS;
 		return answer(ctx, await drawError(ctx, { path: "/", page: page.page }, page, secrets, new NotFound()));
-	};
+	});
 
 	// --- loading ----------------------------------------------------------------
 
-	const compileNow = (): CompiledFile[] => (options.built ? loadBuilt(options.built) : compileAll(options.dir!, { partials: options.partials }));
+	const compileOptions: CompileOptions = { partials: options.partials, transform: options.transform };
+	const compileNow = (): CompiledFile[] => (options.built ? loadBuilt(options.built) : compileAll(options.dir!, compileOptions));
 	await build(compileNow());
 	options.app?.notFound(notFound);
 
@@ -657,7 +733,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			clearTimeout(timer);
 			timer = setTimeout(() => {
 				Promise.resolve()
-					.then(() => build(compileAll(options.dir!, { partials: options.partials })))
+					.then(() => build(compileAll(options.dir!, compileOptions)))
 					.then(
 						() => log.info(`[<green>pages</green>] recompiled`),
 						(error: Error) => log.error(`[<red>pages</red>] ${error.message} (still serving the last good build)`),

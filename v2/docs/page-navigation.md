@@ -51,7 +51,9 @@ safe becomes an ordinary page load.
    around a `navigable()` handler hides the mark unless the wrapper is
    `navigable()` too. Leave out pages that must load for real: checkout
    steps that hand over to a payment page, OAuth callbacks, links from
-   emails that carry one-time tokens.
+   emails that carry one-time tokens. Page files (`mountPages`) are
+   navigable on their own; such a page says `<page navigate="off">`, and
+   its forms still post with the runtime.
 
 That is all. Every page now goes out with the runtime's
 `<script src="/_a/natsu-navigate.….js" defer>` in its head, and every page
@@ -212,6 +214,26 @@ only from an answer that says `Natsu-Island: 1` back, which only an
 `island()` route sends; any other route is refused before its handler runs.
 Islands are fetched from your own site only. If your pages show HTML your
 users wrote, strip `data-natsu-*` attributes from it in your sanitizer.
+
+### Live islands
+
+An island can be live on its own. Give `island()` the tags its answer
+depends on, and when one is invalidated the runtime fetches that island
+again and redraws only it; the page around it, a playing video, an open
+menu, all stay as they are.
+
+```ts
+Routes.get("/api/bell", island(bell, { tags: (ctx) => [`bell:${userOf(ctx)}`] }));
+
+// wherever a notification is written:
+invalidate(`bell:${userId}`);
+```
+
+The tags travel signed in a `Natsu-Live` header on the island's answer, the
+same way a page's travel in its `natsu-live` meta, so a visitor can only
+watch what the server handed them. A tag the page itself depends on still
+redraws the page. Live islands need the live socket (`/_uwu/socket`),
+which page files with a live source already open.
 
 ## Links in page files
 

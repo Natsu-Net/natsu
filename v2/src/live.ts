@@ -11,13 +11,14 @@
  *   client -> server  { t: "hello", stores: string[] }
  *                     { t: "set",  store, key, value }
  *                     { t: "call", store, method, args }
- *                     { t: "watch", tags: "<signed tags>" }   (natsu's own runtime)
+ *                     { t: "watch", tags: "<signed tags>" | ["<signed tags>", …] }   (natsu's own runtime)
  *   server -> client  { t: "sync",  store, value }
  *                     { t: "patch", store, patches: [{ path, value }] }
  *                     { t: "invalidate", tag }
  *
  * `watch` is live data (see invalidate.ts): the tags a page drew, signed by
- * the server that drew it; each `watch` replaces the connection's last one.
+ * the server that drew it (one list, or the page's and each live island's);
+ * each `watch` replaces the connection's last one.
  *
  * **A frame never names a scope.** It names a store by its class key; which
  * instance that is comes from the connection — the session it authenticated
@@ -47,6 +48,7 @@ export interface LiveServer {
 
 import type { NatsuSocketData } from "./context.ts";
 import { onInvalidate, tagTopic, verifyTags } from "./invalidate.ts";
+
 import { log } from "./logger.ts";
 import {
 	type Caller,
@@ -64,6 +66,9 @@ import {
 	topicFor,
 	watch,
 } from "./state.ts";
+
+/** Most signed tag lists one `watch` may carry: a page's and its islands'. */
+const MAX_LISTS = 16;
 
 /** The path the client runtime connects to. Matches uwu-template's default. */
 export const SOCKET_PATH = "/_uwu/socket";
@@ -273,7 +278,11 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			if (frame.t === "watch") {
 				// Signed by the server that drew the page: a socket watches what a
 				// page listed, never a tag it made up. Anything else clears the list.
-				const tags = verifyTags(frame.tags) ?? [];
+				// One signed list per thing on the page that drew live data: the
+				// page's own, then each live island's. A list that does not verify
+				// is dropped alone.
+				const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
+				const tags = lists.flatMap((list: unknown) => verifyTags(list) ?? []);
 				const next = new Set(tags.map(tagTopic));
 				for (const topic of ws.data.tags ?? []) {
 					if (next.has(topic)) continue;

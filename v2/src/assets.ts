@@ -290,9 +290,9 @@ export class Assets {
 			}
 			return url;
 		};
-		let out = page.replace(pattern, (match, quote: string, from: string) => {
+		let out = this.replaceFroms(page, pattern, (from) => {
 			const url = resolve(from);
-			return url && url !== from ? `${quote}${url}${quote}` : match;
+			return url && url !== from ? url : undefined;
 		});
 		for (const url of resolved.values()) {
 			const lazy = url ? this.lazy.get(url) : undefined;
@@ -372,10 +372,59 @@ export class Assets {
 	}
 
 	private pattern: RegExp | null | undefined;
+	/** What every `rewrite` key starts with, when that lets `replaceFroms` skip the regex. */
+	private fromPrefix: string | undefined;
+
+	/**
+	 * Every quoted `rewrite` key in `page`, quotes kept, with `to(from)` in its place
+	 * (undefined leaves it): what `page.replace(pattern, ...)` does. When the keys share a
+	 * prefix (`/assets/`) and hold no quote, it jumps from one prefix to the next with
+	 * `indexOf` instead, a fraction of the regex's cost on a long page: the text between
+	 * a quote and the next same quote is then the only key that could match there.
+	 */
+	private replaceFroms(page: string, pattern: RegExp, to: (from: string) => string | undefined): string {
+		const prefix = this.fromPrefix;
+		if (!prefix) {
+			return page.replace(pattern, (match, quote: string, from: string) => {
+				const url = to(from);
+				return url === undefined ? match : `${quote}${url}${quote}`;
+			});
+		}
+		const froms = this.options.rewrite ?? {};
+		let out = "";
+		// `copied`: the page up to here is in `out`. `matched`: up to here a key and its
+		// quotes were matched, so that closing quote opens nothing (as with the regex).
+		let copied = 0;
+		let matched = 0;
+		for (let at = page.indexOf(prefix); at !== -1; at = page.indexOf(prefix, at + 1)) {
+			if (at - 1 < matched) continue;
+			const quote = page[at - 1];
+			if (quote !== '"' && quote !== "'") continue;
+			const end = page.indexOf(quote, at);
+			if (end === -1) break;
+			const from = page.slice(at, end);
+			if (!Object.hasOwn(froms, from)) continue;
+			matched = end + 1;
+			const url = to(from);
+			if (url === undefined) continue;
+			out += `${page.slice(copied, at)}${url}`;
+			copied = end;
+		}
+		return copied === 0 ? page : out + page.slice(copied);
+	}
 
 	private rewritePattern(): RegExp | null {
 		if (this.pattern !== undefined) return this.pattern;
 		const froms = Object.keys(this.options.rewrite ?? {}).sort((a, b) => b.length - a.length);
+		let prefix = froms[0] ?? "";
+		for (const from of froms) {
+			let same = 0;
+			while (same < prefix.length && same < from.length && prefix[same] === from[same]) same++;
+			prefix = prefix.slice(0, same);
+		}
+		this.fromPrefix = prefix !== "" && !froms.some((from) => from.includes('"') || from.includes("'"))
+			? prefix
+			: undefined;
 		this.pattern = froms.length === 0
 			? null
 			: new RegExp(`(["'])(${froms.map((from) => from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\1`, "g");

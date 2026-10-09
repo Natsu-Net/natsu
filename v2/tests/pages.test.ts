@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import * as natsu from "../index.ts";
 import { Assets } from "../src/assets.ts";
+import { clearActions } from "../src/pages/actions.ts";
 import { splitPageBlock } from "../src/pages/block.ts";
 import { compilePageFile, compilePages, linkProblem, routeOf } from "../src/pages/compile.ts";
 import { clearSources, defaultKind, registerModelResolver, source } from "../src/pages/data.ts";
@@ -27,6 +28,7 @@ let site: PageSite | undefined;
 beforeEach(() => {
 	reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test" } });
 	clearSources();
+	clearActions();
 	dir = mkdtempSync(join(tmpdir(), "natsu-pages-"));
 });
 
@@ -662,6 +664,186 @@ describe("caching", () => {
 	});
 });
 
+describe("inside an existing app", () => {
+	test("request names: the app's own values, read like any name, never kept", async () => {
+		let loads = 0;
+		source("n", () => ++loads);
+		const { get } = await serve(
+			{
+				"_layout.uwu": `<template><header>{{header.who}}</header>{{> @child}}</template>`,
+				"index.uwu": `<template>{{n}} {{session.id}}</template>`,
+			},
+			{
+				request: {
+					header: async (ctx) => ({ who: ctx.headers.get("x-user") ?? "guest" }),
+					session: (ctx) => ({ id: ctx.headers.get("x-session") ?? "none" }),
+				},
+			},
+		);
+		expect(await (await get("/")).text()).toBe("<header>guest</header>1 none");
+		expect(await (await get("/", { headers: { "x-user": "ann", "x-session": "s1" } })).text()).toBe("<header>ann</header>2 s1");
+		// Read by a layout or the page, it is this visitor's: drawn every time.
+		expect(await (await get("/")).text()).toBe("<header>guest</header>3 none");
+		expect(site!.routes[0]!.data).toContainEqual({ name: "header", kind: "request", from: "header" });
+	});
+
+	test("request names see the form a refusal draws again with", async () => {
+		natsu.action("t.name", ({ input }) => {
+			throw new natsu.Invalid({}, `no ${input.title}`);
+		});
+		const { get } = await serve(
+			{ "index.uwu": `<page><action name="t.name"></page><template>[{{alert}}]<form @submit="action:name"><button>go</button></form></template>` },
+			{ request: { alert: (_ctx, { form }) => (form.message ? `${form.action}: ${form.message}` : "none") } },
+		);
+		const page = await get("/");
+		const html = await page.text();
+		expect(html).toContain("[none]");
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "name", _csrf: token, title: "x" });
+		const refused = await get("/", { method: "POST", body, headers: { cookie } });
+		expect(refused.status).toBe(422);
+		expect(await refused.text()).toContain("[name: no x]");
+	});
+
+	test("an answer shown once is drawn into the action's answer, never kept", async () => {
+		let rotations = 0;
+		natsu.action("t.rotate", () => ({ flash: "Rotated", show: { key: `k${++rotations}` } }));
+		const { get } = await serve({
+			"index.uwu": `<page><action rotate="t.rotate"></page><template>[{{form.shown.key}}|{{form.message}}]<form @submit="action:rotate"><button>go</button></form></template>`,
+		});
+		const page = await get("/");
+		const html = await page.text();
+		expect(html).toContain("[|]");
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "rotate", _csrf: token });
+		const shown = await get("/", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(shown.status).toBe(200);
+		expect(shown.headers.get("cache-control")).toBe("no-store");
+		expect(shown.headers.get("set-cookie") ?? "").not.toContain("natsu_flash");
+		expect(await shown.text()).toContain("[k1|Rotated]");
+		// The page after it is the plain one again.
+		expect(await (await get("/", { headers: { cookie } })).text()).toContain("[|]");
+	});
+
+	test("a page that reads none of them is still kept", async () => {
+		let loads = 0;
+		source("n", () => ++loads);
+		const { get } = await serve({ "index.uwu": `<template>{{n}}</template>` }, { request: { header: () => "h" } });
+		expect(await (await get("/")).text()).toBe("1");
+		expect(await (await get("/")).text()).toBe("1");
+	});
+
+	test("around runs around pages, actions and the 404, and may answer first", async () => {
+		const seen: string[] = [];
+		natsu.action("t.ping", () => ({ flash: "pong" }));
+		const around: PagesOptions["around"] = async (ctx, next) => {
+			seen.push(`${ctx.method} ${ctx.path}`);
+			if (ctx.headers.get("x-gate") === "closed") {
+				ctx.response.status = 503;
+				return "closed";
+			}
+			const out = await next();
+			ctx.response.headers.set("x-around", "1");
+			return out;
+		};
+		const { get } = await serve(
+			{
+				"index.uwu": `<page><action ping="t.ping"></page><template><form @submit="action:ping"><button>go</button></form></template>`,
+				"_error.uwu": `<template>missing {{error.status}}</template>`,
+			},
+			{ around },
+		);
+		const page = await get("/");
+		expect(page.headers.get("x-around")).toBe("1");
+		const html = await page.text();
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "ping", _csrf: token });
+		const posted = await get("/", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posted.headers.get("x-around")).toBe("1");
+
+		const missing = await get("/nope");
+		expect(missing.status).toBe(404);
+		expect(await missing.text()).toBe("missing 404");
+		expect(missing.headers.get("x-around")).toBe("1");
+
+		const closed = await get("/", { headers: { "x-gate": "closed" } });
+		expect(closed.status).toBe(503);
+		expect(await closed.text()).toBe("closed");
+		expect(seen).toEqual(["GET /", "POST /", "GET /nope", "GET /"]);
+	});
+
+	test("errors: the app's own, as natsu's, from a source and from an action", async () => {
+		class Gone extends Error {}
+		class SignIn extends Error {}
+		const errors: PagesOptions["errors"] = (error) =>
+			error instanceof Gone ? new natsu.NotFound() : error instanceof SignIn ? new natsu.Redirect("/login?next=%2F") : undefined;
+		source("thing", ({ query }) => {
+			if (query.gone) throw new Gone();
+			if (query.who === undefined) throw new SignIn();
+			if (query.far) throw new natsu.Redirect("//evil.test/x");
+			return query.who;
+		});
+		natsu.action("t.save", () => {
+			throw new SignIn();
+		});
+		const { get } = await serve(
+			{
+				"index.uwu": `<page><action save="t.save"></page><template>{{thing}}<form @submit="action:save"><button>go</button></form></template>`,
+				"_error.uwu": `<template>missing {{error.status}}</template>`,
+			},
+			{ errors },
+		);
+		const page = await get("/?who=ann");
+		expect(await page.text()).toContain("ann");
+		const gone = await get("/?gone=1&who=ann");
+		expect(gone.status).toBe(404);
+		expect(await gone.text()).toBe("missing 404");
+		const away = await get("/", { redirect: "manual" });
+		expect(away.status).toBe(302);
+		expect(away.headers.get("location")).toBe("/login?next=%2F");
+		expect(await away.text()).toBe("");
+		// A location off this site is never followed.
+		const far = await get("/?who=ann&far=1", { redirect: "manual" });
+		expect(far.headers.get("location")).toBe("/");
+
+		const again = await get("/?who=ann");
+		const token = /name="_csrf" value="([^"]+)"/.exec(await again.text())![1]!;
+		const cookie = again.headers.get("set-cookie")?.split(";")[0] ?? `natsu_csrf=${token}`;
+		const body = new URLSearchParams({ _action: "save", _csrf: token });
+		const posted = await get("/?who=ann", { method: "POST", body, headers: { cookie }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posted.headers.get("location")).toBe("/login?next=%2F");
+	});
+
+	test("transform rewrites every file before it compiles: pages, layouts and partials", async () => {
+		const files = {
+			"_layout.uwu": `<template><main>[[> @child]]</main></template>`,
+			"_partials/hi.uwu": `<template><b>[[name]]</b></template>`,
+			"index.uwu": `<page title="Home"></page>\n<template>[[> hi]] [[page.title]]</template>`,
+		};
+		const seen: string[] = [];
+		const transform = (text: string, file: string): string => {
+			seen.push(file);
+			return text.replaceAll("[[", "{{").replaceAll("]]", "}}");
+		};
+		source("name", () => "Ann");
+		const { get } = await serve(files, { transform });
+		expect(await (await get("/")).text()).toBe("<main><b>Ann</b> Home</main>");
+		expect([...new Set(seen)].sort()).toEqual(["_layout.uwu", "_partials/hi.uwu", "index.uwu"]);
+		// The block is cut out first: transform sees its lines blank.
+		const out = mkdtempSync(join(tmpdir(), "natsu-built-"));
+		try {
+			compilePages(dir, out, { transform });
+		} finally {
+			rmSync(out, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("page switching", () => {
 	test("a page file answers a Natsu-Nav request with a part", async () => {
 		writeFileSync(join(dir, "site.css"), "body { margin: 0; } h1 { font-size: 2em; }");
@@ -693,6 +875,49 @@ describe("page switching", () => {
 		const again = await get("/p/shoe", { headers: { "natsu-nav": key! } });
 		expect(again.headers.get("natsu-part")).toBe("1");
 		expect(await again.text()).toContain(`<main id="main" data-natsu-region><h1>Product shoe</h1></main>`);
+	});
+});
+
+describe("page switching, off", () => {
+	test('<page navigate="off">: a soft visit is told to load it for real, and nothing runs; its forms still post', async () => {
+		writeFileSync(join(dir, "site.css"), "body { margin: 0; }");
+		const assets = new Assets({ outDir: join(dir, "out"), styles: { site: [join(dir, "site.css")] }, navigate: true });
+		await assets.build();
+		let loads = 0;
+		let posts = 0;
+		source("secret", () => ++loads);
+		natsu.action("t.press", () => {
+			posts++;
+		});
+		const layout = `<template><!doctype html><html><head><meta charset="utf-8">{{{page.head}}}</head><body><main id="main" data-natsu-region>{{> @child}}</main></body></html></template>`;
+		const { get } = await serve(
+			{
+				"_layout.uwu": layout,
+				"index.uwu": `<template><h1>Home</h1></template>`,
+				"secret.uwu": `<page navigate="off" cache="off"><action press="t.press"></page><template><h1>{{secret}}</h1><form @submit="action:press"><button>go</button></form></template>`,
+			},
+			{ assets },
+			(app) => app.use(assets.middleware()),
+		);
+		const key = /<meta name="natsu" content="([^"]+)"/.exec(await (await get("/")).text())?.[1];
+		expect(key).toBeTruthy();
+		const soft = await get("/secret", { headers: { "natsu-nav": key! } });
+		expect(soft.status).toBe(204);
+		expect(loads).toBe(0);
+		const page = await get("/secret");
+		expect(page.status).toBe(200);
+		expect(loads).toBe(1);
+		const html = await page.text();
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+		const body = new URLSearchParams({ _action: "press", _csrf: token });
+		const posted = await get("/secret", { method: "POST", body, headers: { cookie, "natsu-nav": key! }, redirect: "manual" });
+		expect(posted.status).toBe(303);
+		expect(posts).toBe(1);
+	});
+
+	test('<page navigate="on"> is refused at compile time', async () => {
+		await expect(serve({ "index.uwu": `<page navigate="on"></page><template>x</template>` })).rejects.toThrow(/navigate="on"/);
 	});
 });
 

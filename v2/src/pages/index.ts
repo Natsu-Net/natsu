@@ -11,6 +11,7 @@ export {
 	guard,
 	type ActionHandler,
 	type ActionInput,
+	type FormState,
 	type ActionOptions,
 	type ActionResult,
 	type AuthRule,
@@ -34,6 +35,6 @@ export {
 	type SourceOptions,
 	type UsedData,
 } from "./data.ts";
-export { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
+export { Forbidden, HttpError, NotFound, PageCompileError, Redirect } from "./errors.ts";
 export { mountPages, type PageLocals, type PageRoute, type PageSite, type PagesOptions } from "./mount.ts";
 export type { PageMeta } from "./meta.ts";

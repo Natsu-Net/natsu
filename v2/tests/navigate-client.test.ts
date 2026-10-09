@@ -2957,6 +2957,34 @@ describe("actions", () => {
 		expect(p.loads).toEqual([]);
 	});
 
+	test("a refused form gets back what the visitor typed; a form that went through does not", async () => {
+		const drawn = `<form id="f" method="post" data-uwu-action="add" data-uwu-event="submit"><input type="hidden" name="_action" value="add"><input name="title" value=""><textarea name="note"></textarea><input type="checkbox" name="soon"><button id="go">Add</button></form>`;
+		let status = 422;
+		const p = open({
+			html: page({ main: `<h1>Todos</h1>${drawn}` }),
+			routes: {
+				"POST /a": () => (status == 422 ? answer(part({ main: `<h1>Todos</h1><p class=err>no</p>${drawn}` }), 422) : back()),
+				"/a": () => answer(part({ main: `<h1>Todos</h1>${drawn}` })),
+			},
+		});
+		const fill = () => {
+			p.document.querySelector("[name=title]").value = "oat milk";
+			p.document.querySelector("[name=note]").value = "two";
+			p.document.querySelector("[name=soon]").checked = true;
+		};
+		fill();
+		p.submit("#f", "#go");
+		await settle();
+		expect(text(p, "main .err")).toBe("no");
+		expect(p.document.querySelector("[name=title]").value).toBe("oat milk");
+		expect(p.document.querySelector("[name=note]").value).toBe("two");
+		expect(p.document.querySelector("[name=soon]").checked).toBe(true);
+		status = 303;
+		p.submit("#f", "#go");
+		await settle();
+		expect(p.document.querySelector("[name=title]").value).toBe("");
+	});
+
 	test("a redirect elsewhere is a visit there; one post at a time per element", async () => {
 		const p = open({
 			html: page({ main: `<h1>Todos</h1>${button}` }),
@@ -3040,6 +3068,49 @@ describe("live data", () => {
 		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: "" }));
 	});
 
+	test("a live island is watched beside the page, and an invalidated tag of its own fetches it alone", async () => {
+		FakeSocket.last = undefined;
+		let n = 0;
+		const p = open({
+			html: page({ head: live("todos|SIG"), shell: LINKS + `<div id="bell" data-natsu-island="/api/bell">…</div>` }),
+			before: (w) => (w.WebSocket = FakeSocket),
+			routes: {
+				"/api/bell": () =>
+					new Response(`<b>${++n}</b>`, { headers: { "content-type": "text/html", "natsu-island": "1", "natsu-live": "bell:7|BSIG" } }),
+				"/a": () => answer(part({ head: live("todos|SIG"), main: "<h1>A</h1>" })),
+			},
+		});
+		await settle();
+		const ws = FakeSocket.last!;
+		ws.open();
+		// The page's list, then the island's.
+		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: ["todos|SIG", "bell:7|BSIG"] }));
+		ws.onmessage!({ data: JSON.stringify({ t: "invalidate", tag: "bell:7" }) });
+		await tick(60);
+		await settle();
+		// The island again, and not the page.
+		expect(text(p, "#bell")).toBe("2");
+		expect(p.calls.map((c) => c.url)).toEqual(["/api/bell", "/api/bell"]);
+		// The page's own tag still redraws the page.
+		ws.onmessage!({ data: JSON.stringify({ t: "invalidate", tag: "todos" }) });
+		await tick(60);
+		await settle();
+		expect(p.calls.map((c) => c.url)).toContain("/a");
+	});
+
+	test("a live island on a page with no tags of its own opens the socket by itself", async () => {
+		FakeSocket.last = undefined;
+		open({
+			html: page({ shell: LINKS + `<div id="bell" data-natsu-island="/api/bell">…</div>` }),
+			before: (w) => (w.WebSocket = FakeSocket),
+			routes: { "/api/bell": () => new Response("<b>1</b>", { headers: { "content-type": "text/html", "natsu-island": "1", "natsu-live": "bell:7|BSIG" } }) },
+		});
+		await settle();
+		const ws = FakeSocket.last!;
+		ws.open();
+		expect(ws.sent).toEqual([JSON.stringify({ t: "watch", tags: "bell:7|BSIG" })]);
+	});
+
 	test("a page without tags opens no socket", () => {
 		FakeSocket.last = undefined;
 		open({ html: page(), before: (w) => (w.WebSocket = FakeSocket) });
@@ -3049,9 +3120,10 @@ describe("live data", () => {
 
 describe("size", () => {
 	// 5 KiB until the loading bar, prefetch in view and the Back/Forward cache
-	// (about 600 bytes together); raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, the loading bar and prefetch in view included, stays within 5.5 KiB of brotli", () => {
+	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes).
+	// Raise it only with a note of what it bought.
+	test("the minified runtime, actions, live data, live islands, the loading bar and prefetch in view included, stays within 5.6 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(5632);
+		expect(br).toBeLessThanOrEqual(5734);
 	});
 });

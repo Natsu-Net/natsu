@@ -38,6 +38,7 @@ export { Assets };
 export { addVary, compress, negotiate };
 export { PageCache };
 export { island, navigable };
+export type { IslandOptions } from "./src/navigate.ts";
 export { Session, SessionManager, sessionMiddleware, MemoryAdapter, SqliteAdapter };
 export { Action, Networked, State };
 export { caller, callAction, dropScope, resolveState, resetState, snapshotOf, stateClass, stateKeys, storeOf, topicFor, watch, wireKeyFor };
@@ -45,10 +46,11 @@ export { grantRoom, hasRoom, revokeRoom, revokeSession };
 export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
-export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, action, compilePages, evaluateServer, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
+export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, Redirect, action, compilePages, evaluateServer, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
 export type {
 	ActionHandler,
 	ActionInput,
+	FormState,
 	ActionOptions,
 	ActionResult,
 	AuthRule,

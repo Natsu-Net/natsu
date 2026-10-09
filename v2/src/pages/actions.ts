@@ -61,6 +61,12 @@ export interface ActionResult {
 	errors?: Record<string, string>;
 	/** A message for the whole form, with `errors`. */
 	message?: string;
+	/**
+	 * An answer shown once (a new key, a setup code, recovery codes): the page
+	 * is drawn now (200, never stored) with it as `form.shown`, instead of a
+	 * redirect that would have to carry it. `flash` is then `form.message`.
+	 */
+	show?: Record<string, unknown>;
 }
 
 export type ActionHandler = (input: ActionInput) => ActionResult | void | Promise<ActionResult | void>;
@@ -186,8 +192,18 @@ export function valuesOf(input: Record<string, string | string[]>): Record<strin
 	return out;
 }
 
+/** What a page reads as `form`: the refused action's short name, its errors, what was typed and why. */
+export interface FormState {
+	readonly action: string | null;
+	readonly errors: Readonly<Record<string, string>>;
+	readonly values: Readonly<Record<string, string | string[]>>;
+	readonly message: string;
+	/** What a successful action showed once (`ActionResult.show`). */
+	readonly shown?: Readonly<Record<string, unknown>>;
+}
+
 /** What a page reads as `form` when no form was refused. */
-export const EMPTY_FORM = Object.freeze({ action: null, errors: Object.freeze({}), values: Object.freeze({}), message: "" });
+export const EMPTY_FORM: FormState = Object.freeze({ action: null, errors: Object.freeze({}), values: Object.freeze({}), message: "" });
 
 // --- CSRF and flash ----------------------------------------------------------
 

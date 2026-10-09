@@ -236,7 +236,7 @@ type Reg = [string, (el: Element, signal: AbortSignal) => unknown, string];
 type Mounted = Element & { natsu?: Set<Reg> };
 type Answer = [Response, string];
 /** `a`: the answer already on its way (an action's post), used instead of a GET. */
-type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer> };
+type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer>; k?: () => void };
 
 const D = document;
 const H = D.documentElement;
@@ -318,7 +318,13 @@ const unmount = (root: Element, inner?: 1) =>
 		}
 	}));
 
-const island = async (el: Element & { q?: object }, signal?: AbortSignal) => {
+/** Live islands on the page: each one's element, and the signed tags its last answer carried. */
+const isles = new Map<Isle, string>();
+/** Tell the socket what the page and its islands watch now (set by watchLive). */
+let relive = () => {};
+type Isle = Element & { q?: object; s?: AbortSignal; w?: ReturnType<typeof setTimeout> };
+
+const island = async (el: Isle, signal?: AbortSignal) => {
 	// Only this site, and only an answer from a route that says it is an
 	// island: markup that slipped into a page must not pull in another
 	// origin's HTML, nor a whole page of this one.
@@ -326,13 +332,19 @@ const island = async (el: Element & { q?: object }, signal?: AbortSignal) => {
 	if (u.origin != L.origin) return;
 	// Only the answer to the latest fetch of this island goes in: an earlier one may come back last.
 	const q = (el.q = {});
-	const r = await fetch(u, { signal, headers: { "Natsu-Island": "1" } });
+	// Kept for a live refetch, which is the mount's own fetch again.
+	signal && (el.s = signal);
+	const r = await fetch(u, { signal: el.s, headers: { "Natsu-Island": "1" } });
 	const html =
 		r.status == 200 && /^text\/html/.test(r.headers.get("content-type")!) && r.headers.get("natsu-island") == "1" && (await r.text());
 	if (html !== false && el.isConnected && el.q == q) {
 		unmount(el, 1);
 		el.innerHTML = html;
 		mountIn(el);
+		// A live island: its answer named the tags it was drawn from.
+		const t = r.headers.get("natsu-live");
+		t ? isles.set(el, t) : isles.delete(el);
+		relive();
 	}
 };
 /**
@@ -459,7 +471,7 @@ const send = (url: string, body: FormData | URLSearchParams, key?: string) =>
  * `act(url, body)` runs the post and redraws the page; `key` is the
  * document key (forms go by the browser without one).
  */
-const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParams) => unknown, key?: string) =>
+const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParams, k?: () => void) => unknown, key?: string) =>
 	regs.push([
 		"[data-uwu-action]",
 		(el, signal) => {
@@ -480,7 +492,7 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 					el.setAttribute("aria-busy", "true");
 					acting++;
 					try {
-						await act(to, [...fd.values()].some((v) => typeof v != "string") ? fd : new URLSearchParams(fd as unknown as string[][]));
+						await act(to, [...fd.values()].some((v) => typeof v != "string") ? fd : new URLSearchParams(fd as unknown as string[][]), form ? typed(form) : undefined);
 					} finally {
 						acting--;
 						el.removeAttribute("aria-busy");
@@ -492,10 +504,36 @@ const actions = (regs: Reg[], act: (url: string, body: FormData | URLSearchParam
 		"",
 	]);
 
-/** Watch the page's live tags; `refresh` redraws it. */
+/**
+ * What was typed, picked or ticked in a form (never a hidden field, a
+ * password or a file), and how to put it back in the form of the same action
+ * at the same place on the page once a refusal has drawn it again: whatever the
+ * server wrote in its fields, the visitor's own text is what they fix.
+ */
+const typed = (form: HTMLFormElement) => {
+	const i = [...D.forms].indexOf(form);
+	const of = (f?: HTMLFormElement) => [...(f?.elements || [])].filter((e) => !/^(hi|pa|fi|su|bu)/.test((e as HTMLInputElement).type)) as HTMLInputElement[];
+	const was = of(form).map((e) => [e.value, e.checked] as const);
+	return () => {
+		const now = of(D.forms[i]);
+		now.length == was.length && now.forEach((e, n) => ([e.value, e.checked] = was[n]!));
+	};
+};
+
+/** The tags of a signed list. */
+const tagsOf = (s: string) => s.slice(0, s.lastIndexOf("|")).split(" ");
+
+/**
+ * Watch the page's live tags and its live islands'; `refresh` redraws the
+ * page when one of its own is invalidated, and an island's fetches that
+ * island again, alone.
+ */
 const watchLive = (refresh: () => unknown) => {
 	let ws: WebSocket | 0 = 0;
-	let want = "";
+	/** The page's signed tags. */
+	let mine = "";
+	/** What was last said: one signed list, or the page's and the islands'. */
+	let want: string | string[] = "";
 	let wait = 1e3;
 	let back = 0;
 	let t: ReturnType<typeof setTimeout>;
@@ -510,7 +548,12 @@ const watchLive = (refresh: () => unknown) => {
 		};
 		s.onmessage = (e) => {
 			try {
-				JSON.parse(e.data).t == "invalidate" && !acting && (clearTimeout(t), (t = setTimeout(refresh, 30)));
+				const m = JSON.parse(e.data);
+				if (m.t == "invalidate")
+					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(refresh, 30)));
+					else
+						for (const [el, s] of isles)
+							tagsOf(s).includes(m.tag) && (clearTimeout(el.w), (el.w = setTimeout(() => island(el).catch(() => {}), 30)));
 			} catch {}
 		};
 		s.onclose = () => {
@@ -519,17 +562,24 @@ const watchLive = (refresh: () => unknown) => {
 			want && setTimeout(() => want && !ws && open(), (wait = Math.min(wait * 2, 3e4)));
 		};
 	};
+	relive = () => {
+		for (const el of isles.keys()) el.isConnected || isles.delete(el);
+		const all = [mine, ...isles.values()].filter(Boolean);
+		const n = all[1] ? all : all[0] || "";
+		// A signed list holds no comma, so the lists joined are a fair comparison.
+		if ("" + n != "" + want) (want = n), ws ? say() : n && open();
+	};
 	document.addEventListener("natsu:load", () => {
-		const n = document.querySelector<HTMLMetaElement>('meta[name="natsu-live"]')?.content || "";
-		if (n != want) (want = n), ws ? say() : n && open();
+		mine = document.querySelector<HTMLMetaElement>('meta[name="natsu-live"]')?.content || "";
+		relive();
 	});
 };
 
 /** An action's post, and the page drawn again: without a key, a reload once it is done (a page with one swaps instead). */
-let act = (u: string, body: FormData | URLSearchParams): Promise<unknown> =>
+let act = (u: string, body: FormData | URLSearchParams, _k?: () => void): Promise<unknown> =>
 	send(u, body).then((r) => (r.url && r.url != L.href ? L.assign(r.url) : L.reload()));
 if (!first) {
-	actions(regs, (u, body) => act(u, body), KEY && regions(D)[0] ? KEY : undefined);
+	actions(regs, (u, body, k) => act(u, body, k), KEY && regions(D)[0] ? KEY : undefined);
 	watchLive(() => api.refresh());
 }
 
@@ -1040,6 +1090,8 @@ if (!first && KEY && regions(D)[0]) {
 					unmount(el);
 					el.replaceWith(next[i]!);
 				});
+				// A refused form: what the visitor typed is put back.
+				r.status == 422 && o.k?.();
 				const s = o.scroll;
 				if (s == "keep") fid && D.getElementById(fid)?.focus(QUIET);
 				else {
@@ -1116,7 +1168,7 @@ if (!first && KEY && regions(D)[0]) {
 
 	api.visit = visit;
 	api.refresh = () => visit(L.href, { history: "replace", scroll: "keep" });
-	act = (u, body) => (clear(), visit(L.href, { history: "replace", scroll: "keep", a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) }));
+	act = (u, body, k) => (clear(), visit(L.href, { history: "replace", scroll: "keep", k, a: send(u, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]) }));
 	api.prefetch = prefetch;
 }
 // Last, so that a runtime added after load boots with all of the above set up.

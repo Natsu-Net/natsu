@@ -333,4 +333,17 @@ describe("through a running server", () => {
 		running = await startApp(new Application({ cwd: dir.path }));
 		expect(await (await running.fetch("/ok.txt")).text()).toBe("hello static");
 	});
+
+	test("Static.beforeRoutes still serves a file whose path no route matches", async () => {
+		// Files were tried only once a route matched, so an app with no
+		// catch-all route answered 404 for every file it had.
+		reset({ Static: { enabled: true, root, index: "index.html", beforeRoutes: true } });
+		new Router().get("/other", (ctx) => {
+			ctx.response.body = "a route";
+		});
+		running = await startApp(new Application({ cwd: dir.path }));
+		const response = await running.fetch("/ok.txt");
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("hello static");
+	});
 });
