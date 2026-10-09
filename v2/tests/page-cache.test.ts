@@ -434,6 +434,37 @@ describe("PageCache tags", () => {
 		}
 	});
 
+	test("a request after a drop does not join the first render of a page, which read the old data", async () => {
+		for (const mode of ["delete", "expire"] as const) {
+			const cache = new PageCache({ fresh: 60 });
+			let data = "visible";
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let renders = 0;
+			const draw: PageRender = async () => {
+				const n = ++renders;
+				const read = data;
+				if (n === 1) await gate;
+				return { body: `${read} ${n}`, status: 200, tags: ["product:1"] };
+			};
+			// Nothing kept yet for the key, so the drop finds no page to forget.
+			const first = cache.serve("/p", [], draw);
+			data = "taken down";
+			cache.dropTags(["product:1"], mode);
+			const after = cache.serve("/p", [], draw);
+			// One new render: whoever comes next joins it.
+			const later = cache.serve("/p", [], draw);
+			release();
+			expect((await first)?.body).toBe("visible 1");
+			expect((await after)?.body).toBe("taken down 2");
+			expect((await later)?.body).toBe("taken down 2");
+			expect(renders).toBe(2);
+			expect((await cache.serve("/p", [], draw))?.body).toBe("taken down 2");
+		}
+	});
+
 	test("expiring voids a refresh already under way, which read the old data", async () => {
 		setSystemTime(new Date("2026-10-01T00:00:00Z"));
 		const cache = new PageCache({ fresh: 10, stale: 30 });

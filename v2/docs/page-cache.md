@@ -45,7 +45,9 @@ invalidate(`product:${id}`, { soft: true });  // an edit: the old page is served
   moment old does no harm.
 - **A render under way is not kept** when one of the tags it drew is dropped
   while it runs: it read what was there before. It still answers the
-  requests that were waiting on it, and no request after the drop joins it.
+  requests that were waiting on it, and no request after the drop joins it:
+  until it ends nobody knows which tags it drew, so the first request after
+  any drop draws its own page, and that one is kept instead.
   When a soft drop catches a page mid-render, that render stays the one
   under way: visitors keep getting the old page, and the first one after it
   ends draws the page again, so a burst of edits never stacks up renders of

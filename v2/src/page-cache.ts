@@ -256,9 +256,15 @@ export class PageCache {
 		const running = this.pending.get(key);
 		// Someone else is drawing it: their page, our secrets. Not a render that
 		// read what a drop since made old: that one answers who asked before it.
+		// Nor one that saw any drop at all: which tags it draws is known only
+		// once it ends, so it may have read what the drop let go of. This
+		// request draws its own, which is kept in its place.
 		if (running && !running.void) {
-			const entry = await running.done;
-			return entry ? this.fill(entry.page, secrets) : null;
+			if (!running.dropped) {
+				const entry = await running.done;
+				return entry ? this.fill(entry.page, secrets) : null;
+			}
+			running.void = true;
 		}
 		return this.draw(key, secrets, render);
 	}
