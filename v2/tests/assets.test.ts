@@ -146,6 +146,29 @@ describe("rewriting", () => {
 		// Nothing the caller did not name is touched.
 		expect(page).toContain('src="/assets/js/other.js"');
 	});
+
+	test("the prefix scan rewrites exactly what the quoted-key pattern would", async () => {
+		writeFileSync(join(dir, "a.js"), "export const a = 1;\n");
+		writeFileSync(join(dir, "b.js"), "export const b = 2;\n");
+		reset();
+		const rewrite = { "/assets/a.js": "a", "/assets/a.js.map": "missing", "/assets/b.js": "b" };
+		const pipeline = new Assets({ outDir: out, scripts: { a: join(dir, "a.js"), b: join(dir, "b.js") }, rewrite });
+		await pipeline.build();
+		const urls: Record<string, string> = { "/assets/a.js": pipeline.url("a"), "/assets/b.js": pipeline.url("b") };
+		const keys = Object.keys(rewrite).sort((x, y) => y.length - x.length).map((k) => k.replace(/[.]/g, "\\."));
+		const pattern = new RegExp(`(["'])(${keys.join("|")})\\1`, "g");
+		const byRegex = (html: string) => html.replace(pattern, (m, q: string, from: string) => (urls[from] ? `${q}${urls[from]}${q}` : m));
+		const pages = [
+			'<script src="/assets/a.js"></script><script src=\'/assets/b.js\'></script>',
+			'"/assets/a.js""/assets/b.js"',
+			'"/assets/a.js"/assets/b.js"',
+			'"/assets/a.js.map"/assets/a.js"',
+			'"/assets/a.jsx" \'/assets/a.js" "/assets/b.js\' x="/assets/a.js',
+			'/assets/a.js /assets/b.js "/assets/" "" \'/assets/b.js\'',
+			"no assets at all",
+		];
+		for (const html of pages) expect(pipeline.rewrite(html)).toBe(byRegex(html));
+	});
 });
 
 describe("pages kept rewritten", () => {
