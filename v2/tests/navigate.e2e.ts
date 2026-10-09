@@ -793,6 +793,24 @@ describe("page switching in Chromium, against a natsu app", () => {
 		]);
 	});
 
+	e2e("a real load of this page at another hash (an action's answer that lands on its form) loads it, never only jumps", async () => {
+		const page = await open("/a");
+		// The server answers with a real load, as it does for a page that opts out of switching.
+		fixture.state.banner = "Signed in";
+		try {
+			await page.evaluate(() => (window as any).natsu.visit("/a#results", { history: "replace" }));
+			await page.waitForFunction(() => (window as any).__loads === 2);
+			await page.waitForFunction(() => document.readyState === "complete");
+			expect(await page.evaluate(() => ({ hash: location.hash, banner: document.getElementById("banner")?.textContent ?? null }))).toEqual({
+				hash: "#results",
+				banner: "Signed in",
+			});
+		} finally {
+			fixture.state.banner = "";
+			await page.context().close();
+		}
+	});
+
 	e2e("a redirect whose target's natsu:visit is cancelled leaves no html[data-natsu-loading]", async () => {
 		const page = await open("/a");
 		await page.evaluate(() => {
