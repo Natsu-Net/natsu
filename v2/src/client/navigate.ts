@@ -893,9 +893,17 @@ if (!first && KEY && regions(D)[0]) {
 	 * unsure. Not loading any more: one that never leaves the page (a
 	 * download, a 204) must not leave the mark on it.
 	 */
-	const full = (u: URL, h?: string) =>
-		// This page again (refresh) is a reload: a replace of a URL with a hash would only jump, and one without would lose the scroll.
-		(idle(), L[h == "none" || (h && u.href == L.href) ? "reload" : h ? "replace" : "assign"](u.href));
+	const full = (u: URL, h?: string) => (
+		idle(),
+		h == "none"
+			? L.reload()
+			: // This page again (refresh, an action's answer) is a reload: a replace of a URL with a hash would only
+				// jump, and one without would lose the scroll. One at another hash of it (the form it posted) gets
+				// that hash first, then loads.
+				h && bare(u) == bare(L)
+				? (u.href != L.href && HI.replaceState(HI.state, "", u.href), L.reload())
+				: L[h ? "replace" : "assign"](u.href)
+	);
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
