@@ -225,6 +225,23 @@ const NO_SECRETS: Record<string, string> = Object.freeze({}) as Record<string, s
 const ACTION_INPUT = /<input type="hidden" name="_action" value="[^"]*">/g;
 const MAX_BODY = 1024 * 1024;
 
+/**
+ * Whether a post of `length` bytes, over the pages' limit, may be read: some
+ * action this page runs takes that much (`large`), and lets this request in.
+ */
+async function admitsLarge(ctx: Context, state: { actions: Map<string, { name: string }> }, length: number): Promise<boolean> {
+	for (const { name } of state.actions.values()) {
+		const large = registeredAction(name)?.options.large;
+		if (!large || length > large.maxBody) continue;
+		try {
+			if (!large.admit || (await large.admit(ctx))) return true;
+		} catch {
+			// A check that fails lets nothing in.
+		}
+	}
+	return false;
+}
+
 export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	if (!options.dir && !options.built) throw new TypeError("natsu/pages: mountPages needs { dir } or { built }");
 	const router = options.router ?? new Router();
@@ -619,7 +636,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			// Browsers always send a length for a form; without one the body is unbounded.
 			const length = Number(ctx.headers.get("content-length") ?? Number.NaN);
 			if (!Number.isFinite(length)) return plain(411, "Length Required");
-			if (length > maxBody) return plain(413, "Payload Too Large");
+			// Over the limit only for an action of this page that takes more, and lets this request in.
+			if (length > maxBody && !(await admitsLarge(ctx, state, length))) return plain(413, "Payload Too Large");
 			let form: FormData;
 			try {
 				form = await ctx.request.formData();
@@ -633,6 +651,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				typeof short !== "string" ? undefined : state.actions.get(short) ?? (registeredAction(short)?.options.public ? { name: short } : undefined);
 			const entry = target && registeredAction(target.name);
 			if (!target || !entry || typeof short !== "string") return plain(404, "Unknown action");
+			if (length > maxBody && length > (entry.options.large?.maxBody ?? 0)) return plain(413, "Payload Too Large");
 
 			const secrets = secretsFor(ctx, state);
 			const refuse = async (thrown: unknown): Promise<string> => {

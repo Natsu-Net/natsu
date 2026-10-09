@@ -85,6 +85,13 @@ export interface ActionOptions {
 	 * page that read it refreshes), a tag, or a function of the input for one.
 	 */
 	touches?: readonly (string | ((input: ActionInput) => string | readonly string[] | undefined))[];
+	/**
+	 * Lets this action's post be bigger than the pages' `maxBody` (a form with
+	 * files), up to `maxBody` bytes, and only for a request `admit` lets in: it
+	 * runs before the body is read, so it decides from the request alone (a
+	 * session cookie, say), and a body nobody admits is refused unread.
+	 */
+	large?: { maxBody: number; admit?: (ctx: Context) => boolean | Promise<boolean> };
 }
 
 export interface GuardInput {

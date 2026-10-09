@@ -239,6 +239,29 @@ describe("actions without script", () => {
 		expect((await go("x".repeat(100))).status).toBe(413);
 	});
 
+	test("an action may take a bigger post, only for a request it admits; the rest stay at the limit", async () => {
+		action("attach", ({ input }) => ({ redirect: `/up?n=${String(input.note).length}` }), {
+			csrf: false,
+			large: { maxBody: 512, admit: (ctx) => ctx.headers.get("x-staff") === "1" },
+		});
+		action("small", () => ({ redirect: "/up?small" }), { csrf: false });
+		const { get } = await serve(
+			{ "up.uwu": `<template><form @submit="action:attach"></form><form @submit="action:small"></form></template>` },
+			{ maxBody: 64 },
+		);
+		const post = (fields: Record<string, string>, staff: boolean) =>
+			get("/up", { method: "POST", body: form(fields), headers: staff ? { "x-staff": "1" } : {} });
+		const big = "x".repeat(200);
+		expect((await post({ _action: "attach", note: big }, true)).headers.get("location")).toBe("/up?n=200");
+		// Not admitted: refused before the body is read.
+		expect((await post({ _action: "attach", note: big }, false)).status).toBe(413);
+		// Admitted, but the action named takes no more than the limit.
+		expect((await post({ _action: "small", note: big }, true)).status).toBe(413);
+		// Over the action's own limit.
+		expect((await post({ _action: "attach", note: "x".repeat(600) }, true)).status).toBe(413);
+		expect((await post({ _action: "small" }, false)).headers.get("location")).toBe("/up?small");
+	});
+
 	test("what nothing runs fails at mount, naming the file and the line", async () => {
 		write({ "a.uwu": `<template>\n<button @click="action:nope">x</button></template>` });
 		await expect(mountPages({ dir })).rejects.toThrow(/pages\/a.uwu:2: action:nope is used, and nothing runs it/);
