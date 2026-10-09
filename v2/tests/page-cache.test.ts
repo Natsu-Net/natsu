@@ -465,6 +465,60 @@ describe("PageCache tags", () => {
 		}
 	});
 
+	test("a drop of data a render does not draw leaves it the one render, kept and shared", async () => {
+		for (const mode of ["delete", "expire"] as const) {
+			const cache = new PageCache({ fresh: 60 });
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let renders = 0;
+			const draw: PageRender = async () => {
+				const n = ++renders;
+				await gate;
+				return { body: `home ${n}`, status: 200, tags: ["catalog"] };
+			};
+			const waiting: Promise<CachedPage | null>[] = [];
+			for (let i = 0; i < 10; i++) {
+				waiting.push(cache.serve("/", [], draw));
+				cache.dropTags([`account:${i}`], mode);
+			}
+			release();
+			for (const answer of await Promise.all(waiting)) expect(answer?.body).toBe("home 1");
+			expect(renders).toBe(1);
+			expect(cache.size).toBe(1);
+		}
+	});
+
+	test("a request that joined a render before a drop of its data still gets that render", async () => {
+		const cache = new PageCache({ fresh: 60 });
+		let data = "visible";
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let renders = 0;
+		const draw: PageRender = async () => {
+			const n = ++renders;
+			const read = data;
+			if (n === 1) await gate;
+			return { body: `${read} ${n}`, status: 200, tags: ["product:1", "catalog"] };
+		};
+		const first = cache.serve("/p", [], draw);
+		cache.dropTags(["account:9"], "delete");
+		// Joins after a drop of other data, before the drop of its own.
+		const joined = cache.serve("/p", [], draw);
+		data = "taken down";
+		cache.dropTags(["product:1"], "delete");
+		const after = cache.serve("/p", [], draw);
+		release();
+		expect((await first)?.body).toBe("visible 1");
+		expect((await joined)?.body).toBe("visible 1");
+		expect((await after)?.body).toBe("taken down 2");
+		expect(renders).toBe(2);
+		expect((await cache.serve("/p", [], draw))?.body).toBe("taken down 2");
+	});
+
 	test("expiring voids a refresh already under way, which read the old data", async () => {
 		setSystemTime(new Date("2026-10-01T00:00:00Z"));
 		const cache = new PageCache({ fresh: 10, stale: 30 });

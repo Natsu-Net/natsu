@@ -161,13 +161,27 @@ const MAX_DROPPED = 1024;
 /**
  * A render under way; `void` once the key was forgotten or made old while it
  * ran, after which nobody new waits on it. `dropped` holds the tags dropped
- * meanwhile: a page that drew one read what was there before, so it is not
- * kept either.
+ * meanwhile, in order: a page that drew one read what was there before, so
+ * it is not kept, nor given to a request that came after that drop.
  */
 interface Run {
 	done: Promise<Entry | null>;
 	void: boolean;
 	dropped?: Set<string>;
+}
+
+/**
+ * Whether a page that drew `tags` drew one of the first `count` tags of
+ * `dropped` (a Set keeps the order tags were first added in).
+ */
+function drewDropped(tags: readonly string[] | undefined, dropped: Set<string>, count: number): boolean {
+	if (!tags) return false;
+	let i = 0;
+	for (const tag of dropped) {
+		if (i++ >= count) break;
+		if (tags.includes(tag)) return true;
+	}
+	return false;
 }
 
 /** Seconds as ms, or `fallback` for anything that is not a number of seconds. */
@@ -256,15 +270,17 @@ export class PageCache {
 		const running = this.pending.get(key);
 		// Someone else is drawing it: their page, our secrets. Not a render that
 		// read what a drop since made old: that one answers who asked before it.
-		// Nor one that saw any drop at all: which tags it draws is known only
-		// once it ends, so it may have read what the drop let go of. This
-		// request draws its own, which is kept in its place.
+		// Which tags it draws is known only once it ends, so after a drop this
+		// request waits on it all the same, and asks again if it turns out to
+		// draw a tag dropped before this request came: the page is drawn anew
+		// (once, for everyone who asks again), and kept in its place. A drop of
+		// other data costs no render.
 		if (running && !running.void) {
-			if (!running.dropped) {
-				const entry = await running.done;
-				return entry ? this.fill(entry.page, secrets) : null;
-			}
-			running.void = true;
+			const seen = running.dropped?.size ?? 0;
+			const entry = await running.done;
+			if (!entry) return null;
+			if (seen > 0 && drewDropped(entry.tags, running.dropped!, seen)) return this.serve(key, secrets, render);
+			return this.fill(entry.page, secrets);
 		}
 		return this.draw(key, secrets, render);
 	}
