@@ -19,8 +19,19 @@
  * who gets it. A page that depends on who is asking (a session, a flash
  * message) must not come through here. The key says what else a page
  * depends on: its path and query, and anything else the app knows changes it.
+ *
+ * A page can also say what data it drew (`tags`, the same tags `invalidate`
+ * takes), so a change to that data lets it go at once instead of when it is
+ * old: `dropTags` deletes the pages that carry a tag (a takedown, a price
+ * that must not be shown again) or expires them (an edit: the old page is
+ * served once more while one request draws the new one). Given
+ * `invalidate: true`, the cache does this itself for every `invalidate()` in
+ * this process, and for those a change feed passes in: a plain one deletes,
+ * a `soft` one expires. A page that carries tags can keep its own `hold`,
+ * longer than the cache's when a change will reach it anyway.
  */
 
+import { type InvalidateListener, MAX_TAGS, isTag, onInvalidate } from "./invalidate.ts";
 import { log } from "./logger.ts";
 
 export interface PageCacheOptions {
@@ -43,6 +54,12 @@ export interface PageCacheOptions {
 	 * (`assets.markRewritten(ctx, page)`).
 	 */
 	prepare?: (body: string) => string;
+	/**
+	 * Let pages go as `invalidate()` names their tags, for as long as the
+	 * process runs: a plain invalidation deletes them, a `soft` one expires
+	 * them (default false). `listen()` does the same and can be stopped.
+	 */
+	invalidate?: boolean;
 }
 
 /** A page as `render` draws it, and as `serve` answers it. */
@@ -59,6 +76,18 @@ export interface CachedPage {
 	 * see each one). Whoever was waiting on it draws their own.
 	 */
 	keep?: boolean;
+	/**
+	 * The data the page drew, as `invalidate` names it (`product:blue-shoe`),
+	 * so `dropTags` and invalidations can let it go. A page with more than
+	 * `MAX_TAGS`, or with one that is not a tag, keeps none: it goes when it
+	 * is old, as an untagged page does. Never part of an answer.
+	 */
+	tags?: readonly string[];
+	/**
+	 * Seconds this page is kept fresh, then served stale, in place of the
+	 * cache's own `fresh` and `stale`. Never part of an answer.
+	 */
+	hold?: { fresh: number; stale: number };
 }
 
 /**
@@ -89,6 +118,13 @@ export interface Filled {
 
 const fills = new WeakMap<CachedPage, Filled>();
 
+/** The tags a page drew, once each, or undefined when there are none or any is not a tag. */
+function tagsOf(tags: readonly string[] | undefined): readonly string[] | undefined {
+	if (!tags || tags.length === 0 || tags.length > MAX_TAGS * 4) return undefined;
+	const list = [...new Set(tags)];
+	return list.length <= MAX_TAGS && list.every(isTag) ? list : undefined;
+}
+
 /** How `answer`, a page `PageCache.serve` gave, was filled; undefined for any other page. */
 export function filledOf(answer: CachedPage): Filled | undefined {
 	return fills.get(answer);
@@ -100,7 +136,11 @@ interface Entry {
 	/** When it stops being fresh, then stops being served at all (ms). */
 	fresh: number;
 	until: number;
+	/** How long it is served stale once it is old (ms). */
+	stale: number;
 	chars: number;
+	/** What it drew, checked; undefined for none. */
+	tags: readonly string[] | undefined;
 }
 
 /** Keys longer than this (a made-up query string) are rendered every time. */
@@ -115,10 +155,38 @@ const SECRET = /^[\w.~+/=-]*$/;
 /** Most keys remembered as not to be kept (a page that is missing, or differs per view). */
 const MAX_REFUSED = 10_000;
 
-/** A render under way; `void` once the key was forgotten while it ran. */
+/** Most tags dropped while one render runs; past it the render is not kept. */
+const MAX_DROPPED = 1024;
+
+/**
+ * A render under way; `void` once the key was forgotten or made old while it
+ * ran, after which nobody new waits on it. `dropped` holds the tags dropped
+ * meanwhile, in order: a page that drew one read what was there before, so
+ * it is not kept, nor given to a request that came after that drop.
+ */
 interface Run {
 	done: Promise<Entry | null>;
 	void: boolean;
+	dropped?: Set<string>;
+}
+
+/**
+ * Whether a page that drew `tags` drew one of the first `count` tags of
+ * `dropped` (a Set keeps the order tags were first added in).
+ */
+function drewDropped(tags: readonly string[] | undefined, dropped: Set<string>, count: number): boolean {
+	if (!tags) return false;
+	let i = 0;
+	for (const tag of dropped) {
+		if (i++ >= count) break;
+		if (tags.includes(tag)) return true;
+	}
+	return false;
+}
+
+/** Seconds as ms, or `fallback` for anything that is not a number of seconds. */
+function ms(seconds: unknown, fallback: number): number {
+	return typeof seconds === "number" && seconds >= 0 && seconds < 1e9 ? seconds * 1000 : fallback;
 }
 
 export class PageCache {
@@ -132,6 +200,8 @@ export class PageCache {
 	 * not be shared either (a missing page, a page with an ad picked per view).
 	 */
 	private readonly refused = new Map<string, number>();
+	/** Kept keys by the tags their pages carry. */
+	private readonly byTag = new Map<string, Set<string>>();
 	private readonly fresh: number;
 	private readonly stale: number;
 	private readonly maxChars: number;
@@ -150,6 +220,7 @@ export class PageCache {
 		this.stale = (options.stale ?? 30) * 1000;
 		this.maxChars = options.maxChars ?? 32_000_000;
 		this.prepare = options.prepare;
+		if (options.invalidate) this.listen();
 	}
 
 	/** Pages kept now. */
@@ -197,10 +268,19 @@ export class PageCache {
 		// Past its stale time a page is not served; its memory goes with it.
 		if (kept) this.forget(key);
 		const running = this.pending.get(key);
-		if (running) {
-			// Someone else is drawing it: their page, our secrets.
+		// Someone else is drawing it: their page, our secrets. Not a render that
+		// read what a drop since made old: that one answers who asked before it.
+		// Which tags it draws is known only once it ends, so after a drop this
+		// request waits on it all the same, and asks again if it turns out to
+		// draw a tag dropped before this request came: the page is drawn anew
+		// (once, for everyone who asks again), and kept in its place. A drop of
+		// other data costs no render.
+		if (running && !running.void) {
+			const seen = running.dropped?.size ?? 0;
 			const entry = await running.done;
-			return entry ? this.fill(entry.page, secrets) : null;
+			if (!entry) return null;
+			if (seen > 0 && drewDropped(entry.tags, running.dropped!, seen)) return this.serve(key, secrets, render);
+			return this.fill(entry.page, secrets);
 		}
 		return this.draw(key, secrets, render);
 	}
@@ -223,10 +303,84 @@ export class PageCache {
 	/** Forget every page, and every render under way, as `delete` does. */
 	public clear(): void {
 		this.entries.clear();
+		this.byTag.clear();
 		this.chars = 0;
 		this.refused.clear();
 		for (const running of this.pending.values()) running.void = true;
 		this.pending.clear();
+	}
+
+	/**
+	 * Let go of every page that carries one of `tags`, and of every render
+	 * under way that turns out to draw one (it read what was there before).
+	 * `delete` forgets them, as `delete(key)` does: the next request waits on
+	 * a new render. `expire` makes them old: the next request is answered the
+	 * old page while one render draws the new one, within the page's stale
+	 * time (a page with none is forgotten). Answers how many kept pages it
+	 * let go of.
+	 */
+	public dropTags(tags: readonly string[], mode: "delete" | "expire"): number {
+		if (this.pending.size > 0) {
+			for (const running of this.pending.values()) {
+				const dropped = (running.dropped ??= new Set());
+				for (const tag of tags) dropped.add(tag);
+				if (dropped.size > MAX_DROPPED) running.void = true;
+			}
+		}
+		const keys = new Set<string>();
+		for (const tag of tags) for (const key of this.byTag.get(tag) ?? []) keys.add(key);
+		if (keys.size === 0) return 0;
+		const now = Date.now();
+		for (const key of keys) {
+			const entry = this.entries.get(key);
+			if (mode === "delete" || !entry || entry.stale === 0) {
+				this.delete(key);
+				continue;
+			}
+			this.age(key, entry, now, now + entry.stale);
+		}
+		return keys.size;
+	}
+
+	/**
+	 * Make every page old, and serve none for more than `staleSeconds` from
+	 * now (a change feed that lost touch: what changed meanwhile is not
+	 * known). Each is answered once more while one render draws it again;
+	 * renders under way are not kept.
+	 */
+	public expireAll(staleSeconds: number): void {
+		const now = Date.now();
+		const until = now + ms(staleSeconds, 0);
+		for (const [key, entry] of this.entries) this.age(key, entry, now, until);
+		for (const running of this.pending.values()) running.void = true;
+	}
+
+	/**
+	 * Let pages go as `invalidate()` names their tags (see the `invalidate`
+	 * option). Returns the function that stops it.
+	 */
+	public listen(): () => void {
+		const heard: InvalidateListener = (tags, _remote, info) => {
+			this.dropTags(tags, info?.soft ? "expire" : "delete");
+		};
+		return onInvalidate(heard);
+	}
+
+	/**
+	 * Makes a kept page old, served until `until` at most. A render of it under
+	 * way is not kept, but stays the one render under way: the visitors served
+	 * the old page meanwhile start no other, so a burst of drops draws a busy
+	 * page once at a time, and the first visitor after it ends draws it again.
+	 */
+	private age(key: string, entry: Entry, now: number, until: number): void {
+		const running = this.pending.get(key);
+		if (running) running.void = true;
+		if (until <= now) {
+			this.forget(key);
+			return;
+		}
+		if (entry.fresh > now) entry.fresh = now;
+		if (entry.until > until) entry.until = until;
 	}
 
 	/** Draws the page for this request, keeps it if it may be kept, and tells whoever waits. */
@@ -257,19 +411,26 @@ export class PageCache {
 				}
 				const body = this.prepare ? this.prepare(page.body) : page.body;
 				const now = Date.now();
+				const { tags: drew, hold, ...rest } = page;
+				const tags = tagsOf(drew);
+				const fresh = hold ? ms(hold.fresh, this.fresh) : this.fresh;
+				const stale = hold ? ms(hold.stale, this.stale) : this.stale;
 				entry = {
 					page: {
-						...page,
+						...rest,
 						body,
 						...(page.headers ? { headers: { ...page.headers } } : {}),
 						...(this.prepare ? { prepared: true } : {}),
 					},
-					fresh: now + this.fresh,
-					until: now + this.fresh + this.stale,
+					fresh: now + fresh,
+					until: now + fresh + stale,
+					stale,
 					chars: body.length + key.length,
+					tags,
 				};
-				// Forgotten while it ran: answer whoever asked before that, keep nothing.
-				if (!run.void) this.keep(key, entry, now);
+				// Forgotten while it ran, or it drew data dropped since: answer
+				// whoever asked before that, keep nothing.
+				if (!run.void && !(tags && run.dropped && tags.some((tag) => run.dropped!.has(tag)))) this.keep(key, entry, now);
 				return this.fill(entry.page, secrets);
 			} finally {
 				if (this.pending.get(key) === run) this.pending.delete(key);
@@ -295,6 +456,13 @@ export class PageCache {
 		if (entry.chars > this.maxChars) return;
 		this.entries.set(key, entry);
 		this.chars += entry.chars;
+		if (entry.tags) {
+			for (const tag of entry.tags) {
+				let keys = this.byTag.get(tag);
+				if (!keys) this.byTag.set(tag, (keys = new Set()));
+				keys.add(key);
+			}
+		}
 		while (this.chars > this.maxChars) {
 			const oldest = this.entries.keys().next();
 			if (oldest.done) break;
@@ -318,11 +486,17 @@ export class PageCache {
 		if (!entry) return;
 		this.entries.delete(key);
 		this.chars -= entry.chars;
+		if (entry.tags) {
+			for (const tag of entry.tags) {
+				const keys = this.byTag.get(tag);
+				if (keys?.delete(key) && keys.size === 0) this.byTag.delete(tag);
+			}
+		}
 	}
 
 	private fill(page: CachedPage, secrets: readonly string[]): CachedPage {
 		const fill = (text: string): string => this.fillText(text, secrets);
-		const { keep: _keep, ...answer } = page;
+		const { keep: _keep, tags: _tags, hold: _hold, ...answer } = page;
 		const filled = { ...answer, body: fill(page.body), ...(page.headers ? { headers: { ...page.headers } } : {}) };
 		fills.set(filled, { page, fill });
 		return filled;

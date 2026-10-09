@@ -67,7 +67,7 @@ export type {
 	SourceOptions,
 } from "./src/pages/index.ts";
 export { invalidate, onInvalidate, setLiveSecret } from "./src/invalidate.ts";
-export type { InvalidateListener } from "./src/invalidate.ts";
+export type { InvalidateInfo, InvalidateListener } from "./src/invalidate.ts";
 
 export type { ApplicationOptions, ErrorHandler, StartOptions } from "./src/server.ts";
 export type { CookieOptions, Handler, Middleware, NatsuSocketData, ResponseBody } from "./src/context.ts";

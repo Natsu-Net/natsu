@@ -298,6 +298,9 @@ if (page?.prepared) assets.markRewritten(ctx, page);
 return page?.body;
 ```
 
+How a kept page carries tags and is let go when its data changes is in
+[page-cache.md](page-cache.md).
+
 A part (the answer to a visit) is never kept by PageCache and never cached
 by a browser or CDN (`private, no-store`, `Vary: Natsu-Nav`).
 

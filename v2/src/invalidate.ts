@@ -13,10 +13,17 @@
  *   invalidate(`product:${slug}`);        // after a write, from anywhere
  *   action("products.save", save, { touches: ["product"] });
  *
- * Fan-out is node-local: this process's sockets and its PageCache. Several
- * nodes need a change feed between them, which is not here yet: it plugs
- * into `onInvalidate` (to send this node's invalidations out) and calls
+ * Fan-out is node-local: this process's sockets and its PageCaches (those
+ * made with `invalidate: true`, or that `listen()`). Several nodes need a
+ * change feed between them, which is not here yet: it plugs into
+ * `onInvalidate` (to send this node's invalidations out) and calls
  * `invalidate(tags, { remote: true })` for the ones that come in.
+ *
+ * An invalidation is `soft` when the data changed but what was shown before
+ * may still be shown while it is drawn again (an edited description, not a
+ * takedown): a PageCache then serves the old page once more instead of making
+ * the next visitor wait. Listeners hear it as `info.soft`; one that ignores it
+ * treats every invalidation as a plain one, which is always safe.
  *
  * The tags a page carries are signed so that a socket subscribes to what a
  * page this server drew listed, and nothing else; a page served by one node
@@ -29,7 +36,12 @@ const TAG = /^[\w.:/@+=-]{1,160}$/;
 /** Most tags one page carries; past it the page is not live. */
 export const MAX_TAGS = 64;
 
-export type InvalidateListener = (tags: readonly string[], remote: boolean) => void;
+/** What else an invalidation says: `soft`, see above. */
+export interface InvalidateInfo {
+	soft: boolean;
+}
+
+export type InvalidateListener = (tags: readonly string[], remote: boolean, info: InvalidateInfo) => void;
 
 const listeners = new Set<InvalidateListener>();
 
@@ -49,14 +61,16 @@ export function isTag(tag: unknown): tag is string {
 
 /**
  * Tell every page that drew data tagged so to draw itself again: kept pages
- * are let go, and every browser showing one refreshes its regions.
+ * are let go (`soft`: served once more while they are drawn again), and
+ * every browser showing one refreshes its regions.
  */
-export function invalidate(tags: string | readonly string[], options: { remote?: boolean } = {}): void {
+export function invalidate(tags: string | readonly string[], options: { remote?: boolean; soft?: boolean } = {}): void {
 	const list = [...new Set(typeof tags === "string" ? [tags] : tags)].filter(isTag);
 	if (list.length === 0) return;
+	const remote = options.remote === true;
 	for (const fn of [...listeners]) {
 		try {
-			fn(list, options.remote === true);
+			fn(list, remote, { soft: options.soft === true });
 		} catch {
 			// One listener failing must not keep the others from hearing it.
 		}
