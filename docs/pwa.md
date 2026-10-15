@@ -50,7 +50,8 @@ Served with `no-cache` and rebuilt with every deploy (its cache is named after
 the build), so a deploy is a new worker.
 
 - Files under the chunk path and `cache` prefixes: from the cache first, else
-  the network, then kept.
+  the network, kept only when answered `immutable` (a fallback page for a
+  missing file never is).
 - A page load: always the network. A page answered `200` with
   `Natsu-Offline: 1` (a listed path, a GET that `offlineWhen` let through) is
   kept; one that is no longer marked is dropped. Offline, a kept page is shown

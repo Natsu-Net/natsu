@@ -129,7 +129,7 @@ const r=e.request;
 if(r.method!="GET")return;
 const u=new URL(r.url);
 if(u.origin!=location.origin)return;
-if(I.some(p=>u.pathname.startsWith(p)))return e.respondWith(caches.open(C).then(c=>c.match(r).then(m=>m||fetch(r).then(n=>(n.ok&&c.put(r,n.clone()),n)))));
+if(I.some(p=>u.pathname.startsWith(p)))return e.respondWith(caches.open(C).then(c=>c.match(r).then(m=>m||fetch(r).then(n=>(n.ok&&/immutable/.test(n.headers.get("cache-control")||"")&&c.put(r,n.clone()),n)))));
 u.hash="";
 const k=u.href;
 if(r.mode!="navigate"){if(r.headers.get("natsu-nav"))e.respondWith(fetch(r).then(n=>{n.headers.get("natsu-offline")=="1"&&e.waitUntil(fetch(k,{credentials:"same-origin"}).then(f=>f.ok&&f.headers.get("natsu-offline")=="1"&&caches.open(C).then(c=>c.put(k,f))).catch(()=>{}));return n}));return}

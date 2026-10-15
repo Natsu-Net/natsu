@@ -207,7 +207,7 @@ describe("the worker", () => {
 
 	test("assets are cache-first; parts, posts and other origins are left to the network", async () => {
 		const seen: string[] = [];
-		const w = worker(async (url) => (seen.push(url), new Response("x")));
+		const w = worker(async (url) => (seen.push(url), new Response("x", { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
 		await w.run(`${BASE}/_a/site.1.css`, "no-cors");
 		await w.run(`${BASE}/_a/site.1.css`, "no-cors");
 		expect(seen).toEqual([`${BASE}/_a/site.1.css`]);
@@ -224,6 +224,16 @@ describe("the worker", () => {
 		expect(seen).toEqual([`cors ${BASE}/about`, `fetch ${BASE}/about`, `cors ${BASE}/account`]);
 		expect(w.stores.get("natsu-b1")!.has(`${BASE}/about`)).toBe(true);
 		expect(w.stores.get("natsu-b1")!.has(`${BASE}/account`)).toBe(false);
+	});
+
+	test("only an immutable answer under an asset prefix is kept: a fallback page for a missing chunk never is", async () => {
+		const seen: string[] = [];
+		const w = worker(async (url) => (seen.push(url), url.includes("gone") ? new Response("<p>not found</p>", { headers: { "cache-control": "private, no-store" } }) : new Response("x", { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
+		await w.run(`${BASE}/_a/gone.1.css`, "no-cors");
+		await w.run(`${BASE}/_a/gone.1.css`, "no-cors");
+		await w.run(`${BASE}/_a/site.1.css`, "no-cors");
+		await w.run(`${BASE}/_a/site.1.css`, "no-cors");
+		expect(seen).toEqual([`${BASE}/_a/gone.1.css`, `${BASE}/_a/gone.1.css`, `${BASE}/_a/site.1.css`]);
 	});
 
 	test("activate drops older builds' caches", async () => {
