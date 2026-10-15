@@ -64,7 +64,7 @@
  * emits them.
  *
  * **Which clicks.** A plain left click on a link to this site, and the
- * submit of a GET form. Left to the browser: a click with a modifier (on a
+ * submit of a form, GET or POST (see docs/page-navigation.md). Left to the browser: a click with a modifier (on a
  * submit button too: it opens a tab or a window), a target other than
  * `_self` (the element's own, else the first `<base target>`), `download`, a file
  * (an extension other than `.html`), a link inside an editor
@@ -236,7 +236,7 @@ type Reg = [string, (el: Element, signal: AbortSignal) => unknown, string];
 type Mounted = Element & { natsu?: Set<Reg> };
 type Answer = [Response, string];
 /** `a`: the answer already on its way (an action's post), used instead of a GET. */
-type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer>; k?: () => void };
+type Opts = NatsuVisitOptions & { hops?: number; a?: Promise<Answer>; k?: () => void; n?: () => void };
 
 const D = document;
 const H = D.documentElement;
@@ -744,16 +744,18 @@ if (!first && KEY && regions(D)[0]) {
 			visit(a[1]);
 		}
 	});
+	let passing: unknown;
 	on("submit", (e: SubmitEvent) => {
 		clear();
 		const form = e.target as HTMLFormElement;
+		if (passing == form) return void (passing = 0);
 		const by = e.submitter;
 		const attr = (n: string) => by?.getAttribute("form" + n) ?? form.getAttribute(n);
 		// A query in another encoding than UTF-8 is the browser's to write.
 		if (
 			e.defaultPrevented ||
 			by?.contains(mod as Node) ||
-			/post|dialog/i.test(attr("method")!) ||
+			/dialog/i.test(attr("method")!) ||
 			other(attr("target")) ||
 			/[^utf8-]/i.test(attr("accept-charset") || "")
 		)
@@ -761,6 +763,7 @@ if (!first && KEY && regions(D)[0]) {
 		// No action is the page's own URL, never the base.
 		const u = new URL(attr("action") || here(), base());
 		if (!ok(form, u) || (by && !ok(by, u))) return;
+		if (/post/i.test(attr("method")!)) return post(e, form, by, u, attr("enctype") || "");
 		// A file goes as its name, and a line break as CRLF, as the browser sends them in a query.
 		// "?" first: with no field the query is empty, not gone, as the browser sends it.
 		u.search =
@@ -768,6 +771,27 @@ if (!first && KEY && regions(D)[0]) {
 		e.preventDefault();
 		visit(u);
 	});
+
+	const post = (e: SubmitEvent, form: HTMLFormElement, by: HTMLElement | null, u: URL, type: string) => {
+		if (/text\/plain/i.test(type) || unsafe()) return;
+		e.preventDefault();
+		const fd = new FormData(form, by);
+		const body = /multipart/i.test(type) ? fd : new URLSearchParams([...fd].map(([k, v]) => [k, (v as File).name ?? (v as string)]));
+		const same = bare(u) == bare(L);
+		acting++;
+		const a = send(u.href, body, KEY).then(async (r): Promise<Answer> => [r, await r.text()]);
+		a.finally(() => acting--).catch(() => {});
+		visit(u, {
+			history: same ? "replace" : undefined,
+			scroll: same ? "keep" : undefined,
+			k: typed(form),
+			a,
+			n: () => {
+				passing = form;
+				by ? form.requestSubmit(by) : form.requestSubmit();
+			},
+		});
+	};
 
 	// --- prefetch -------------------------------------------------------
 	const cache = new Map<string, { t: number; p: Promise<Answer | undefined> }>();
@@ -920,7 +944,7 @@ if (!first && KEY && regions(D)[0]) {
 			// A redirect's hop owns the loading timer its first visit started.
 			return "none" == h ? full(u, h) : void (o.hops && idle());
 		}
-		if (unsafe() || u.origin != L.origin || refused.has(u.pathname)) return full(u, h);
+		if (unsafe() || u.origin != L.origin || (!o.a && refused.has(u.pathname))) return full(u, h);
 		// The page already shown: the browser too replaces rather than pushes.
 		if (!h && u.href == L.href) h = "replace";
 		// A hover's pending prefetch would only fetch the same page twice; and
@@ -958,8 +982,12 @@ if (!first && KEY && regions(D)[0]) {
 			// Shown from its top (or its hash), as a load that redirects is: a scroll asked for was for the URL asked for.
 			// An action's refresh of the same page keeps its scroll and focus; one that sent the visitor elsewhere is a visit there.
 			const same = bare(v) == bare(L);
-			const next: Opts = { ...(o.a && same ? o : {}), a: undefined, history: o.a && !same ? undefined : h == "none" ? "replace" : h, hops: -~o.hops! };
+			const next: Opts = { ...(o.a && same ? o : {}), a: undefined, n: undefined, history: o.a && !same ? undefined : h == "none" ? "replace" : h, hops: -~o.hops! };
 			return next.hops! < 6 ? visit(v, next) : (DEV && why("redirect to", v.href), full(v, next.history));
+		}
+		if (o.n && head.has("natsu-unrun")) {
+			if (DEV) why("the form's route takes no visit, so the browser posts it", u.href);
+			return idle(), o.n();
 		}
 		if (!head.has("natsu-part")) {
 			if (DEV) why(head.get("natsu-reload") ?? "not a part", u.href);

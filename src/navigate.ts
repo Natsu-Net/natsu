@@ -326,7 +326,7 @@ export function refuseBeforeHandler(ctx: Context, handler: Handler): boolean {
 	if (!(nav instanceof NavRequest)) return false;
 	const flag = navigables.get(handler);
 	if (!flag) {
-		nav.decide({ kind: "reload", reason: "route", detail: "the route is not navigable(): wrap the handler it is registered with in navigable() (or mark the controller method @Navigable()) to let it answer parts" });
+		nav.decide({ kind: "reload", reason: "route", unrun: true, detail: "the route is not navigable(): wrap the handler it is registered with in navigable() (or mark the controller method @Navigable()) to let it answer parts" });
 		return true;
 	}
 	if (nav.prefetch && !flag.prefetch) {
@@ -347,7 +347,7 @@ export function refuseWithoutRoute(ctx: Context): boolean {
 	}
 	const nav = ctx.nav;
 	if (!(nav instanceof NavRequest)) return false;
-	nav.decide({ kind: "reload", reason: "response", detail: "no route answers this path" });
+	nav.decide({ kind: "reload", reason: "response", unrun: true, detail: "no route answers this path" });
 	return true;
 }
 
@@ -364,7 +364,7 @@ function refuseIsland(ctx: Context): void {
 // --- the request -------------------------------------------------------------
 
 type Decision =
-	| { kind: "reload"; reason: ReloadReason; detail: string }
+	| { kind: "reload"; reason: ReloadReason; detail: string; unrun?: true }
 	| { kind: "skip"; detail: string }
 	| { kind: "location"; url: string; detail: string };
 
@@ -700,12 +700,15 @@ export class Navigation {
 		addVary(headers, "Natsu-Nav");
 		if (decision.kind === "location") headers.set("natsu-location", decision.url);
 		else if (decision.kind === "skip") headers.set("natsu-prefetch", "skip");
-		else headers.set("natsu-reload", decision.reason);
+		else {
+			headers.set("natsu-reload", decision.reason);
+			if (decision.unrun) headers.set("natsu-unrun", "1");
+		}
 		if (development()) {
 			const what = decision.kind === "location"
 				? `redirect to ${decision.url}`
 				: decision.kind === "skip" ? "prefetch refused" : `full load (${decision.reason})`;
-			log.info(`[<magenta>navigate</magenta>] GET ${ctx.path}: ${what}: ${decision.detail}`);
+			log.info(`[<magenta>navigate</magenta>] ${ctx.method} ${ctx.path}: ${what}: ${decision.detail}`);
 		}
 	}
 

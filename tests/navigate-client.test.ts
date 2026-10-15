@@ -626,10 +626,8 @@ describe("GET forms", () => {
 		expect(p.document.title).toBe("Plain");
 	});
 
-	test("left alone: POST, formmethod=post, formtarget, data-natsu-reload, a listener that prevented it", async () => {
+	test("left alone: formtarget, data-natsu-reload, a listener that prevented it", async () => {
 		const p = open({ html: page({ shell }), routes });
-		expect(p.submit("#post-form")).toBe(false);
-		expect(p.submit("#get", "#post")).toBe(false);
 		expect(p.submit("#get", "#blank")).toBe(false);
 		expect(p.submit("#off")).toBe(false);
 		p.document.addEventListener("submit", (e: Event) => e.preventDefault(), { once: true });
@@ -2614,7 +2612,7 @@ describe("prefetch", () => {
 
 	test("any submit clears the cache; so does pagehide", async () => {
 		const p = open({
-			html: page({ shell: LINKS + `<form id="act" method="post" action="/_act/x"></form>` }),
+			html: page({ shell: LINKS + `<form id="act" method="post" action="/_act/x" data-natsu-reload></form>` }),
 			routes: { "/b": () => answer(part()), "/c": () => answer(part({ title: "C" })) },
 		});
 		p.natsu.prefetch("/b");
@@ -2914,6 +2912,103 @@ describe("types", () => {
 	});
 });
 
+describe("POST forms", () => {
+	const login = `<form id="pf" method="post" action="/login"><input name="user" value="ann"><button id="in" name="go" value="1">in</button></form>`;
+	const posted = { url: "/login", method: "POST", headers: { "Natsu-Action": "1", "Natsu-Nav": "k1.s1" }, body: "user=ann&go=1" };
+
+	test("the runtime posts the form with the page's key; its 303 elsewhere is a visit there, on a new entry", async () => {
+		const p = open({
+			html: page({ main: login }),
+			routes: { "POST /login": () => control({ "natsu-location": "/home" }), "/home": () => answer(part({ title: "Home" })) },
+		});
+		expect(p.submit("#pf", "#in")).toBe(true);
+		await settle();
+		expect(p.calls[0]).toEqual(posted);
+		expect(path(p)).toBe("/home");
+		expect(p.document.title).toBe("Home");
+		expect(p.loads).toEqual([]);
+		expect(p.window.history.length).toBe(2);
+	});
+
+	test("formmethod=post on a button of a GET form posts too", async () => {
+		const p = open({
+			html: page({ main: `<form id="g" action="/login"><input name="user" value="ann"><button id="p" formmethod="post" name="go" value="1">p</button></form>` }),
+			routes: { "POST /login": () => control({ "natsu-location": "/home" }), "/home": () => answer(part({ title: "Home" })) },
+		});
+		expect(p.submit("#g", "#p")).toBe(true);
+		await settle();
+		expect(p.calls[0]).toEqual(posted);
+		expect(path(p)).toBe("/home");
+	});
+
+	test("a refused form at the page's own URL comes back as a part, on the same entry", async () => {
+		const p = open({
+			html: page({ main: `<form id="pf" method="post"><input name="user" value="ann"></form>` }),
+			routes: { "POST /a": () => answer(part({ main: `<form id="pf" method="post"><input name="user" value="" aria-invalid="true"></form><p class=err>no</p>` }), 422) },
+		});
+		expect(p.submit("#pf")).toBe(true);
+		await settle();
+		expect(text(p, "main .err")).toBe("no");
+		expect(p.document.querySelector('input[name="user"]').value).toBe("ann");
+		expect(p.loads).toEqual([]);
+		expect(p.window.history.length).toBe(1);
+	});
+
+	test("a route that takes no visit, refused before it ran: the browser posts the form itself, with its submitter, once", async () => {
+		const p = open({
+			html: page({ main: login }),
+			routes: { "POST /login": () => control({ "natsu-reload": "route", "natsu-unrun": "1" }) },
+		});
+		const natives: (string | undefined)[] = [];
+		p.document.getElementById("pf").requestSubmit = (by?: Element) => natives.push(by?.id);
+		expect(p.submit("#pf", "#in")).toBe(true);
+		await settle();
+		expect(natives).toEqual(["in"]);
+		expect(p.calls).toEqual([posted]);
+		expect(p.loads).toEqual([]);
+	});
+
+	test("the submit the runtime hands back is the browser's: not taken again", async () => {
+		const p = open({
+			html: page({ main: login }),
+			routes: { "POST /login": () => control({ "natsu-reload": "route", "natsu-unrun": "1" }) },
+		});
+		const form = p.document.getElementById("pf");
+		form.requestSubmit = () => expect(p.submit("#pf", "#in")).toBe(false);
+		p.submit("#pf", "#in");
+		await settle();
+		expect(p.calls).toEqual([posted]);
+	});
+
+	test("a refusal after the post ran is a real load of where it went, never a second post", async () => {
+		const p = open({
+			html: page({ main: login }),
+			routes: { "POST /login": () => control({ "natsu-reload": "response" }) },
+		});
+		const natives: unknown[] = [];
+		p.document.getElementById("pf").requestSubmit = () => natives.push(1);
+		p.submit("#pf", "#in");
+		await settle();
+		expect(natives).toEqual([]);
+		expect(p.calls).toEqual([posted]);
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/login`]]);
+	});
+
+	test("left to the browser: text/plain, another origin, a target, data-natsu-reload", () => {
+		const p = open({
+			html: page({
+				main:
+					`<form id="t" method="post" action="/login" enctype="text/plain"></form>` +
+					`<form id="o" method="post" action="https://elsewhere.test/login"></form>` +
+					`<form id="w" method="post" action="/login" target="_blank"></form>` +
+					`<form id="r" method="post" action="/login" data-natsu-reload></form>`,
+			}),
+		});
+		expect(["#t", "#o", "#w", "#r"].map((f) => p.submit(f))).toEqual([false, false, false, false]);
+		expect(p.calls).toEqual([]);
+	});
+});
+
 describe("actions", () => {
 	const form = `<form id="f" method="post" data-uwu-action="add" data-uwu-event="submit" data-list="7"><input type="hidden" name="_action" value="add"><input type="hidden" name="_csrf" value="T0KEN"><input name="title" value="milk"><button id="go">Add</button></form>`;
 	const button = `<button id="done" data-uwu-action="done" data-uwu-event="click" data-todo-id="3">Done</button>`;
@@ -3138,10 +3233,11 @@ describe("live data", () => {
 
 describe("size", () => {
 	// 5 KiB until the loading bar, prefetch in view and the Back/Forward cache
-	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes).
+	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes);
+	// 5.6 KiB until POST forms (about 200 bytes).
 	// Raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, live islands, the loading bar and prefetch in view included, stays within 5.6 KiB of brotli", () => {
+	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view and POST forms included, stays within 5.85 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(5734);
+		expect(br).toBeLessThanOrEqual(5990);
 	});
 });

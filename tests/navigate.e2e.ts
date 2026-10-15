@@ -488,7 +488,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("a GET form swaps softly; a POST, a data-natsu-reload link and a redirect to another origin load for real", async () => {
+	e2e("a GET form swaps softly; a POST no route ran, a data-natsu-reload link and a redirect to another origin load for real", async () => {
 		const page = await open("/a");
 		let from = fixture.seen.length;
 		await page.click("#hard");
@@ -504,13 +504,16 @@ describe("page switching in Chromium, against a natsu app", () => {
 		expect(asked(from, "/catalog?q=mecha")).toEqual([["part", "fetch"]]);
 		expect(await loads(page)).toBe(2);
 
-		// A POST is the browser's own: the product's form goes to /cart, which has no route.
+		// The product's form posts to /cart, which has no route: the runtime's post is refused unrun, and the browser posts it once.
 		await page.click("#to-p1");
 		await title(page, "Product 1");
 		from = fixture.seen.length;
 		await page.click("main form button");
 		await page.waitForFunction(() => location.pathname === "/cart" && (window as any).__loads === 3);
-		expect(fixture.seen.slice(from).filter((s) => s.path === "/cart").map((s) => [s.mode, s.nav, s.status])).toEqual([["navigate", null, 404]]);
+		expect(fixture.seen.slice(from).filter((s) => s.path === "/cart").map((s) => [s.mode, !!s.nav, s.status])).toEqual([
+			["cors", true, 204],
+			["navigate", false, 404],
+		]);
 
 		// A redirect to another origin (localhost is not 127.0.0.1) is told to the runtime, which leaves.
 		await page.goto(`${ORIGIN}/a`);
