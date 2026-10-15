@@ -379,7 +379,7 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 		const out = response.headersInitialized ? response.headers : new Headers();
 		entry.status = response.status;
 		entry.answer = out.get("natsu-part")
-			? "part"
+			? out.get("natsu-part") === "body" ? "body" : "part"
 			: out.get("natsu-reload")
 				? `reload ${out.get("natsu-reload")}`
 				: out.get("natsu-location")

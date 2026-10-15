@@ -2912,6 +2912,62 @@ describe("types", () => {
 	});
 });
 
+describe("another layout (a body part)", () => {
+	const admin = () =>
+		new Response(
+			`<!doctype html><html lang="en" data-layout="admin"><head><meta charset="utf-8"><title>Admin</title><link rel="stylesheet" href="/_a/site.a.css"><meta name="natsu" content="k1.s2.h1"></head>` +
+				`<body class="admin"><nav id="side">Side <a id="to-c" href="/c">C</a></nav><main id="side-main" data-natsu-region><h1>Admin</h1></main></body></html>`,
+			{ headers: { "content-type": "text/html; charset=utf-8", "natsu-part": "body" } },
+		);
+
+	test("the whole body is swapped, its attributes and <html>'s follow, and what scripts added to the body stays", async () => {
+		const p = open({ html: page({ key: "k1.s1.h1" }), routes: { "/admin": admin } });
+		const widget = p.document.createElement("div");
+		widget.id = "widget";
+		p.document.body.append(widget);
+		await p.natsu.visit("/admin");
+		await settle();
+		expect(p.loads).toEqual([]);
+		expect(p.document.title).toBe("Admin");
+		expect(p.document.getElementById("hdr")).toBeNull();
+		expect(text(p, "#side-main h1")).toBe("Admin");
+		expect(p.document.body.className).toBe("admin");
+		expect(p.document.documentElement.getAttribute("data-layout")).toBe("admin");
+		expect(p.document.getElementById("widget")).toBe(widget);
+		expect([...p.document.body.children].indexOf(widget)).toBeGreaterThan([...p.document.body.children].indexOf(p.document.getElementById("side-main")));
+	});
+
+	test("regions an earlier visit swapped in go with the old layout too", async () => {
+		const p = open({ html: page({ key: "k1.s1.h1" }), routes: { "/b": () => answer(part()), "/admin": admin } });
+		await p.natsu.visit("/b");
+		await settle();
+		await p.natsu.visit("/admin");
+		await settle();
+		expect([...p.document.querySelectorAll("[data-natsu-region]")].map((e) => e.id)).toEqual(["side-main"]);
+		expect(p.loads).toEqual([]);
+	});
+
+	test("the next visit sends the new layout's key", async () => {
+		const p = open({ html: page({ key: "k1.s1.h1" }), routes: { "/admin": admin, "/c": () => answer(part({ title: "C", regions: `<main id="side-main" data-natsu-region><h1>C</h1></main>` })) } });
+		await p.natsu.visit("/admin");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		expect(p.calls.map((c) => c.headers["Natsu-Nav"])).toEqual(["k1.s1.h1", "k1.s2.h1"]);
+		expect(text(p, "#side-main h1")).toBe("C");
+		expect(p.loads).toEqual([]);
+	});
+
+	test("mounts on the old shell stop and run again on the new one", async () => {
+		const p = open({ html: page({ key: "k1.s1.h1" }), routes: { "/admin": admin } });
+		const seen: string[] = [];
+		p.natsu.mount("header, nav", (el) => (seen.push(`+${el.id}`), () => seen.push(`-${el.id}`)));
+		await p.natsu.visit("/admin");
+		await settle();
+		expect(seen).toEqual(["+hdr", "-hdr", "+side"]);
+	});
+});
+
 describe("POST forms", () => {
 	const login = `<form id="pf" method="post" action="/login"><input name="user" value="ann"><button id="in" name="go" value="1">in</button></form>`;
 	const posted = { url: "/login", method: "POST", headers: { "Natsu-Action": "1", "Natsu-Nav": "k1.s1" }, body: "user=ann&go=1" };
@@ -3234,10 +3290,11 @@ describe("live data", () => {
 describe("size", () => {
 	// 5 KiB until the loading bar, prefetch in view and the Back/Forward cache
 	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes);
-	// 5.6 KiB until POST forms (about 200 bytes).
+	// 5.6 KiB until POST forms (about 200 bytes); 5.85 KiB until body parts
+	// for another layout and the offline event (about 130 bytes).
 	// Raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view and POST forms included, stays within 5.85 KiB of brotli", () => {
+	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms and body parts included, stays within 6 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(5990);
+		expect(br).toBeLessThanOrEqual(6144);
 	});
 });

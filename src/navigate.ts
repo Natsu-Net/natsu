@@ -146,7 +146,7 @@ export const REGION_ATTRIBUTE = "data-natsu-region";
 export const RUNTIME_ENTRY = "natsu-navigate";
 
 /** What `Natsu-Nav` may hold: the two hashes, base 36, as the meta writes them. */
-const KEY = /^[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/;
+const KEY = /^[a-z0-9]{1,13}\.[a-z0-9]{1,13}(\.[a-z0-9]{0,13})?$/;
 
 /** Every response header a document keeps from its first load. */
 const DOCUMENT_HEADERS = [
@@ -384,6 +384,7 @@ class NavRequest implements Nav {
 		public readonly prefetch: boolean,
 		/** An action the runtime posted: it always runs (see stale()). */
 		public readonly action = false,
+		public readonly head: string | undefined = undefined,
 	) {}
 
 	/** The first decision stands: a later call cannot turn a refusal into a part. */
@@ -493,8 +494,8 @@ export class Navigation {
 		// not the runtime, and gets the page.
 		if (headers.get("sec-fetch-mode") === "navigate" || headers.get("sec-fetch-dest") === "document") return false;
 		if (!KEY.test(value)) return false;
-		const dot = value.indexOf(".");
-		const nav = new NavRequest(this, ctx, value.slice(0, dot), value.slice(dot + 1), prefetch, action);
+		const [docKey, shellKey, headKey] = value.split(".");
+		const nav = new NavRequest(this, ctx, docKey!, shellKey!, prefetch, action, headKey);
 		ctx.nav = nav;
 		if (prefetch && !this.prefetch) {
 			nav.decide({ kind: "skip", detail: "prefetches are off (navigate.prefetch: false)" });
@@ -550,13 +551,22 @@ export class Navigation {
 		const shellText = shellOf(page, scan);
 		const shell = hashOf(shellText);
 		if (development()) this.remember(shell, shellText);
-		if (shell !== nav.shell) {
-			return this.control(ctx, { kind: "reload", reason: "shell", detail: this.shellChange(nav.shell, shellText) });
-		}
-
 		const csp = header(ctx, "content-security-policy");
 		const nonces = cspNonces(csp);
-		const part = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime, csp !== null && /'strict-dynamic'/i.test(csp), this.pwa?.head);
+		const strictDynamic = csp !== null && /'strict-dynamic'/i.test(csp);
+		const head = hashOf(headOf(page, scan));
+		let whole = false;
+		let part: Part;
+		if (shell !== nav.shell) {
+			const body = nav.head === head ? bodyPartOf(page, scan, `${doc}.${shell}.${head}`, nonces, this.runtime, strictDynamic, this.pwa?.head) : undefined;
+			if (!body || "reason" in body) {
+				return this.control(ctx, { kind: "reload", reason: "shell", detail: body?.detail ?? this.shellChange(nav.shell, shellText) });
+			}
+			whole = true;
+			part = body;
+		} else {
+			part = partOf(page, scan, `${doc}.${shell}.${head}`, nonces, this.runtime, strictDynamic, this.pwa?.head);
+		}
 		if (part.scripts.length > SCRIPTS_HEADER_LIMIT) {
 			return this.control(ctx, { kind: "reload", reason: "response", detail: `the page lists more scripts than a header carries (${part.scripts.length} bytes)` });
 		}
@@ -571,7 +581,7 @@ export class Navigation {
 		this.dropDocumentHeaders(headers);
 		headers.set("content-type", "text/html; charset=utf-8");
 		headers.set("cache-control", NO_STORE);
-		headers.set("natsu-part", "1");
+		headers.set("natsu-part", whole ? "body" : "1");
 		if (part.scripts) headers.set("natsu-scripts", part.scripts);
 		if (nonces.length > 0) headers.set("natsu-nonce", nonces.join(" "));
 		addVary(headers, "Natsu-Nav");
@@ -599,7 +609,7 @@ export class Navigation {
 	public full(ctx: Context, page: string): string {
 		addVary(ctx.response.headers, "Natsu-Nav");
 		const shape = shapeOf(page, this.inject && this.runtime !== "");
-		const tags = this.tags(ctx, shape, shape.shell, shape.hash, page);
+		const tags = this.tags(ctx, shape, shape.shell, shape.hash, shape.head, page);
 		return tags ? `${page.slice(0, shape.at)}${tags}${page.slice(shape.at)}` : page;
 	}
 
@@ -623,7 +633,8 @@ export class Navigation {
 		// A secret outside the regions (a CSRF token in a header form) makes
 		// the shell this visitor's, and its hash too.
 		const shell = shape.shell === undefined ? undefined : filled.fill(shape.shell);
-		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), page);
+		const headText = filled.fill(shape.headText);
+		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), headText === shape.headText ? shape.head : hashOf(headText), page);
 		if (!tags) return transform ? transform(page) : page;
 		const before = transform ? transform(shape.before!) : shape.before!;
 		const after = transform ? transform(shape.after!) : shape.after!;
@@ -631,14 +642,14 @@ export class Navigation {
 	}
 
 	/** The key and the runtime for a page of this shape; "" for none. */
-	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string, page: string): string {
+	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string, head: string, page: string): string {
 		if (shape.refusal && development()) this.warnOnce(ctx, `no soft navigation from this page (${shape.refusal.reason}: ${shape.refusal.detail})`);
 		if (shape.at === -1) return "";
 		const csp = header(ctx, "content-security-policy");
 		let tags = "";
 		if (shell !== undefined) {
 			if (development()) this.remember(hash, shell);
-			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}"${this.keyAttributes}>`;
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}.${head}"${this.keyAttributes}>`;
 		}
 		if (this.inject && this.runtime) {
 			const nonce = scriptNonce(csp);
@@ -763,6 +774,8 @@ interface Shape {
 	/** The shell, for a page that gets a key, and its hash. */
 	shell: string | undefined;
 	hash: string;
+	headText: string;
+	head: string;
 	/** Why a page with a region gets no key (development says so, once per path). */
 	refusal: { reason: string; detail: string } | undefined;
 	/** A kept page either side of `at` (see `fullFilled`). */
@@ -779,10 +792,11 @@ function shapeOf(page: string, runtime: boolean): Shape {
 	if (scan === null || "reason" in scan) {
 		const refusal = scan ?? undefined;
 		const at = runtime && refusal?.reason !== "response" ? runtimeAt(page) : -1;
-		return { at, shell: undefined, hash: "", refusal };
+		return { at, shell: undefined, hash: "", headText: "", head: "", refusal };
 	}
 	const shell = shellOf(page, scan);
-	return { at: scan.deferred !== -1 ? scan.deferred : scan.head[2], shell, hash: hashOf(shell), refusal: undefined };
+	const headText = headOf(page, scan);
+	return { at: scan.deferred !== -1 ? scan.deferred : scan.head[2], shell, hash: hashOf(shell), headText, head: hashOf(headText), refusal: undefined };
 }
 
 /**
@@ -948,6 +962,16 @@ export function scanPage(html: string): PageScan | PageRefusal | null {
  * list, with each region's id where it sits, nonces taken out. A different
  * text is a different shell.
  */
+export function headOf(html: string, scan: PageScan): string {
+	const [, headStart, headClose] = scan.head;
+	const pieces: string[] = [];
+	for (let i = firstAtOrAfter(scan.raw, headStart); i < scan.raw.length && scan.raw[i]! < headClose; i += 2) {
+		const at = scan.raw[i]!;
+		if (isScriptAt(html, at) && !html.startsWith(LAZY_LOADER_HEAD, tagEnd(html, at + 7))) pieces.push(html.slice(at, scan.raw[i + 1]!));
+	}
+	return pieces.join("").replace(NONCE_ATTRIBUTE, "");
+}
+
 export function shellOf(html: string, scan: PageScan): string {
 	const pieces: string[] = [];
 	const [headOpen, headStart, headClose, headEnd] = scan.head;
@@ -1018,6 +1042,86 @@ export function partOf(
 	strictDynamic = true,
 	extraHead = "",
 ): Part {
+	const head = partHead(html, scan, nonces);
+	const raw = scan.raw;
+	let regions = "";
+	for (const region of scan.regions) regions += withoutNoscript(html, raw, region.start, region.end);
+	return {
+		html: `<!doctype html><html><head>${head}${extraHead}<meta name="natsu" content="${key}"></head><body>${regions}</body></html>`,
+		scripts: partScripts(scan, nonces, runtime, strictDynamic),
+	};
+}
+
+export function bodyPartOf(
+	html: string,
+	scan: PageScan,
+	key: string,
+	nonces: readonly string[],
+	runtime = "",
+	strictDynamic = true,
+	extraHead = "",
+): Part | { reason: "shell"; detail: string } {
+	const raw = scan.raw;
+	const headEnd = scan.head[3];
+	const before = html.slice(0, scan.head[0]);
+	const htmlAt = before.search(/<html[\s>]/i);
+	const htmlTag = htmlAt === -1 ? null : readTag(html, htmlAt);
+	const bodyAt = html.slice(headEnd).search(/<body[\s>]/i);
+	const bodyStart = headEnd + bodyAt;
+	const bodyTag = bodyAt === -1 ? null : readTag(html, bodyStart);
+	if (!bodyTag) return { reason: "shell", detail: "the page has no <body> tag to swap" };
+	const closeAt = html.toLowerCase().lastIndexOf("</body");
+	const end = closeAt === -1 || closeAt < bodyTag.end ? html.length : closeAt;
+	for (let i = firstAtOrAfter(raw, bodyTag.end); i < raw.length && raw[i]! < end; i += 2) {
+		if (!isScriptAt(html, raw[i]!)) continue;
+		const script = readTag(html, raw[i]!);
+		if (script && runs(script) && script.get("src") === undefined) {
+			return { reason: "shell", detail: "the new layout's shell holds an inline script, which does not run when swapped in" };
+		}
+	}
+	let body = "";
+	let from = bodyTag.end;
+	for (const tag of scan.scripts) {
+		if (tag.start < from || tag.start >= end) continue;
+		body += withoutNoscript(html, raw, from, tag.start);
+		from = tag.end;
+	}
+	body += withoutNoscript(html, raw, from, end);
+	const attrs = (at: number, tag: Tag | null) => (tag ? html.slice(at + tag.name.length + 1, tag.end - 1).replace(/\/$/, "") : "");
+	return {
+		html: `<!doctype html><html${attrs(htmlAt, htmlTag)}><head>${partHead(html, scan, nonces)}${extraHead}<meta name="natsu" content="${key}"></head><body${attrs(bodyStart, bodyTag)}>${body}</body></html>`,
+		scripts: partScripts(scan, nonces, runtime, strictDynamic),
+	};
+}
+
+function withoutNoscript(html: string, raw: number[], start: number, end: number): string {
+	let out = "";
+	let at = start;
+	for (let i = firstAtOrAfter(raw, at); i < raw.length && raw[i]! < end; i += 2) {
+		if (!isNoscriptAt(html, raw[i]!)) continue;
+		out += html.slice(at, raw[i]);
+		at = Math.min(raw[i + 1]!, end);
+	}
+	return out + html.slice(at, end);
+}
+
+function partScripts(scan: PageScan, nonces: readonly string[], runtime: string, strictDynamic: boolean): string {
+	const scripts: string[] = [];
+	for (const tag of scan.scripts) {
+		if (runtime && tag.src === runtime) continue;
+		const vouched = tag.nonce !== undefined && nonces.includes(tag.nonce);
+		if (nonces.length > 0 && !vouched && strictDynamic) continue;
+		const attributes = new URLSearchParams();
+		for (const attribute of tag.attributes) {
+			if (attribute.name !== "nonce") attributes.append(attribute.name, decodeEntities(attribute.value));
+		}
+		if (vouched && nonces.length > 0) attributes.append("nonce", "");
+		scripts.push(attributes.toString());
+	}
+	return scripts.join(" ");
+}
+
+function partHead(html: string, scan: PageScan, nonces: readonly string[]): string {
 	const [, headStart, headClose] = scan.head;
 	const raw = scan.raw;
 	let head = "";
@@ -1050,35 +1154,7 @@ export function partOf(
 		lt = html.indexOf("<", rawStart === lt ? raw[r + 1]! : tag ? tag.end : lt + 1);
 	}
 	head += html.slice(from, headClose);
-	// A <noscript> goes too: the runtime parses with scripting off, which reads
-	// its content as markup (a `</div>` in it would close the region's own),
-	// and with scripting on a browser never shows it anyway.
-	let regions = "";
-	for (const region of scan.regions) {
-		let at = region.start;
-		for (let i = firstAtOrAfter(raw, at); i < raw.length && raw[i]! < region.end; i += 2) {
-			if (!isNoscriptAt(html, raw[i]!)) continue;
-			regions += html.slice(at, raw[i]);
-			at = Math.min(raw[i + 1]!, region.end);
-		}
-		regions += html.slice(at, region.end);
-	}
-	const scripts: string[] = [];
-	for (const tag of scan.scripts) {
-		if (runtime && tag.src === runtime) continue;
-		const vouched = tag.nonce !== undefined && nonces.includes(tag.nonce);
-		if (nonces.length > 0 && !vouched && strictDynamic) continue;
-		const attributes = new URLSearchParams();
-		for (const attribute of tag.attributes) {
-			if (attribute.name !== "nonce") attributes.append(attribute.name, decodeEntities(attribute.value));
-		}
-		if (vouched && nonces.length > 0) attributes.append("nonce", "");
-		scripts.push(attributes.toString());
-	}
-	return {
-		html: `<!doctype html><html><head>${head}${extraHead}<meta name="natsu" content="${key}"></head><body>${regions}</body></html>`,
-		scripts: scripts.join(" "),
-	};
+	return head;
 }
 
 /** Every nonce a CSP header allows, in order. */
