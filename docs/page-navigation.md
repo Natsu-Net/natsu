@@ -60,7 +60,7 @@ That is all. Every page now goes out with the runtime's
 with a region with `<meta name="natsu" content="…">` next to it.
 
 A visit starts from a plain left click on a link to your site, or from the
-submit of a GET form. The browser keeps the rest, as it would without
+submit of a form, GET or POST. The browser keeps the rest, as it would without
 natsu: a click with Ctrl, Shift, Meta or Alt (on a submit button too, which
 opens the result in a new tab or window), a link or form with a target
 other than `_self` (its own, or the page's first `<base target>`), `download`, a
@@ -70,6 +70,23 @@ form's URL and query are built as the browser builds them: no action is
 the page's own URL (never the `<base href>`), no field to send is
 `action?`, a file goes as its name and a line break as CRLF. Scroll comes back on Back, Forward and a reload, and
 every scroll the runtime makes is a jump, whatever `scroll-behavior` says.
+
+## POST forms
+
+The runtime posts a same-site POST form itself, with `Natsu-Action: 1` and
+the page's key, so its answer is handled as a visit's: a redirect is a visit
+of where it points (a new entry; the same page keeps its entry, scroll and
+focus), and a page answered at once (a refused form, `422`) is swapped in
+with what the visitor typed put back. A multipart form goes as multipart,
+any other as `application/x-www-form-urlencoded`; `text/plain` is left to
+the browser.
+
+A route that is not `navigable()`, or a path with no route, is refused
+before its handler runs, and the answer says so with `Natsu-Unrun: 1`: the
+runtime then lets the browser post the form itself, submitter and all, so a
+post is never lost and never runs twice. A refusal after the handler ran (it
+answered JSON, or a page in another shell) loads the post's URL for real
+with a GET; answer a post with a redirect (`303`) to keep it soft.
 
 ## Page scripts
 
