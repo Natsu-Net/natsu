@@ -25,6 +25,7 @@ import { brotliCompressSync, constants } from "node:zlib";
 import { Window } from "happy-dom";
 import HistoryItemList from "happy-dom/lib/history/HistoryItemList.js";
 import type { NatsuClient, NatsuLoadDetail, NatsuVisitOptions } from "../src/client/types.ts";
+import { scriptId } from "../src/navigate.ts";
 
 // happy-dom's replaceState drops the entries after the current one; a
 // browser keeps them, and back/forward tests need them.
@@ -1237,6 +1238,34 @@ describe("mounts and scripts", () => {
 		await settle();
 		expect(q.loads).toEqual([]);
 		expect(path(q)).toBe("/b");
+	});
+
+	test("a script the key does not name was injected on the way (a CDN's beacon): it never holds swaps back", async () => {
+		const listed = (ids: string[]) =>
+			page({ scripts: ["/beacon.min.js/v1"] }).replace(`<meta name="natsu" content="k1.s1">`, `<meta name="natsu" content="k1.s1" data-scripts="${ids.map(scriptId).join(" ")}">`);
+		const p = open({ html: listed(["s/_a/natsu.js"]), routes: { "/b": () => answer(part()) } });
+		p.click("#to-b");
+		await settle();
+		expect(p.loads).toEqual([]);
+		expect(path(p)).toBe("/b");
+
+		const q = open({ html: listed(["s/_a/natsu.js", "s/beacon.min.js/v1"]), routes: { "/b": () => answer(part()) } });
+		q.click("#to-b");
+		await settle();
+		expect(q.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+	});
+
+	test("with the key naming the page's scripts, one a loader adds after boot still counts", async () => {
+		const p = open({
+			html: page().replace(`<meta name="natsu" content="k1.s1">`, `<meta name="natsu" content="k1.s1" data-scripts="${scriptId("s/_a/natsu.js")}">`),
+			routes: { "/b": () => answer(part()) },
+		});
+		const s = p.document.createElement("script");
+		s.textContent = "window.late = 1;";
+		p.document.body.append(s);
+		p.click("#to-b");
+		await settle();
+		expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
 	});
 
 	test("a script a loader added after boot counts too, from the next visit on; tagged data-natsu-once, it does not", async () => {
@@ -3291,10 +3320,11 @@ describe("size", () => {
 	// 5 KiB until the loading bar, prefetch in view and the Back/Forward cache
 	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes);
 	// 5.6 KiB until POST forms (about 200 bytes); 5.85 KiB until body parts
-	// for another layout and the offline event (about 130 bytes).
+	// for another layout and the offline event (about 130 bytes); 6 KiB until
+	// scripts an edge injected are told apart (about 115 bytes).
 	// Raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms and body parts included, stays within 6 KiB of brotli", () => {
+	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms, body parts and edge scripts included, stays within 6.15 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(6144);
+		expect(br).toBeLessThanOrEqual(6300);
 	});
 });

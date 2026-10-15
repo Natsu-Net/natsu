@@ -133,6 +133,11 @@ natsu.mount("[data-clock]", (el, signal) => {
   `defer` or `async`, which runs once per document like the shell. A
   script already on the page, one a loader added included, never runs
   twice.
+- A script a CDN or proxy put into the page on its way out (Cloudflare's
+  Web Analytics beacon, say) is left out: the key lists every script the
+  server wrote (`data-scripts`, a short hash of each `src` or inline text),
+  and a script on the page at load that is not on that list never holds
+  swaps back. One that page code adds later still counts.
 - Scripts inside a region do not run when the region is swapped in, so a
   page with one is a full load: move it after the region. Data blocks
   (`type="application/json"`, JSON-LD) are fine.

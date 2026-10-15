@@ -20,7 +20,7 @@ import { setConfig } from "../src/config.ts";
 import type { Context, Handler } from "../src/context.ts";
 import { setLogLevel, setLogSink } from "../src/logger.ts";
 import { Controller } from "../src/controller.ts";
-import { inertNav, island, navigable, partOf, scanPage, shellOf } from "../src/navigate.ts";
+import { inertNav, island, navigable, partOf, scanPage, scriptId, shellOf } from "../src/navigate.ts";
 import { verifyTags } from "../src/invalidate.ts";
 import { PageCache } from "../src/page-cache.ts";
 import { Get, Island, Navigable, Router } from "../src/router.ts";
@@ -102,6 +102,7 @@ function get(app: Application, path: string, headers: Record<string, string> = {
 
 const metaKey = (html: string): string => /<meta name="natsu" content="([^"]+)"/.exec(html)?.[1] ?? "";
 const headless = (key: string): string => key.split(".").slice(0, 2).join(".");
+const scriptsAttr = (html: string): string => / data-scripts="([^"]*)"/.exec(html)?.[1] ?? "";
 const stylesheet = (html: string): string => /<link rel="stylesheet" href="([^"]+)"/.exec(html)?.[1] ?? "";
 
 /** The key a visitor's runtime would send from `path`. */
@@ -1149,7 +1150,7 @@ describe("delivery", () => {
 		const nonce = /'nonce-([^']+)'/.exec(answer.headers.get("content-security-policy") ?? "")?.[1];
 		const runtime = assets.url("natsu-navigate");
 		expect(runtime).toMatch(/^\/_a\/natsu-navigate\.[0-9a-f]{10}\.js$/);
-		const tags = `<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script>`;
+		const tags = `<meta name="natsu" content="${metaKey(html)}" data-scripts="${scriptsAttr(html)}"><script src="${runtime}" nonce="${nonce}" defer></script>`;
 		// An inline script runs where it stands, before any deferred one.
 		expect(html).toContain(`<script nonce="${nonce}">window.boot = 1;</script>${tags}</head>`);
 		expect(metaKey(html)).toMatch(/^[a-z0-9]{1,13}\.[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/);
@@ -1184,11 +1185,19 @@ describe("delivery", () => {
 		expect(await (await get(app, "/headless")).text()).toBe("<p>a fragment</p>");
 	});
 
+	test("the key names every script the page was written with, so the runtime can tell one an edge injected", async () => {
+		new Router().get("/p", navigable((ctx) => (csp(ctx, "n0"), page({ nonce: "n0" }))));
+		const { app } = await pipeline();
+		const html = await (await get(app, "/p")).text();
+		expect(scriptsAttr(html)).toBe([scriptId("iwindow.boot = 1;"), scriptId("s/assets/site.js")].join(" "));
+		expect(scriptId("s/beacon.min.js")).not.toBe(scriptId("s/assets/site.js"));
+	});
+
 	test("with prefetches off the key says so, so the runtime never sends one", async () => {
 		route("/p");
 		const { app } = await pipeline({ navigate: { prefetch: false } });
 		const html = await (await get(app, "/p")).text();
-		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}" data-prefetch="off">`);
+		expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}" data-prefetch="off" data-scripts="${scriptsAttr(html)}">`);
 	});
 
 	test("prefetch: viewport or none, and transition: true, are said on the key; the server still answers prefetches", async () => {
@@ -1201,7 +1210,7 @@ describe("delivery", () => {
 		] as const) {
 			const { app } = await pipeline({ navigate });
 			const html = await (await get(app, "/p")).text();
-			expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"${attributes}>`);
+			expect(html).toContain(`<meta name="natsu" content="${metaKey(html)}"${attributes} data-scripts="${scriptsAttr(html)}">`);
 			calls.count = 0;
 			const prefetch = await nav(app, "/p", metaKey(html), { "natsu-prefetch": "1" });
 			expect([navigate, prefetch.headers.get("natsu-part"), calls.count]).toEqual([navigate, "1", 1]);
@@ -1222,8 +1231,8 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		// 6 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(6144);
+		// 6.15 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(6300);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {

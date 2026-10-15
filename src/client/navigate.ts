@@ -249,6 +249,13 @@ const me = D.currentScript as HTMLScriptElement | null;
 const NONCE = me?.nonce as string;
 const META = D.querySelector<HTMLMetaElement>('meta[name="natsu"]');
 let KEY = META?.content;
+const known = META?.dataset.scripts?.split(" ");
+const fnv = (k: string) => {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < k.length; i++) h = Math.imul(h ^ k.charCodeAt(i), 16777619);
+	return (h >>> 0).toString(36);
+};
+const foreign = new Set(known ? [...D.scripts].filter((s) => !known.includes(fnv(s.hasAttribute("src") ? "s" + s.getAttribute("src") : "i" + s.text))) : []);
 const OFF = /^(false|off|none)$/;
 const REGION = "[data-natsu-region][id]";
 const LOADING = "data-natsu-loading";
@@ -404,6 +411,7 @@ const runs = (s: HTMLScriptElement) => /script|^(module)?$/i.test(s.type.trim())
 const counts = (s: HTMLScriptElement) =>
 	runs(s) &&
 	!aware.has(s) &&
+	!foreign.has(s) &&
 	!s.hasAttribute("data-natsu-once") &&
 	!(s.parentNode == D.head && !/module/i.test(s.type) && !(s.src && (s.defer || s.async)));
 /**
