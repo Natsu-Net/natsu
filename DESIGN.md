@@ -1,7 +1,8 @@
 # natsu v2 — Bun rework design
 
-Status: design + validated prototype (`prototype/`). Companion document:
-`DESIGN.md` in [beingsuz/uwu-template](https://github.com/beingsuz/uwu-template),
+Status: shipped at the repo root; v1 (Deno) and the Bun prototype live on the
+`v1` branch. Companion document: `DESIGN.md` in
+[Natsu-Net/uwu-template](https://github.com/Natsu-Net/uwu-template),
 which covers the template engine and hydration half.
 
 ## Goal
@@ -145,7 +146,7 @@ That is all an app writes on the server. `src/navigate.ts` holds the rest; it
 runs inside `Assets.middleware()`, which is what makes the order right with no
 rule to follow: after the asset rewrite, so a part links its whole page's CSS
 chunk, and inside `compress()`, which still sees a string. How to turn it on
-and what to change in an app: `v2/docs/page-navigation.md`.
+and what to change in an app: `docs/page-navigation.md`.
 
 **Every page with a head** gets the runtime's `<script src nonce defer>`
 before the head's first deferred script (one with a `src`, or a module), or
@@ -355,7 +356,7 @@ times of a full load against a soft visit.
 | State scope | `session` | The safe default if a field is marked by accident |
 | Transport | WebSocket only (SSE later) | Two-way from the start; SSE cannot carry actions |
 | Router API | Keep `"Controller@method"`, add `@Get`/`@Post` decorators | Existing apps port unchanged |
-| Versioning | v2 on a branch | v1 keeps working for anyone on Deno |
+| Versioning | v2 on `main`, v1 on the `v1` branch | v1 keeps working for anyone on Deno |
 | Repo layout | natsu depends on uwu-template via npm | uwu-template ships independently |
 
 ## Staged plan
