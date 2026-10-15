@@ -609,7 +609,7 @@ export class Navigation {
 	public full(ctx: Context, page: string): string {
 		addVary(ctx.response.headers, "Natsu-Nav");
 		const shape = shapeOf(page, this.inject && this.runtime !== "");
-		const tags = this.tags(ctx, shape, shape.shell, shape.hash, shape.head, page);
+		const tags = this.tags(ctx, shape, shape.shell, shape.hash, shape.head, shape.scriptKeys.map(scriptId).join(" "), page);
 		return tags ? `${page.slice(0, shape.at)}${tags}${page.slice(shape.at)}` : page;
 	}
 
@@ -634,7 +634,8 @@ export class Navigation {
 		// the shell this visitor's, and its hash too.
 		const shell = shape.shell === undefined ? undefined : filled.fill(shape.shell);
 		const headText = filled.fill(shape.headText);
-		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), headText === shape.headText ? shape.head : hashOf(headText), page);
+		const ids = shape.scriptKeys.map((key) => scriptId(filled.fill(key))).join(" ");
+		const tags = this.tags(ctx, shape, shell, shell === shape.shell ? shape.hash : hashOf(shell!), headText === shape.headText ? shape.head : hashOf(headText), ids, page);
 		if (!tags) return transform ? transform(page) : page;
 		const before = transform ? transform(shape.before!) : shape.before!;
 		const after = transform ? transform(shape.after!) : shape.after!;
@@ -642,14 +643,14 @@ export class Navigation {
 	}
 
 	/** The key and the runtime for a page of this shape; "" for none. */
-	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string, head: string, page: string): string {
+	private tags(ctx: Context, shape: Shape, shell: string | undefined, hash: string, head: string, ids: string, page: string): string {
 		if (shape.refusal && development()) this.warnOnce(ctx, `no soft navigation from this page (${shape.refusal.reason}: ${shape.refusal.detail})`);
 		if (shape.at === -1) return "";
 		const csp = header(ctx, "content-security-policy");
 		let tags = "";
 		if (shell !== undefined) {
 			if (development()) this.remember(hash, shell);
-			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}.${head}"${this.keyAttributes}>`;
+			tags = `<meta name="natsu" content="${this.docHash((name) => header(ctx, name))}.${hash}.${head}"${this.keyAttributes} data-scripts="${ids}">`;
 		}
 		if (this.inject && this.runtime) {
 			const nonce = scriptNonce(csp);
@@ -776,6 +777,7 @@ interface Shape {
 	hash: string;
 	headText: string;
 	head: string;
+	scriptKeys: string[];
 	/** Why a page with a region gets no key (development says so, once per path). */
 	refusal: { reason: string; detail: string } | undefined;
 	/** A kept page either side of `at` (see `fullFilled`). */
@@ -792,11 +794,19 @@ function shapeOf(page: string, runtime: boolean): Shape {
 	if (scan === null || "reason" in scan) {
 		const refusal = scan ?? undefined;
 		const at = runtime && refusal?.reason !== "response" ? runtimeAt(page) : -1;
-		return { at, shell: undefined, hash: "", headText: "", head: "", refusal };
+		return { at, shell: undefined, hash: "", headText: "", head: "", scriptKeys: [], refusal };
 	}
 	const shell = shellOf(page, scan);
 	const headText = headOf(page, scan);
-	return { at: scan.deferred !== -1 ? scan.deferred : scan.head[2], shell, hash: hashOf(shell), headText, head: hashOf(headText), refusal: undefined };
+	return {
+		at: scan.deferred !== -1 ? scan.deferred : scan.head[2],
+		shell,
+		hash: hashOf(shell),
+		headText,
+		head: hashOf(headText),
+		scriptKeys: scriptKeys(page, scan.raw),
+		refusal: undefined,
+	};
 }
 
 /**
@@ -1726,6 +1736,28 @@ function isLetter(code: number): boolean {
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
 
 /** An attribute value as the browser reads it: the character references a template writes, decoded. */
+function scriptKeys(html: string, raw: number[]): string[] {
+	const keys: string[] = [];
+	for (let i = 0; i < raw.length; i += 2) {
+		const at = raw[i]!;
+		if (!isScriptAt(html, at)) continue;
+		const tag = readTag(html, at);
+		if (!tag) continue;
+		const src = tag.get("src");
+		keys.push(src !== undefined ? `s${decodeEntities(src)}` : `i${html.slice(tag.end, html.lastIndexOf("<", raw[i + 1]! - 1)).replace(/\r\n?/g, "\n")}`);
+	}
+	return keys;
+}
+
+export function scriptId(key: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < key.length; i++) {
+		h ^= key.charCodeAt(i);
+		h = Math.imul(h, 16777619);
+	}
+	return (h >>> 0).toString(36);
+}
+
 function decodeEntities(value: string): string {
 	if (value.indexOf("&") === -1) return value;
 	return value.replace(/&(?:#(\d+)|#x([\da-f]+)|(amp|lt|gt|quot|apos));?/gi, (match, dec?: string, hex?: string, name?: string) => {
