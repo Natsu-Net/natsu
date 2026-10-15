@@ -101,6 +101,7 @@ function get(app: Application, path: string, headers: Record<string, string> = {
 }
 
 const metaKey = (html: string): string => /<meta name="natsu" content="([^"]+)"/.exec(html)?.[1] ?? "";
+const headless = (key: string): string => key.split(".").slice(0, 2).join(".");
 const stylesheet = (html: string): string => /<link rel="stylesheet" href="([^"]+)"/.exec(html)?.[1] ?? "";
 
 /** The key a visitor's runtime would send from `path`. */
@@ -867,9 +868,40 @@ describe("the key", () => {
 		const { app } = await pipeline();
 		const key = await keyOf(app, "/p");
 		variant = { header: "changed" };
+		expect((await nav(app, "/p", headless(key))).headers.get("natsu-reload")).toBe("shell");
+		expect((await nav(app, "/p", key)).headers.get("natsu-part")).toBe("body");
+		variant = { header: "changed", head: "<script>window.theme = 1;</script>" };
 		expect((await nav(app, "/p", key)).headers.get("natsu-reload")).toBe("shell");
 		policy = " https://ads.test";
 		expect((await nav(app, "/p", key)).headers.get("natsu-reload")).toBe("document");
+	});
+
+	test("another layout with the same head scripts is a body part: the whole body, its attributes and the key of that layout", async () => {
+		const layout = (shell: string, body = "") =>
+			`<!doctype html><html lang="en" data-layout="${shell}"><head><meta charset="utf-8"><title>${shell}</title><script nonce="n0">window.boot = 1;</script></head>` +
+			`<body${body}><aside>${shell} menu<noscript><p>enable js</p></noscript></aside><main id="main" data-natsu-region><h1>${shell}</h1></main>` +
+			`<script src="/assets/${shell}.js" nonce="n0" defer></script></body></html>`;
+		new Router().get("/site", navigable((ctx) => (csp(ctx, "n0"), layout("site"))));
+		new Router().get("/admin", navigable((ctx) => (csp(ctx, "n0"), layout("admin", ' class="admin"'))));
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/site");
+		const answer = await nav(app, "/admin", key);
+		expect(answer.status).toBe(200);
+		expect(answer.headers.get("natsu-part")).toBe("body");
+		expect(answer.headers.get("natsu-scripts")).toBe("src=%2Fassets%2Fadmin.js&defer=&nonce=");
+		const html = await answer.text();
+		expect(html).toContain('<html lang="en" data-layout="admin">');
+		expect(html).toContain('<body class="admin"><aside>admin menu</aside><main id="main" data-natsu-region><h1>admin</h1></main></body>');
+		expect(html).not.toContain("<script");
+		expect(metaKey(html)).toBe(await keyOf(app, "/admin"));
+	});
+
+	test("a new layout whose shell runs an inline script is a full load: a swap would never run it", async () => {
+		new Router().get("/site", navigable((ctx) => (csp(ctx, "n0"), page({ header: "Site" }))));
+		new Router().get("/admin", navigable((ctx) => (csp(ctx, "n0"), page({ header: "Admin", scripts: '<script nonce="n0">window.admin = 1;</script>' }))));
+		const { app } = await pipeline();
+		const answer = await nav(app, "/admin", await keyOf(app, "/site"));
+		expect(answer.headers.get("natsu-reload")).toBe("shell");
 	});
 
 	test("a different script in the head is a different shell: it would never run after a swap", async () => {
@@ -1009,11 +1041,11 @@ describe("answers", () => {
 		expect(cookies(part)).toEqual(["seen", "flash"]);
 
 		shellText = "Changed";
-		const refused = await nav(app, "/p", key);
+		const refused = await nav(app, "/p", headless(key));
 		expect(refused.headers.get("natsu-reload")).toBe("shell");
 		expect(cookies(refused)).toEqual(["seen"]);
 
-		const prefetch = await nav(app, "/p", key, { "natsu-prefetch": "1" });
+		const prefetch = await nav(app, "/p", headless(key), { "natsu-prefetch": "1" });
 		expect(cookies(prefetch)).toEqual(["seen"]);
 	});
 
@@ -1120,7 +1152,7 @@ describe("delivery", () => {
 		const tags = `<meta name="natsu" content="${metaKey(html)}"><script src="${runtime}" nonce="${nonce}" defer></script>`;
 		// An inline script runs where it stands, before any deferred one.
 		expect(html).toContain(`<script nonce="${nonce}">window.boot = 1;</script>${tags}</head>`);
-		expect(metaKey(html)).toMatch(/^[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/);
+		expect(metaKey(html)).toMatch(/^[a-z0-9]{1,13}\.[a-z0-9]{1,13}\.[a-z0-9]{1,13}$/);
 		// First among the deferred ones, so a page script deferred like it runs after it and finds `natsu`.
 		const deferred = await (await get(app, "/deferred")).text();
 		expect(deferred.indexOf(runtime)).toBeLessThan(deferred.indexOf('<script src="/assets/head.js" defer>'));
@@ -1190,8 +1222,8 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		// 5.85 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5990);
+		// 6 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(6144);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {
@@ -1324,9 +1356,13 @@ describe("delivery", () => {
 		// The region's data block carries Bob's own nonce (the part itself carries no CSP).
 		expect(bobPart).toContain(`nonce="${lastNonce}"`);
 
-		// Alice's key does not open Bob's shell.
+		// Alice's key does not open Bob's shell as a part: it is a whole body, drawn for Bob.
+		expect((await nav(app, "/two", headless(alice), as("bob-token"))).headers.get("natsu-reload")).toBe("shell");
 		const crossed = await nav(app, "/two", alice, as("bob-token"));
-		expect(crossed.headers.get("natsu-reload")).toBe("shell");
+		expect(crossed.headers.get("natsu-part")).toBe("body");
+		const crossedBody = await crossed.text();
+		expect(crossedBody).toContain("bob-token");
+		expect(crossedBody).not.toContain("alice-token");
 	});
 
 	test("with lazy styles the stylesheet link names its later half for the runtime", async () => {
@@ -1517,7 +1553,7 @@ describe("development", () => {
 			const { app } = await pipeline();
 			const key = await keyOf(app, "/p");
 			banner = " — maintenance at noon";
-			await nav(app, "/p", key);
+			await nav(app, "/p", headless(key));
 			const line = lines.find((l) => l.includes("full load (shell)")) ?? "";
 			expect(line).toContain("GET /p");
 			expect(line).toContain("maintenance at noon");
