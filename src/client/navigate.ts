@@ -79,6 +79,8 @@
  * `Natsu-Nav: <doc>.<shell>` (and `Natsu-Prefetch: 1` for a hover). The
  * answers:
  *
+ *  - a **body part** (`Natsu-Part: body`): another layout, swapped whole
+ *    (see docs/page-navigation.md);
  *  - a **part**: the page's own status, `Natsu-Part: 1`, and a small HTML
  *    document: the page's head with no scripts, then its regions in order, with no `<noscript>`.
  *    Nothing in that markup is trusted. Its scripts come in
@@ -246,7 +248,7 @@ const me = D.currentScript as HTMLScriptElement | null;
 /** The boot nonce, for what goes in under the page's CSP (none: a runtime with no tag of its own). */
 const NONCE = me?.nonce as string;
 const META = D.querySelector<HTMLMetaElement>('meta[name="natsu"]');
-const KEY = META?.content;
+let KEY = META?.content;
 const OFF = /^(false|off|none)$/;
 const REGION = "[data-natsu-region][id]";
 const LOADING = "data-natsu-loading";
@@ -603,6 +605,11 @@ if (!first && KEY && regions(D)[0]) {
 
 	/** Head elements the server sent: the only ones a merge may remove. */
 	const owned = new Set([...D.head.children].filter((e) => !e.matches("script")));
+	let parsed = new Set<Node>(D.body.childNodes);
+	const sync = (to: Element, from: Element) => {
+		for (const { name } of [...to.attributes]) from.hasAttribute(name) || name == LOADING || to.removeAttribute(name);
+		for (const { name, value } of from.attributes) to.setAttribute(name, value);
+	};
 	// Off when the page said this document is never to be swapped again (an ad shown, say).
 	const unsafe = DEV
 		? () => {
@@ -1021,13 +1028,15 @@ if (!first && KEY && regions(D)[0]) {
 				.map((e) => new URLSearchParams(e))
 				.filter((p) => p.has("src"))
 				.map((p) => [new URL(p.get("src")!, f).href, p] as const);
+			const whole = head.get("natsu-part") == "body";
 			const now = regions(D);
 			const next = regions(doc);
+			const key = doc.querySelector<HTMLMetaElement>('meta[name="natsu"]')?.content;
 			// DOMParser reads a <noscript> with scripting off, as markup: the server
 			// drops them, and one left (in svg, say) is refused. (A declarative
 			// shadow root, which DOMParser would leave an inert <template>, the
 			// server never sends: a region with one is a real load.)
-			if (ids(now) != ids(next) || doc.querySelector("noscript")) {
+			if ((!whole && ids(now) != ids(next)) || doc.querySelector("noscript")) {
 				if (DEV)
 					why(
 						...(ids(now) != ids(next)
@@ -1124,10 +1133,21 @@ if (!first && KEY && regions(D)[0]) {
 				// Focus inside a region going out: refresh() gives it back to its namesake.
 				const was = D.activeElement;
 				const fid = now.some((el) => el.contains(was)) && was!.id;
-				now.forEach((el, i) => {
-					unmount(el);
-					el.replaceWith(next[i]!);
-				});
+				if (whole) {
+					unmount(D.body);
+					for (const n of [...D.body.childNodes]) parsed.has(n) && n.remove();
+					sync(H, doc.documentElement);
+					sync(D.body, doc.body);
+					const nodes = [...doc.body.childNodes];
+					D.body.prepend(...nodes);
+					parsed = new Set(nodes);
+					KEY = key || KEY;
+				} else
+					now.forEach((el, i) => {
+						unmount(el);
+						el.replaceWith(next[i]!);
+						parsed.delete(el) && parsed.add(next[i]!);
+					});
 				// A refused form: what the visitor typed is put back, and the first field
 				// the server marked invalid takes the focus, so its reason is read out.
 				const pick = (sel: string) => next.map((e) => e.querySelector<HTMLElement>(sel)).find((e) => e);

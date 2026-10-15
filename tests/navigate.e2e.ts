@@ -389,7 +389,8 @@ describe("page switching in Chromium, against a natsu app", () => {
 		// In the account layout, a clock's interval is stopped by its cleanup: one ticks at a time.
 		await page.click("#to-account");
 		await title(page, "Account");
-		expect(await loads(page)).toBe(2); // another layout is another shell
+		expect(await loads(page)).toBe(1); // another layout swaps the whole body
+		await page.waitForFunction(() => (window as any).__clocks === 1);
 		for (const [to, name] of [["#side-orders", "Orders"], ["#side-account", "Account"], ["#side-orders", "Orders"]] as const) {
 			await page.click(to);
 			await title(page, name);
@@ -398,7 +399,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 			await page.waitForTimeout(120);
 			expect(await page.evaluate(() => (window as any).__clocks)).toBe(1);
 		}
-		expect(await loads(page)).toBe(2);
+		expect(await loads(page)).toBe(1);
 		await page.context().close();
 	});
 
@@ -559,7 +560,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("refusals: a route not navigable, no route, another CSP or another shell are real loads; a 404 page swaps", async () => {
+	e2e("refusals: a route not navigable, no route or another CSP are real loads; another shell swaps the body; a 404 page swaps", async () => {
 		const page = await open("/a");
 
 		// Not navigable: refused before the handler, which then draws once, for the real load.
@@ -595,20 +596,23 @@ describe("page switching in Chromium, against a natsu app", () => {
 		expect(asked(from, "/ads")).toEqual([["reload document", "fetch"], ["page", "load"]]);
 		expect(fixture.calls.ads).toBe(ads + 1);
 
-		// Another shell: a banner in the header is a real load, and then it shows.
+		// Another shell: a banner in the header swaps the whole body, and then it shows.
 		await page.goto(`${ORIGIN}/a`);
 		await title(page, "A");
 		fixture.state.banner = "Maintenance at noon";
 		try {
 			from = fixture.seen.length;
 			await page.click("#to-c");
-			await page.waitForFunction(() => document.title === "C" && (window as any).__loads === 7);
+			await page.waitForFunction(() => document.title === "C");
+			expect(await loads(page)).toBe(6);
 			expect(await page.textContent("#banner")).toBe("Maintenance at noon");
-			expect(asked(from, "/c")).toEqual([["reload shell", "fetch"], ["page", "load"]]);
-			// And from there, with the banner in both shells, soft again.
+			expect(asked(from, "/c").filter((a) => a[1] !== "prefetch")).toEqual([["body", "fetch"]]);
+			// And from there, with the banner in both shells, regions only.
+			from = fixture.seen.length;
 			await page.click("#to-b");
 			await title(page, "B");
-			expect(await loads(page)).toBe(7);
+			expect(asked(from, "/b").filter((a) => a[1] !== "prefetch")).toEqual([["part", "fetch"]]);
+			expect(await loads(page)).toBe(6);
 		} finally {
 			fixture.state.banner = "";
 		}
@@ -679,10 +683,13 @@ describe("page switching in Chromium, against a natsu app", () => {
 		expect(seenByBob.html).not.toContain("natsu-secret-");
 		expect(await loads(bob)).toBe(1);
 
-		// Alice's key does not open Bob's shell: her token is in it.
+		// Alice's key does not open Bob's shell as regions: her token is in it. What Bob's request gets is Bob's whole body.
 		const aliceKey = await alice.evaluate(() => document.querySelector<HTMLMetaElement>('meta[name="natsu"]')!.content);
 		const crossed = await fetch(`${ORIGIN}/p/2`, { headers: { "natsu-nav": aliceKey, cookie: "visitor=bob" } });
-		expect([crossed.status, crossed.headers.get("natsu-reload")]).toEqual([204, "shell"]);
+		expect([crossed.status, crossed.headers.get("natsu-part")]).toEqual([200, "body"]);
+		const crossedBody = await crossed.text();
+		expect(crossedBody).toContain("tok-bob");
+		expect(crossedBody).not.toContain("tok-alice");
 		await alice.context().close();
 		await bob.context().close();
 	});
@@ -763,7 +770,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		await page.context().close();
 	});
 
-	e2e("refresh() that the server answers with a real load (the shell changed after an action) reloads the page and keeps the scroll, as location.reload() does", async () => {
+	e2e("refresh() that the server answers with a real load (the document changed after an action) reloads the page and keeps the scroll, as location.reload() does", async () => {
 		const results: unknown[] = [];
 		for (const hash of [false, true]) {
 			const page = await open("/a");
@@ -773,8 +780,9 @@ describe("page switching in Chromium, against a natsu app", () => {
 			}
 			await scrollTo(page, 1500);
 			await new Promise((r) => setTimeout(r, 300));
-			// An action signed the visitor in: the header (shell) differs, so the server answers the refresh with a real load.
+			// An action signed the visitor in and the CSP changed with it: another document, so the server answers the refresh with a real load.
 			fixture.state.banner = "Signed in";
+			fixture.state.strict = false;
 			try {
 				await page.evaluate(() => (window as any).natsu.refresh());
 				await new Promise((r) => setTimeout(r, 1500));
@@ -787,6 +795,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 				results.push({ hash, ...got });
 			} finally {
 				fixture.state.banner = "";
+				fixture.state.strict = true;
 				await page.context().close();
 			}
 		}
@@ -800,6 +809,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 		const page = await open("/a");
 		// The server answers with a real load, as it does for a page that opts out of switching.
 		fixture.state.banner = "Signed in";
+		fixture.state.strict = false;
 		try {
 			await page.evaluate(() => (window as any).natsu.visit("/a#results", { history: "replace" }));
 			await page.waitForFunction(() => (window as any).__loads === 2);
@@ -810,6 +820,7 @@ describe("page switching in Chromium, against a natsu app", () => {
 			});
 		} finally {
 			fixture.state.banner = "";
+			fixture.state.strict = true;
 			await page.context().close();
 		}
 	});

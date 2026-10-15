@@ -26,9 +26,12 @@ safe becomes an ordinary page load.
    ```
 
    Everything else in the body (the header, the menus) is the *shell*. A
-   visit swaps the regions and keeps the shell, so the shell must be the same
-   on both pages; when it is not (a signed-in header, a banner), the visit is
-   a full load.
+   visit swaps the regions and keeps the shell when it is the same on both
+   pages. When it is not (another layout, a signed-in header, a banner), the
+   visit swaps the whole body instead, with `<html>`'s and `<body>`'s
+   attributes; nodes your scripts added to the body after load stay. That
+   needs the same scripts in the head on both pages and no inline script in
+   the new shell; otherwise the visit is a full load.
 
 3. Let the routes answer navigations. A route that does not opt in answers a
    visit with a full load, and its handler never runs for it, so a GET with
@@ -357,7 +360,7 @@ says which:
 | Reason | Meaning | What to do |
 | --- | --- | --- |
 | `route` | the route is not `navigable()`, or called `ctx.nav.reload()` | wrap the handler it is registered with |
-| `shell` | the markup outside the regions differs (the log shows the first line that does) | move what differs into a region, or accept a full load there |
+| `shell` | the markup outside the regions differs and the body cannot be swapped whole: the head's scripts differ, or the new shell runs an inline script (the log shows the first line that differs) | keep head scripts alike across layouts and move inline scripts to files |
 | `document` | a deploy, or the CSP or another document header differs | expected; nothing |
 | `regions` | no region, one without an id or end tag, nested regions, a region in the head, or a declarative shadow root in a region | fix the markup |
 | `inline-script` | a region holds a script that would not run when swapped in | move it after the region |
