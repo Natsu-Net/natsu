@@ -23,13 +23,13 @@
 		"typescript": "^7.0.2"
 	},
 	"dependencies": {
-		"uwu-template": "file:../../uwu-template/packages/uwu"
+		"uwu-template": "file:../uwu-template/packages/uwu"
 	},
 	"overrides": {
-		"@uwu/assets": "file:../../uwu-template/packages/assets",
-		"@uwu/compiler": "file:../../uwu-template/packages/compiler",
-		"@uwu/runtime": "file:../../uwu-template/packages/runtime",
-		"@uwu/runtime-client": "file:../../uwu-template/packages/runtime-client",
-		"@uwu/store": "file:../../uwu-template/packages/store"
+		"@uwu/assets": "file:../uwu-template/packages/assets",
+		"@uwu/compiler": "file:../uwu-template/packages/compiler",
+		"@uwu/runtime": "file:../uwu-template/packages/runtime",
+		"@uwu/runtime-client": "file:../uwu-template/packages/runtime-client",
+		"@uwu/store": "file:../uwu-template/packages/store"
 	}
 }

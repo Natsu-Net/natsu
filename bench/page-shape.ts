@@ -14,7 +14,7 @@
  * one before a change), in the same process, taking turns, so both see the
  * same machine. Each number is the median of `--runs` calls, in µs.
  *
- *   bun run bench/page-shape.ts [--runs 2000] [--against ../../natsu-main/v2]
+ *   bun run bench/page-shape.ts [--runs 2000] [--against ../natsu-main]
  */
 
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
