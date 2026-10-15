@@ -202,6 +202,43 @@ describe("the request", () => {
 		expect(await answer.text()).toBe("");
 	});
 
+	test("a form post refused before its handler says it never ran, so the runtime can let the browser post it", async () => {
+		let posts = 0;
+		new Router().post("/plain-form", () => {
+			posts++;
+			return page();
+		});
+		route("/from");
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/from");
+
+		const refused = await get(app, "/plain-form", { "natsu-nav": key, "natsu-action": "1" }, "POST");
+		expect(refused.status).toBe(204);
+		expect(refused.headers.get("natsu-reload")).toBe("route");
+		expect(refused.headers.get("natsu-unrun")).toBe("1");
+		expect(posts).toBe(0);
+
+		const nowhere = await get(app, "/no-such-form", { "natsu-nav": key, "natsu-action": "1" }, "POST");
+		expect(nowhere.headers.get("natsu-reload")).toBe("response");
+		expect(nowhere.headers.get("natsu-unrun")).toBe("1");
+	});
+
+	test("a refusal after the handler ran never says it did not run", async () => {
+		let posts = 0;
+		new Router().post("/json-form", navigable(() => {
+			posts++;
+			return Response.json({ ok: true });
+		}));
+		route("/from");
+		const { app } = await pipeline();
+		const key = await keyOf(app, "/from");
+
+		const answer = await get(app, "/json-form", { "natsu-nav": key, "natsu-action": "1" }, "POST");
+		expect(posts).toBe(1);
+		expect(answer.headers.get("natsu-reload")).toBe("response");
+		expect(answer.headers.get("natsu-unrun")).toBeNull();
+	});
+
 	test("guards keep the navigable flag, and run only for navigable routes", async () => {
 		let guarded = 0;
 		const draw: Handler = (ctx) => {
@@ -1148,13 +1185,13 @@ describe("delivery", () => {
 		const code = await answer.text();
 		expect(code).not.toMatch(/\bexport\b|\bimport\b/);
 		// The client runtime itself, speaking this wire format, minified and without its console lines.
-		for (const word of ["Natsu-Nav", "Natsu-Prefetch", "natsu-part", "natsu-location", 'meta[name="natsu"]', "data-natsu-region", "data-natsu-later"]) {
+		for (const word of ["Natsu-Nav", "Natsu-Prefetch", "natsu-part", "natsu-location", "natsu-unrun", 'meta[name="natsu"]', "data-natsu-region", "data-natsu-later"]) {
 			expect(code).toContain(word);
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		// 5.6 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5734);
+		// 5.85 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(5990);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {
