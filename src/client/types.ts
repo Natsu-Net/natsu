@@ -26,6 +26,11 @@ export interface NatsuLoadDetail {
 	regions: Element[];
 }
 
+export interface NatsuOfflineDetail {
+	url: string;
+	post: boolean;
+}
+
 /** `window.natsu`, or `natsu` from any script. */
 export interface NatsuClient {
 	/**
@@ -46,5 +51,6 @@ declare global {
 		"natsu:visit": CustomEvent<NatsuVisitDetail>;
 		"natsu:before-swap": CustomEvent<NatsuVisitDetail>;
 		"natsu:load": CustomEvent<NatsuLoadDetail>;
+		"natsu:offline": CustomEvent<NatsuOfflineDetail>;
 	}
 }
