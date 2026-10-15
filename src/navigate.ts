@@ -437,6 +437,7 @@ export class Navigation {
 	public buildId = "";
 	/** The runtime's URL, set by `Assets.build()`; "" until then. */
 	public runtime = "";
+	public pwa: { head: string; script: (nonce: string | undefined) => string } | undefined;
 	private readonly documentHeaders: string[];
 	private readonly inject: boolean;
 	private readonly prefetch: boolean;
@@ -555,7 +556,7 @@ export class Navigation {
 
 		const csp = header(ctx, "content-security-policy");
 		const nonces = cspNonces(csp);
-		const part = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime, csp !== null && /'strict-dynamic'/i.test(csp));
+		const part = partOf(page, scan, `${doc}.${shell}`, nonces, this.runtime, csp !== null && /'strict-dynamic'/i.test(csp), this.pwa?.head);
 		if (part.scripts.length > SCRIPTS_HEADER_LIMIT) {
 			return this.control(ctx, { kind: "reload", reason: "response", detail: `the page lists more scripts than a header carries (${part.scripts.length} bytes)` });
 		}
@@ -642,7 +643,9 @@ export class Navigation {
 		if (this.inject && this.runtime) {
 			const nonce = scriptNonce(csp);
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
+			if (this.pwa) tags += this.pwa.script(nonce);
 		}
+		if (this.pwa) tags += this.pwa.head;
 		// A CSP set after Assets ran (a middleware that sets it once the route
 		// has answered) is one this step never saw: the runtime's tag has no
 		// nonce and is blocked, so the page simply loads for real every time.
@@ -1013,6 +1016,7 @@ export function partOf(
 	nonces: readonly string[],
 	runtime = "",
 	strictDynamic = true,
+	extraHead = "",
 ): Part {
 	const [, headStart, headClose] = scan.head;
 	const raw = scan.raw;
@@ -1072,7 +1076,7 @@ export function partOf(
 		scripts.push(attributes.toString());
 	}
 	return {
-		html: `<!doctype html><html><head>${head}<meta name="natsu" content="${key}"></head><body>${regions}</body></html>`,
+		html: `<!doctype html><html><head>${head}${extraHead}<meta name="natsu" content="${key}"></head><body>${regions}</body></html>`,
 		scripts: scripts.join(" "),
 	};
 }

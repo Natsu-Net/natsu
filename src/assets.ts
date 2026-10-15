@@ -52,6 +52,7 @@ import { log } from "./logger.ts";
 import { scriptNonce } from "./csp.ts";
 import { LAZY_LOADER_HEAD, type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
 import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
+import { PWA_ENTRY, Pwa, type PwaOptions } from "./pwa.ts";
 import { type PageShape, PageShapes } from "./page-shape.ts";
 
 export interface AssetsOptions {
@@ -157,6 +158,7 @@ export interface AssetsOptions {
 	 * every page with a region. See `src/navigate.ts`.
 	 */
 	navigate?: boolean | NavigateOptions;
+	pwa?: PwaOptions;
 }
 
 export interface AssetReport {
@@ -213,6 +215,7 @@ export class Assets {
 	private readonly filled = new WeakMap<Context, { body: string; filled: Filled }>();
 	/** Page navigation, when the `navigate` option turns it on. */
 	private readonly navigation: Navigation | undefined;
+	private readonly pwa: Pwa | undefined;
 	/** Reads a page's shape from the class attribute values it has seen before. */
 	private shapes = new PageShapes(new Map(), new Map());
 
@@ -220,6 +223,10 @@ export class Assets {
 		this.options = { publicPath: "/_a", ...options };
 		const navigate = options.navigate;
 		if (navigate) this.navigation = new Navigation(navigate === true ? {} : navigate);
+		if (options.pwa) {
+			if (!this.navigation) throw new TypeError("natsu/assets: pwa needs navigate");
+			this.pwa = new Pwa(options.pwa, this.options.publicPath);
+		}
 	}
 
 	/** Build every entry. Call once at boot. */
@@ -233,7 +240,9 @@ export class Assets {
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
+		await this.buildPwa();
 		await this.buildNavigation();
+		this.finishPwa();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
 	}
@@ -583,6 +592,8 @@ export class Assets {
 				return;
 			}
 
+			if (this.pwa?.serve(ctx)) return;
+
 			// Read and delete the navigation headers before anything further in
 			// can see them; a prefetch refused outright never reaches a route.
 			const navigation = this.navigation;
@@ -599,6 +610,7 @@ export class Assets {
 			// cutting, and only if it has not run already.
 			if (navigation && ctx.nav.requested) {
 				navigation.answer(ctx, (html) => (this.rewritten.has(ctx) ? html : this.rewrite(html)));
+				if (ctx.response.headers.get("natsu-part") === "1") this.pwa?.mark(ctx);
 				return;
 			}
 
@@ -606,6 +618,7 @@ export class Assets {
 			// Documents only. An API answer is a string too, and one that
 			// happens to carry an asset path is not a page to rewrite.
 			if (typeof body !== "string" || !isDocument(ctx, body)) return;
+			this.pwa?.mark(ctx);
 			// A lazy loader is the one inline script of ours, so only lazy
 			// styles need the answer's nonce. A page kept rewritten was
 			// rewritten before any answer's nonce existed: its loaders get it now.
@@ -805,6 +818,31 @@ export class Assets {
 		}
 		navigation.runtime = this.url(RUNTIME_ENTRY);
 		navigation.buildId = Bun.hash(JSON.stringify(this.manifest())).toString(36);
+	}
+
+	private async buildPwa(): Promise<void> {
+		const pwa = this.pwa;
+		if (!pwa) return;
+		const file = fileURLToPath(new URL("./client/pwa.ts", import.meta.url));
+		const built = await Bun.build({ entrypoints: [file], target: "browser", format: "iife", splitting: false, minify: !config.General.development });
+		if (!built.success || !built.outputs[0]) {
+			for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
+			return;
+		}
+		const body = await built.outputs[0].text();
+		const url = this.hold(`${PWA_ENTRY}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
+		this.pin(url);
+		this.entries.set(PWA_ENTRY, url);
+		this.report.sizes[PWA_ENTRY] = { from: await sourceSize(file), to: body.length };
+	}
+
+	private finishPwa(): void {
+		const pwa = this.pwa;
+		const navigation = this.navigation;
+		if (!pwa || !navigation) return;
+		const script = this.url(PWA_ENTRY);
+		navigation.pwa = { head: pwa.headTags(), script: (nonce) => (script ? pwa.scriptTag(script, nonce) : "") };
+		pwa.build(navigation.buildId, [...this.entries.values()].filter((url) => url.endsWith(".js")));
 	}
 
 	private async buildFiles(): Promise<void> {

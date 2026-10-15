@@ -78,6 +78,7 @@ export type { AssetReport, AssetsOptions } from "./src/assets.ts";
 export type { CompressOptions } from "./src/compress.ts";
 export type { CachedPage, PageCacheOptions, PageRender } from "./src/page-cache.ts";
 export type { Nav, NavigateOptions } from "./src/navigate.ts";
+export type { PwaIcon, PwaManifest, PwaOptions, PwaText } from "./src/pwa.ts";
 export type { SessionAdapter, SessionRecord, MaybePromise } from "./src/session/adapter.ts";
 export type { SessionHook, SessionManagerOptions } from "./src/session/session.ts";
 export type {

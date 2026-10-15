@@ -970,6 +970,7 @@ if (!first && KEY && regions(D)[0]) {
 		} catch {}
 		if (n != seq) return;
 		if (!a) {
+			if (!fire("offline", { url: u.href, post: !!o.a })) return idle();
 			if (DEV) why("network error", u.href);
 			return full(u, h);
 		}
