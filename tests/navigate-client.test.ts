@@ -3266,6 +3266,29 @@ describe("live data", () => {
 		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: "" }));
 	});
 
+	test("a canceled natsu:invalidate keeps the page as it is", async () => {
+		FakeSocket.last = undefined;
+		const heard: string[] = [];
+		const p = open({
+			html: page({ head: live("todos|SIG") }),
+			before: (w) => {
+				w.WebSocket = FakeSocket;
+				w.document.addEventListener("natsu:invalidate", (e: Event) => {
+					heard.push((e as CustomEvent<{ tag: string }>).detail.tag);
+					e.preventDefault();
+				});
+			},
+			routes: { "/a": () => answer(part({ head: live("todos|SIG"), main: "<h1>A again</h1>" })) },
+		});
+		const ws = FakeSocket.last!;
+		ws.open();
+		ws.onmessage!({ data: JSON.stringify({ t: "invalidate", tag: "todos" }) });
+		await tick(60);
+		await settle();
+		expect(heard).toEqual(["todos"]);
+		expect(p.calls).toEqual([]);
+	});
+
 	test("a live island is watched beside the page, and an invalidated tag of its own fetches it alone", async () => {
 		FakeSocket.last = undefined;
 		let n = 0;
