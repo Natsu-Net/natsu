@@ -201,7 +201,8 @@
  *  - events on `document`: `natsu:visit` (cancelable: the visit does not
  *    happen, and on Back or Forward the page loads for real),
  *    `natsu:before-swap`, and `natsu:load`, once per page shown (at boot
- *    too) with `detail: { url, regions }`
+ *    too) with `detail: { url, regions }`; `natsu:invalidate` (cancelable:
+ *    the live refresh it announces does not happen) with `detail: { tag }`
  *  - attributes: `data-natsu-reload` on a link, form or ancestor for a real
  *    load, and on `<html>` for every visit from this document;
  *    `data-natsu-prefetch` for when links below it are fetched ahead
@@ -561,7 +562,7 @@ const watchLive = (refresh: () => unknown) => {
 			try {
 				const m = JSON.parse(e.data);
 				if (m.t == "invalidate")
-					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(refresh, 30)));
+					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(() => fire("invalidate", { tag: m.tag }) && refresh(), 30)));
 					else
 						for (const [el, s] of isles)
 							tagsOf(s).includes(m.tag) && (clearTimeout(el.w), (el.w = setTimeout(() => island(el).catch(() => {}), 30)));
