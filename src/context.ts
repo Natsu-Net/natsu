@@ -9,6 +9,7 @@
  */
 
 import type { Server } from "bun";
+import { isIP } from "node:net";
 import { Cache, defaultCache } from "./cache.ts";
 import { type Nav, inertNav } from "./navigate.ts";
 import type { Session, SessionManager } from "./session/session.ts";
@@ -133,6 +134,16 @@ export class NatsuResponse {
 	}
 }
 
+const ADDRESS_WITH_PORT = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/;
+const BRACKETED_ADDRESS = /^\[([0-9a-fA-F:.]+)\](?::\d{1,5})?$/;
+
+function cleanAddress(raw: string | undefined): string {
+	if (raw === undefined) return "";
+	let candidate = raw.trim();
+	candidate = ADDRESS_WITH_PORT.exec(candidate)?.[1] ?? BRACKETED_ADDRESS.exec(candidate)?.[1] ?? candidate;
+	return isIP(candidate) === 0 ? "" : candidate;
+}
+
 export class Context {
 	public readonly request: Request;
 	public readonly server: NatsuServer | undefined;
@@ -153,6 +164,7 @@ export class Context {
 	/** Set by the session middleware; `session` creates one on demand. */
 	public sessions: SessionManager | undefined;
 	public trustProxy = false;
+	public proxyHops = 1;
 
 	private _session: Session | undefined;
 	private _url: URL | undefined;
@@ -249,8 +261,9 @@ export class Context {
 		if (this.trustProxy) {
 			const forwarded = this.request.headers.get("x-forwarded-for");
 			if (forwarded) {
-				const first = forwarded.split(",")[0];
-				if (first) return first.trim();
+				const entries = forwarded.split(",");
+				const trusted = cleanAddress(entries[entries.length - this.proxyHops]);
+				if (trusted) return trusted;
 			}
 		}
 		return this.server?.requestIP(this.request)?.address ?? "";
