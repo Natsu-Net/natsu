@@ -19,6 +19,14 @@ export interface GeneralConfig {
 	listenOn: string;
 	/** Trust `X-Forwarded-For` when resolving `ctx.ip`. */
 	proxy: boolean;
+	/** Trusted proxies in front of the app; `X-Forwarded-For` is read that many entries from the right. */
+	proxyHops: number;
+	/** Largest frame, in bytes, the live socket accepts. */
+	socketMaxPayload: number;
+	/** Seconds of silence after which an idle socket is closed. */
+	socketIdleTimeout: number;
+	/** Live sockets one address may hold open; 0 means unlimited. */
+	socketMaxPerIp: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -120,6 +128,10 @@ export function defaultConfig(): NatsuConfig {
 			port: 8083,
 			listenOn: "0.0.0.0",
 			proxy: false,
+			proxyHops: 1,
+			socketMaxPayload: 32768,
+			socketIdleTimeout: 120,
+			socketMaxPerIp: 0,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
@@ -195,6 +207,19 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!["sqlite", "memory", "none"].includes(config.Session.driver)) {
 		throw new ConfigError(`Session.driver must be one of sqlite|memory|none, got ${config.Session.driver}`);
+	}
+	const { proxyHops, socketMaxPayload, socketIdleTimeout, socketMaxPerIp } = config.General;
+	if (!Number.isInteger(proxyHops) || proxyHops < 1) {
+		throw new ConfigError(`General.proxyHops must be a positive integer, got ${String(proxyHops)}`);
+	}
+	if (!Number.isInteger(socketMaxPayload) || socketMaxPayload < 1) {
+		throw new ConfigError(`General.socketMaxPayload must be a positive integer, got ${String(socketMaxPayload)}`);
+	}
+	if (!Number.isInteger(socketIdleTimeout) || socketIdleTimeout < 0 || socketIdleTimeout > 960) {
+		throw new ConfigError(`General.socketIdleTimeout must be an integer in 0..960, got ${String(socketIdleTimeout)}`);
+	}
+	if (!Number.isInteger(socketMaxPerIp) || socketMaxPerIp < 0) {
+		throw new ConfigError(`General.socketMaxPerIp must be a non-negative integer, got ${String(socketMaxPerIp)}`);
 	}
 	return config;
 }

@@ -342,6 +342,75 @@ describe("isolation", () => {
 	});
 });
 
+describe("who may connect", () => {
+	async function outcome(headers: Record<string, string> | undefined, overrides = {}): Promise<"open" | "refused"> {
+		reset({ General: { logFormat: "", logLevel: "silent", ...overrides } });
+		running = await startApp(new Application());
+		const client = open(running.base, headers);
+		const result = await client.ready.then(
+			() => "open" as const,
+			() => "refused" as const,
+		);
+		client.socket.close();
+		return result;
+	}
+
+	test("a client that sends no Origin is let in", async () => {
+		expect(await outcome(undefined)).toBe("open");
+	});
+
+	test("the same origin is let in", async () => {
+		reset();
+		running = await startApp(new Application());
+		const client = open(running.base, { Origin: running.base });
+		await client.ready;
+		client.socket.close();
+	});
+
+	test("another site's page is refused", async () => {
+		expect(await outcome({ Origin: "https://evil.test" })).toBe("refused");
+	});
+
+	test("Origin null is refused", async () => {
+		expect(await outcome({ Origin: "null" })).toBe("refused");
+	});
+
+	test("a garbled Origin is refused", async () => {
+		expect(await outcome({ Origin: "not a url" })).toBe("refused");
+	});
+
+	test("the configured public url is accepted behind a proxy that rewrites Host", async () => {
+		expect(await outcome({ Origin: "https://shop.test" }, { url: "https://shop.test" })).toBe("open");
+	});
+
+	test("a frame over the payload limit closes the socket", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMaxPayload: 256 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		const closed = new Promise<number>((resolve) => client.socket.addEventListener("close", (e) => resolve((e as CloseEvent).code)));
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["x".repeat(1000)] }));
+		expect([1006, 1009]).toContain(await closed);
+	});
+
+	test("the per-address cap refuses the connection past the limit and frees on close", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMaxPerIp: 2 } });
+		running = await startApp(new Application());
+		const first = open(running.base);
+		const second = open(running.base);
+		await first.ready;
+		await second.ready;
+		const third = open(running.base);
+		await expect(third.ready).rejects.toThrow();
+		first.socket.close();
+		await Bun.sleep(100);
+		const fourth = open(running.base);
+		await fourth.ready;
+		fourth.socket.close();
+		second.socket.close();
+	});
+});
+
 describe("living beside an app's own socket", () => {
 	test("the live socket can be turned off, freeing the path", async () => {
 		running = await startApp(new Application(), { live: false });
