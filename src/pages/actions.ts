@@ -237,6 +237,7 @@ export function csrfOk(ctx: Context, form: FormData): boolean {
 	const site = ctx.headers.get("sec-fetch-site");
 	if (site !== null && site !== "same-origin" && site !== "none") return false;
 	const origin = ctx.headers.get("origin");
+	if (origin === "null" && site === null) return false;
 	if (origin !== null && origin !== "null" && origin !== ctx.url.origin && origin !== publicOrigin()) return false;
 	const cookie = tokenOf(ctx);
 	const sent = form.get(CSRF_FIELD) ?? ctx.headers.get("natsu-csrf");

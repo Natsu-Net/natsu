@@ -167,6 +167,7 @@ describe("actions without script", () => {
 		expect((await post({ _action: "add", title: "a", _csrf: token }, {})).status).toBe(403);
 		expect((await post({ _action: "add", title: "a", _csrf: token }, { cookie, "sec-fetch-site": "cross-site" })).status).toBe(403);
 		expect((await post({ _action: "add", title: "a", _csrf: token }, { cookie, origin: "https://evil.test" })).status).toBe(403);
+		expect((await post({ _action: "add", title: "a", _csrf: token }, { cookie, origin: "null" })).status).toBe(403);
 		expect(todos).toEqual([]);
 		// The header works as well as the field (the runtime's click without a form).
 		expect((await post({ _action: "add", title: "a" }, { cookie, "natsu-csrf": token, origin: "https://shop.test" })).status).toBe(303);
