@@ -66,8 +66,10 @@ import {
 	csrfOk,
 	decodeFlash,
 	encodeFlash,
+	assertActionsDeclareAuth,
 	hasGuard,
 	inputOf,
+	maskToken,
 	newToken,
 	registeredAction,
 	sameSitePath,
@@ -240,6 +242,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const maxBody = options.maxBody ?? MAX_BODY;
 	const publicUrl = (): string => options.baseUrl ?? config.General.url;
 	setPublicOrigin(publicUrl);
+	if (config.General.requireActionAuth === true) assertActionsDeclareAuth();
 	const secure = (): boolean => publicUrl().startsWith("https:");
 
 	const appNames = new Set(Object.keys(options.request ?? {}));
@@ -549,7 +552,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			// cross-site page can neither read it nor set it.
 			ctx.setCookie(CSRF_COOKIE, token, { httpOnly: false, sameSite: "lax", secure: secure(), path: "/" });
 		}
-		return { ...own, csrf: token };
+		return { ...own, csrf: maskToken(token) };
 	};
 
 	function handlerFor(path: string): Handler {

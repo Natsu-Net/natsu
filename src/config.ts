@@ -33,6 +33,8 @@ export interface GeneralConfig {
 	logLevel: LogLevel;
 	/** Include stack traces in 500 bodies. Never turn this on in production. */
 	development: boolean;
+	/** Make every action name its `auth` rule (`"anonymous"` for none). */
+	requireActionAuth: boolean;
 	/** Paths the request logger stays quiet about. */
 	logIgnore: string[];
 }
@@ -136,6 +138,7 @@ export function defaultConfig(): NatsuConfig {
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
 			development: false,
+			requireActionAuth: false,
 			logIgnore: ["/favicon.ico", "/assets"],
 		},
 		Cache: {

@@ -15,7 +15,7 @@ import { dirname, join } from "node:path";
 import * as natsu from "../index.ts";
 import { Assets } from "../src/assets.ts";
 import { invalidate, onInvalidate, signTags, verifyTags } from "../src/invalidate.ts";
-import { Invalid, action, clearActions, guard } from "../src/pages/actions.ts";
+import { Invalid, action, clearActions, guard, maskToken } from "../src/pages/actions.ts";
 import { compilePageFile } from "../src/pages/compile.ts";
 import { clearSources, source } from "../src/pages/data.ts";
 import { PageCompileError } from "../src/pages/errors.ts";
@@ -99,6 +99,12 @@ async function tokenOf(answer: Response): Promise<{ cookie: string; token: strin
 	return { cookie, token, html };
 }
 
+function unmasked(masked: string): string {
+	const bytes = Buffer.from(masked, "base64url");
+	const half = bytes.length / 2;
+	return Buffer.from(bytes.subarray(0, half).map((byte, i) => byte ^ bytes[half + i]!)).toString("latin1");
+}
+
 const form = (fields: Record<string, string>) => new URLSearchParams(fields);
 const cookieOf = (answer: Response, name: string) => answer.headers.getSetCookie().find((c) => c.startsWith(`${name}=`));
 
@@ -109,7 +115,8 @@ describe("actions without script", () => {
 		const first = await get("/todos");
 		const { cookie, token, html } = await tokenOf(first);
 		expect(cookie).toMatch(/^natsu_csrf=[\w-]{32}$/);
-		expect(cookie.slice("natsu_csrf=".length)).toBe(token);
+		expect(token).not.toBe(cookie.slice("natsu_csrf=".length));
+		expect(unmasked(token)).toBe(cookie.slice("natsu_csrf=".length));
 		// uwu's markup, with natsu's token beside the action field.
 		expect(html).toContain(`<form data-uwu-action="add" data-uwu-event="submit" method="post"><input type="hidden" name="_action" value="add"><input type="hidden" name="_csrf" value="${token}">`);
 		expect(cookieOf(first, "natsu_csrf")).not.toContain("HttpOnly");
@@ -143,7 +150,7 @@ describe("actions without script", () => {
 		expect(html).toContain(`<b class="error">Give it a title</b>`);
 		expect(html).toContain(`<input name="title" value="  ">`);
 		expect(html).toContain(`<input type="password" name="password" value="">`);
-		expect(html).toContain(`name="_csrf" value="${token}"`);
+		expect(html).toMatch(/name="_csrf" value="[\w-]{86}"/);
 		expect(todos).toEqual([]);
 		// An action can answer errors instead of throwing them.
 		action("todos.check", () => ({ errors: { title: "taken" } }));
@@ -174,6 +181,50 @@ describe("actions without script", () => {
 		// An action that opted out takes no token.
 		expect((await post({ _action: "ping" }, {})).status).toBe(303);
 		expect(todos.length).toBe(1);
+	});
+
+	test("the form token is masked per response and verified against the stable cookie", async () => {
+		registerTodos();
+		const { get } = await serve({ "todos.uwu": TODOS });
+		const first = await tokenOf(await get("/todos"));
+		const second = await tokenOf(await get("/todos", { headers: { cookie: first.cookie } }));
+		const raw = first.cookie.slice("natsu_csrf=".length);
+		expect(second.cookie).toBe("");
+		expect(first.token).not.toBe(second.token);
+		expect(unmasked(second.token)).toBe(raw);
+		const post = (sent: string) => get("/todos", { method: "POST", body: form({ _action: "add", _csrf: sent, title: "a" }), headers: { cookie: first.cookie } });
+		expect((await post(first.token)).status).toBe(303);
+		expect((await post(second.token)).status).toBe(303);
+		expect((await post(raw)).status).toBe(303);
+		const tampered = (first.token[0] === "A" ? "B" : "A") + first.token.slice(1);
+		expect((await post(tampered)).status).toBe(403);
+		expect((await post(first.token.slice(0, -1))).status).toBe(403);
+		expect((await post("!".repeat(90))).status).toBe(403);
+		expect((await post(maskToken("y".repeat(32)))).status).toBe(403);
+		expect(todos.length).toBe(3);
+	});
+
+	test("a duplicate action name throws at registration", () => {
+		action("dup.one", () => {});
+		expect(() => action("dup.one", () => {})).toThrow(/registered twice/);
+	});
+
+	test("General.requireActionAuth makes an action name its auth rule", async () => {
+		action("open.before", () => {});
+		reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test", requireActionAuth: true } });
+		expect(() => action("open.after", () => {})).toThrow(/needs an auth rule/);
+		expect(() => action("open.after", () => {}, { auth: "anonymous" })).not.toThrow();
+		expect(() => action("signed.in", () => {}, { auth: "viewer" })).not.toThrow();
+		write({ "x.uwu": `<template><form @submit="action:open.after"></form></template>` });
+		await expect(mountPages({ dir, app: new Application() })).rejects.toThrow(/open.before/);
+		expect(() => guard("anonymous", () => true)).toThrow(/cannot name a guard/);
+	});
+
+	test("an action with no auth rule still runs by default, and anonymous lets anyone in", async () => {
+		action("hello.say", () => ({ flash: "hi" }), { auth: "anonymous" });
+		const { get } = await serve({ "hello.uwu": `<template><form @submit="action:hello.say"></form></template>` });
+		const { cookie, token } = await tokenOf(await get("/hello"));
+		expect((await get("/hello", { method: "POST", body: form({ _action: "hello.say", _csrf: token }), headers: { cookie } })).status).toBe(303);
 	});
 
 	test("only what the page names runs from its URL; a public action from any", async () => {

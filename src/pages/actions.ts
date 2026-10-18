@@ -25,6 +25,7 @@
  * `form.errors` and `form.values`, and the runtime's swap of the regions.
  */
 
+import { config } from "../config.ts";
 import type { Context } from "../context.ts";
 import type { Session } from "../session/session.ts";
 
@@ -72,7 +73,7 @@ export interface ActionResult {
 export type ActionHandler = (input: ActionInput) => ActionResult | void | Promise<ActionResult | void>;
 
 /** Who may run it: anyone signed in, a registered guard, or a check of its own. */
-export type AuthRule = "viewer" | (string & {}) | ((input: GuardInput) => boolean | Promise<boolean>);
+export type AuthRule = "viewer" | "anonymous" | (string & {}) | ((input: GuardInput) => boolean | Promise<boolean>);
 
 export interface ActionOptions {
 	auth?: AuthRule;
@@ -123,12 +124,25 @@ const NAME = /^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)*$/;
 /** Register an action under `name`. Before `mountPages`, which checks every name a page uses. */
 export function action(name: string, fn: ActionHandler, options: ActionOptions = {}): void {
 	if (!NAME.test(name)) throw new TypeError(`natsu/pages: '${name}' is not an action name`);
+	if (actions.has(name)) throw new TypeError(`natsu/pages: action("${name}", …) is registered twice`);
+	if (config.General.requireActionAuth === true) assertAuthDeclared(name, options);
 	actions.set(name, { name, fn, options });
+}
+
+function assertAuthDeclared(name: string, options: ActionOptions): void {
+	if (options.auth === undefined) {
+		throw new TypeError(`natsu/pages: action("${name}", …) needs an auth rule (General.requireActionAuth); say auth: "anonymous" to allow anyone`);
+	}
+}
+
+/** Throws for any registered action that names no auth rule; mountPages calls it under `General.requireActionAuth`. */
+export function assertActionsDeclareAuth(): void {
+	for (const entry of actions.values()) assertAuthDeclared(entry.name, entry.options);
 }
 
 /** A named rule for `auth`: `guard("admin", ({ viewer }) => viewer?.role === "admin")`. */
 export function guard(name: string, fn: Guard): void {
-	if (!/^[A-Za-z_][\w.:-]*$/.test(name) || name === "viewer") throw new TypeError(`natsu/pages: '${name}' cannot name a guard`);
+	if (!/^[A-Za-z_][\w.:-]*$/.test(name) || name === "viewer" || name === "anonymous") throw new TypeError(`natsu/pages: '${name}' cannot name a guard`);
 	guards.set(name, fn);
 }
 
@@ -137,7 +151,7 @@ export function registeredAction(name: string): RegisteredAction | undefined {
 }
 
 export function hasGuard(name: string): boolean {
-	return name === "viewer" || guards.has(name);
+	return name === "viewer" || name === "anonymous" || guards.has(name);
 }
 
 /** Whether any action is public (then every page route takes a POST). */
@@ -156,6 +170,7 @@ export function clearActions(): void {
 export async function allowed(rule: AuthRule | undefined, input: GuardInput): Promise<boolean> {
 	if (rule === undefined) return true;
 	if (typeof rule === "function") return (await rule(input)) === true;
+	if (rule === "anonymous") return true;
 	if (rule === "viewer") return input.viewer !== null && input.viewer !== undefined;
 	const check = guards.get(rule);
 	if (!check) throw new Error(`natsu/pages: no guard("${rule}", …) is registered`);
@@ -222,6 +237,30 @@ export function tokenOf(ctx: Context): string | undefined {
 	return value !== undefined && TOKEN.test(value) ? value : undefined;
 }
 
+const MASKED_MIN = 65;
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+
+/** A fresh one-time-pad view of `token`, different on every call, that `csrfOk` unmasks. */
+export function maskToken(token: string): string {
+	const bytes = Buffer.from(token, "latin1");
+	const pad = crypto.getRandomValues(new Uint8Array(bytes.length));
+	const out = new Uint8Array(bytes.length * 2);
+	out.set(pad);
+	for (let i = 0; i < bytes.length; i++) out[bytes.length + i] = pad[i]! ^ bytes[i]!;
+	return Buffer.from(out).toString("base64url");
+}
+
+function unmaskToken(sent: string): string | undefined {
+	if (sent.length < MASKED_MIN) return sent;
+	if (!BASE64URL.test(sent)) return undefined;
+	const bytes = Buffer.from(sent, "base64url");
+	if (bytes.length % 2 !== 0) return undefined;
+	const half = bytes.length / 2;
+	const out = Buffer.alloc(half);
+	for (let i = 0; i < half; i++) out[i] = bytes[i]! ^ bytes[half + i]!;
+	return out.toString("latin1");
+}
+
 function same(a: string, b: string): boolean {
 	if (a.length !== b.length) return false;
 	let diff = 0;
@@ -241,7 +280,9 @@ export function csrfOk(ctx: Context, form: FormData): boolean {
 	if (origin !== null && origin !== "null" && origin !== ctx.url.origin && origin !== publicOrigin()) return false;
 	const cookie = tokenOf(ctx);
 	const sent = form.get(CSRF_FIELD) ?? ctx.headers.get("natsu-csrf");
-	return cookie !== undefined && typeof sent === "string" && same(cookie, sent);
+	if (cookie === undefined || typeof sent !== "string") return false;
+	const token = unmaskToken(sent);
+	return token !== undefined && same(cookie, token);
 }
 
 let origin: (() => string) | undefined;
