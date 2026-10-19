@@ -85,6 +85,7 @@ export interface LiveSocketData {
 	topics: Set<string>;
 	/** Live-data tag topics, which the next `watch` replaces. */
 	tags?: Set<string>;
+	ip?: string;
 }
 
 interface ClientFrame {
@@ -168,6 +169,37 @@ export function resetLive(): void {
 	for (const stop of publishing.values()) stop();
 	publishing.clear();
 	hooks = {};
+	socketsByIp.clear();
+}
+
+const socketsByIp = new Map<string, number>();
+
+export function socketCountFor(ip: string): number {
+	return socketsByIp.get(ip) ?? 0;
+}
+
+function releaseIp(ip: string | undefined): void {
+	if (!ip) return;
+	const left = (socketsByIp.get(ip) ?? 0) - 1;
+	if (left > 0) socketsByIp.set(ip, left);
+	else socketsByIp.delete(ip);
+}
+
+export function sameOriginSocket(request: Request, publicUrl: string): boolean {
+	const origin = request.headers.get("origin");
+	if (origin === null) return true;
+	let originHost: string;
+	try {
+		originHost = new URL(origin).host;
+	} catch {
+		return false;
+	}
+	if (originHost === request.headers.get("host")) return true;
+	try {
+		return originHost === new URL(publicUrl).host;
+	} catch {
+		return false;
+	}
 }
 
 /** A store a connection is allowed to address, and where it lives. */
@@ -331,6 +363,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 
 		close(ws: ServerWebSocket<LiveSocketData>, code: number, reason: string) {
 			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
+			releaseIp(ws.data.ip);
 			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
 			try {
 				hooks.close?.(callerOf(ws.data));
@@ -385,9 +418,12 @@ export function upgradeLive(
 	server: LiveServer,
 	scopeId: string,
 	session?: CallerSession,
+	ip = "",
 ): Response | undefined {
 	const upgraded = server.upgrade(request, {
-		data: { live: true, scopeId, session, topics: new Set<string>() },
+		data: { live: true, scopeId, session, topics: new Set<string>(), ip },
 	});
-	return upgraded ? undefined : new Response("expected a websocket", { status: 400 });
+	if (!upgraded) return new Response("expected a websocket", { status: 400 });
+	if (ip) socketsByIp.set(ip, socketCountFor(ip) + 1);
+	return undefined;
 }

@@ -17,7 +17,7 @@ import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
 import { isIslandRequest, refuseBeforeHandler, refuseWithoutRoute } from "./navigate.ts";
-import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, setLiveHooks, setLiveServer, upgradeLive } from "./live.ts";
+import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
 
@@ -65,6 +65,15 @@ export interface StartOptions {
 	upgrade?: (request: Request, server: NatsuServer) => Response | undefined;
 }
 
+function ownLimits(handler: Partial<Bun.WebSocketHandler<never>> | undefined): Partial<Bun.WebSocketHandler<never>> {
+	const limits: Partial<Bun.WebSocketHandler<never>> = {};
+	if (handler?.maxPayloadLength !== undefined) limits.maxPayloadLength = handler.maxPayloadLength;
+	if (handler?.idleTimeout !== undefined) limits.idleTimeout = handler.idleTimeout;
+	return limits;
+}
+
+export type UpgradeGuard = (ctx: Context) => boolean | Response | Promise<boolean | Response>;
+
 type Terminal = (ctx: Context) => Promise<void>;
 
 export class Application {
@@ -76,6 +85,7 @@ export class Application {
 	private chain: ((ctx: Context, terminal: Terminal) => Promise<void>) | undefined;
 	private serverRef: NatsuServer | undefined;
 	private errorHandler: ErrorHandler | undefined;
+	private upgradeGuardHandler: UpgradeGuard | undefined;
 	private notFoundHandler: Handler | undefined;
 	private readonly cwd: string;
 
@@ -104,6 +114,11 @@ export class Application {
 	public use(middleware: Middleware): this {
 		this.userMiddleware.push(middleware);
 		this.chain = undefined;
+		return this;
+	}
+
+	public upgradeGuard(guard: UpgradeGuard | undefined): this {
+		this.upgradeGuardHandler = guard;
 		return this;
 	}
 
@@ -175,6 +190,7 @@ export class Application {
 	): Promise<Response> {
 		const ctx = new Context(request, server, params);
 		ctx.trustProxy = this.config.General.proxy;
+		ctx.proxyHops = this.config.General.proxyHops;
 
 		try {
 			this.chain ??= compose([...this.builtins(), ...this.userMiddleware]);
@@ -323,10 +339,7 @@ export class Application {
 		if (!live) return routes;
 		return {
 			...routes,
-			[SOCKET_PATH]: async (request: BunRequest, server: NatsuServer) => {
-				const session = await this.socketScope(request);
-				return upgradeLive(request, server, session?.id ?? "", session) ?? (undefined as unknown as Response);
-			},
+			[SOCKET_PATH]: (request: BunRequest, server: NatsuServer) => this.upgradeSocket(request, server),
 		};
 	}
 
@@ -340,7 +353,15 @@ export class Application {
 			development: options.development ?? this.config.General.development,
 			reusePort: options.reusePort ?? false,
 			routes: this.socketRoute(live, this.buildRoutes()),
-			websocket: options.websocket || live ? liveWebSocketHandler(options.websocket) : undefined,
+			websocket:
+				options.websocket || live
+					? {
+							maxPayloadLength: this.config.General.socketMaxPayload,
+							idleTimeout: this.config.General.socketIdleTimeout,
+							...liveWebSocketHandler(options.websocket),
+							...ownLimits(options.websocket),
+						}
+					: undefined,
 			fetch: async (request: Request, server: NatsuServer) => {
 				// The upgrade has to happen before the middleware chain: a
 				// handshake that went through the chain would get a body, and a
@@ -349,8 +370,7 @@ export class Application {
 					// The session decides which state this connection can see,
 					// so it is resolved here and nowhere else — a frame never
 					// names a scope.
-					const session = await this.socketScope(request);
-					return upgradeLive(request, server, session?.id ?? "", session) ?? (undefined as unknown as Response);
+					return this.upgradeSocket(request, server);
 				}
 				if (options.upgrade) {
 					const refused = options.upgrade(request, server);
@@ -368,6 +388,35 @@ export class Application {
 				return new Response("Internal Server Error", { status: 500 });
 			},
 		} as unknown as ServeOptions<NatsuSocketData>;
+	}
+
+	private async upgradeSocket(request: Request, server: NatsuServer): Promise<Response> {
+		const { General } = this.config;
+		if (!sameOriginSocket(request, General.url)) return new Response("Forbidden", { status: 403 });
+
+		const probe = new Context(request, server);
+		probe.trustProxy = General.proxy;
+		probe.proxyHops = General.proxyHops;
+		const verdict = await this.guardUpgrade(probe);
+		if (verdict) return verdict;
+		const ip = probe.ip;
+
+		const session = await this.socketScope(request);
+		if (General.socketMaxPerIp > 0 && ip && socketCountFor(ip) >= General.socketMaxPerIp) {
+			return new Response("Too Many Connections", { status: 429 });
+		}
+		return upgradeLive(request, server, session?.id ?? "", session, ip) ?? (undefined as unknown as Response);
+	}
+
+	private async guardUpgrade(probe: Context): Promise<Response | undefined> {
+		if (!this.upgradeGuardHandler) return undefined;
+		try {
+			const verdict = await this.upgradeGuardHandler(probe);
+			if (verdict === true) return undefined;
+			return verdict instanceof Response ? verdict : new Response("Forbidden", { status: 403 });
+		} catch {
+			return new Response("Forbidden", { status: 403 });
+		}
 	}
 
 	/**

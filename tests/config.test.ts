@@ -34,6 +34,23 @@ describe("defaults", () => {
 	});
 });
 
+describe("socket and proxy limits", () => {
+	test("safe defaults", () => {
+		const { General } = defaultConfig();
+		expect(General.proxy).toBe(false);
+		expect(General.proxyHops).toBe(1);
+		expect(General.socketMaxPayload).toBe(32768);
+		expect(General.socketIdleTimeout).toBe(120);
+		expect(General.socketMaxPerIp).toBe(0);
+	});
+
+	test("nonsense values are refused", () => {
+		for (const bad of [{ proxyHops: 0 }, { socketMaxPayload: 0 }, { socketIdleTimeout: 1000 }, { socketMaxPerIp: -1 }]) {
+			expect(() => setConfig({ General: bad })).toThrow(ConfigError);
+		}
+	});
+});
+
 describe("merge", () => {
 	test("a partial section keeps its siblings", () => {
 		const merged = mergeConfig(defaultConfig(), { General: { port: 9000 } });

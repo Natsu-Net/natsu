@@ -69,7 +69,7 @@ export type {
 export { invalidate, onInvalidate, setLiveSecret } from "./src/invalidate.ts";
 export type { InvalidateInfo, InvalidateListener } from "./src/invalidate.ts";
 
-export type { ApplicationOptions, ErrorHandler, StartOptions } from "./src/server.ts";
+export type { ApplicationOptions, ErrorHandler, StartOptions, UpgradeGuard } from "./src/server.ts";
 export type { CookieOptions, Handler, Middleware, NatsuSocketData, ResponseBody } from "./src/context.ts";
 export type { CompiledRoutes, PrefixMiddleware, RouteEntry, RouteMethod, RouteRecord } from "./src/router.ts";
 export type { ControllerFactory, ControllerNamespaceApi, ControllerOptions } from "./src/controller.ts";

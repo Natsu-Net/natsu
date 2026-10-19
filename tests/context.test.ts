@@ -156,11 +156,44 @@ describe("response", () => {
 });
 
 describe("ip", () => {
+	const forwarded = (value: string, hops?: number) => {
+		const ctx = ctxFor("http://a.test/", { headers: { "x-forwarded-for": value } });
+		ctx.trustProxy = true;
+		if (hops !== undefined) ctx.proxyHops = hops;
+		return ctx.ip;
+	};
+
 	test("the forwarded header is ignored unless the proxy is trusted", () => {
 		const ctx = ctxFor("http://a.test/", { headers: { "x-forwarded-for": "1.2.3.4, 5.6.7.8" } });
 		expect(ctx.ip).toBe("");
 		ctx.trustProxy = true;
-		expect(ctx.ip).toBe("1.2.3.4");
+		expect(ctx.ip).toBe("5.6.7.8");
+	});
+
+	test("a client-supplied leftmost entry is never the answer", () => {
+		expect(forwarded("6.6.6.6, 203.0.113.9")).toBe("203.0.113.9");
+	});
+
+	test("proxyHops counts entries from the right", () => {
+		expect(forwarded("6.6.6.6, 203.0.113.9, 10.0.0.1", 2)).toBe("203.0.113.9");
+		expect(forwarded("203.0.113.9, 10.0.0.1", 2)).toBe("203.0.113.9");
+	});
+
+	test("fewer entries than hops falls back to the socket address", () => {
+		expect(forwarded("203.0.113.9", 2)).toBe("");
+	});
+
+	test("ports and brackets are stripped, v6 is kept", () => {
+		expect(forwarded("203.0.113.9:4711")).toBe("203.0.113.9");
+		expect(forwarded("[2001:db8::1]:4711")).toBe("2001:db8::1");
+		expect(forwarded("2001:db8::1")).toBe("2001:db8::1");
+	});
+
+	test("anything that is not an address cannot reach a log line", () => {
+		expect(forwarded("1.2.3.4, <script>alert(1)</script>")).toBe("");
+		expect(forwarded("1.2.3.4, 9.9.9.9 extra")).toBe("");
+		expect(forwarded("1.2.3.4, 9.9.9.9;rm")).toBe("");
+		expect(forwarded("1.2.3.4,")).toBe("");
 	});
 });
 
