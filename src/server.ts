@@ -72,6 +72,8 @@ function ownLimits(handler: Partial<Bun.WebSocketHandler<never>> | undefined): P
 	return limits;
 }
 
+export type UpgradeGuard = (ctx: Context) => boolean | Response | Promise<boolean | Response>;
+
 type Terminal = (ctx: Context) => Promise<void>;
 
 export class Application {
@@ -83,6 +85,7 @@ export class Application {
 	private chain: ((ctx: Context, terminal: Terminal) => Promise<void>) | undefined;
 	private serverRef: NatsuServer | undefined;
 	private errorHandler: ErrorHandler | undefined;
+	private upgradeGuardHandler: UpgradeGuard | undefined;
 	private notFoundHandler: Handler | undefined;
 	private readonly cwd: string;
 
@@ -111,6 +114,11 @@ export class Application {
 	public use(middleware: Middleware): this {
 		this.userMiddleware.push(middleware);
 		this.chain = undefined;
+		return this;
+	}
+
+	public upgradeGuard(guard: UpgradeGuard | undefined): this {
+		this.upgradeGuardHandler = guard;
 		return this;
 	}
 
@@ -389,6 +397,8 @@ export class Application {
 		const probe = new Context(request, server);
 		probe.trustProxy = General.proxy;
 		probe.proxyHops = General.proxyHops;
+		const verdict = await this.guardUpgrade(probe);
+		if (verdict) return verdict;
 		const ip = probe.ip;
 		if (General.socketMaxPerIp > 0 && ip && socketCountFor(ip) >= General.socketMaxPerIp) {
 			return new Response("Too Many Connections", { status: 429 });
@@ -396,6 +406,17 @@ export class Application {
 
 		const session = await this.socketScope(request);
 		return upgradeLive(request, server, session?.id ?? "", session, ip) ?? (undefined as unknown as Response);
+	}
+
+	private async guardUpgrade(probe: Context): Promise<Response | undefined> {
+		if (!this.upgradeGuardHandler) return undefined;
+		try {
+			const verdict = await this.upgradeGuardHandler(probe);
+			if (verdict === true) return undefined;
+			return verdict instanceof Response ? verdict : new Response("Forbidden", { status: 403 });
+		} catch {
+			return new Response("Forbidden", { status: 403 });
+		}
 	}
 
 	/**
