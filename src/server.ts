@@ -400,11 +400,11 @@ export class Application {
 		const verdict = await this.guardUpgrade(probe);
 		if (verdict) return verdict;
 		const ip = probe.ip;
+
+		const session = await this.socketScope(request);
 		if (General.socketMaxPerIp > 0 && ip && socketCountFor(ip) >= General.socketMaxPerIp) {
 			return new Response("Too Many Connections", { status: 429 });
 		}
-
-		const session = await this.socketScope(request);
 		return upgradeLive(request, server, session?.id ?? "", session, ip) ?? (undefined as unknown as Response);
 	}
 

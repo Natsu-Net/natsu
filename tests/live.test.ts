@@ -409,6 +409,28 @@ describe("who may connect", () => {
 		fourth.socket.close();
 		second.socket.close();
 	});
+
+	test("a burst of handshakes behind a slow session lookup cannot exceed the cap", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMaxPerIp: 2 } });
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		const original = manager.get.bind(manager);
+		manager.get = async (id: string) => {
+			await Bun.sleep(50);
+			return original(id);
+		};
+		running = await startApp(new Application({ sessions: manager }));
+		const clients = Array.from({ length: 6 }, () => open(running!.base, { Cookie: "SID=any" }));
+		const results = await Promise.all(
+			clients.map((c) =>
+				c.ready.then(
+					() => "open" as const,
+					() => "refused" as const,
+				),
+			),
+		);
+		expect(results.filter((r) => r === "open").length).toBe(2);
+		for (const c of clients) c.socket.close();
+	});
 });
 
 describe("the upgrade guard", () => {
