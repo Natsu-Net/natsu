@@ -130,7 +130,6 @@ export interface PagesOptions {
 	 * place and filled per answer. `csrf` is natsu's own on a page with actions.
 	 */
 	secrets?: (ctx: Context) => Record<string, string>;
-	/** Most fields (counting repeats) an action's post may carry (default 1000). */
 	maxFields?: number;
 	/** Public origin for canonical URLs (default `config.General.url`). */
 	baseUrl?: string;

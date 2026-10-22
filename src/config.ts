@@ -37,7 +37,6 @@ export interface GeneralConfig {
 	socketAllowedOrigins: string[];
 	/** Refuse browser-like socket upgrades that carry no Origin header. */
 	socketRequireOrigin: boolean;
-	/** Seconds a signed live-tag list stays valid; a page drawn again signs a fresh one. */
 	liveTagTtl: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
