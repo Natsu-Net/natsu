@@ -258,6 +258,12 @@ function validate(config: NatsuConfig): NatsuConfig {
 	if (!Number.isInteger(socketSilenceTimeout) || socketSilenceTimeout < 0) {
 		throw new ConfigError(`General.socketSilenceTimeout must be a non-negative integer, got ${String(socketSilenceTimeout)}`);
 	}
+	if (!["strict", "lax", "none"].includes(config.Session.cookie.sameSite)) {
+		throw new ConfigError(`Session.cookie.sameSite must be one of strict|lax|none, got ${String(config.Session.cookie.sameSite)}`);
+	}
+	if (!Array.isArray(config.General.socketAllowedOrigins) || !config.General.socketAllowedOrigins.every((origin) => typeof origin === "string")) {
+		throw new ConfigError("General.socketAllowedOrigins must be a list of origin strings");
+	}
 	if (!Number.isInteger(config.General.liveTagTtl) || config.General.liveTagTtl < 1) {
 		throw new ConfigError(`General.liveTagTtl must be a positive integer, got ${String(config.General.liveTagTtl)}`);
 	}
@@ -345,7 +351,11 @@ function coerceEnvValue(value: string, fallback: unknown): unknown {
 		if (Number.isNaN(n)) throw new ConfigError(`${JSON.stringify(value)} is not a number`);
 		return n;
 	}
-	if (typeof fallback === "boolean") return /^(1|true|yes|on)$/i.test(value);
+	if (typeof fallback === "boolean") {
+		if (/^(1|true|yes|on)$/i.test(value)) return true;
+		if (/^(0|false|no|off)$/i.test(value)) return false;
+		throw new ConfigError(`${JSON.stringify(value)} is not a boolean (use true or false)`);
+	}
 	if (Array.isArray(fallback) || isPlainObject(fallback)) return parseJson(value);
 	if (typeof fallback === "string") return value;
 

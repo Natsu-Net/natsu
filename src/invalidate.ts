@@ -82,7 +82,9 @@ export function invalidate(tags: string | readonly string[], options: { remote?:
 
 // --- signing ---------------------------------------------------------------------
 
-let secret: string = process.env.NATSU_LIVE_SECRET || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+const FROM_ENV = process.env.NATSU_LIVE_SECRET;
+if (FROM_ENV && FROM_ENV.length < 16) throw new TypeError("natsu: NATSU_LIVE_SECRET is at least 16 characters");
+let secret: string = FROM_ENV || Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
 /** The key the tags in a page are signed with (default: `NATSU_LIVE_SECRET`, else random per process). */
 export function setLiveSecret(next: string): void {
