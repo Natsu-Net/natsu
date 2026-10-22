@@ -130,6 +130,8 @@ export interface PagesOptions {
 	 * place and filled per answer. `csrf` is natsu's own on a page with actions.
 	 */
 	secrets?: (ctx: Context) => Record<string, string>;
+	/** Most fields (counting repeats) an action's post may carry (default 1000). */
+	maxFields?: number;
 	/** Public origin for canonical URLs (default `config.General.url`). */
 	baseUrl?: string;
 	/** PageCache for signed-out visitors; `false` turns it off for every page. */
@@ -228,6 +230,7 @@ const NO_SECRETS: Record<string, string> = Object.freeze({}) as Record<string, s
 /** What uwu draws as the first child of a `<form @submit="action:…">`. */
 const ACTION_INPUT = /<input type="hidden" name="_action" value="[^"]*">/g;
 const MAX_BODY = 1024 * 1024;
+const MAX_FIELDS = 1000;
 const SWAP_MARKER = "__uwuSwap";
 const SWAP_SCRIPT =
 	/<script>(\(window\.__uwuSwap\|\|\(window\.__uwuSwap=function\(r,p\)\{var t=document\.getElementById\(r\),s=document\.getElementById\(p\);if\(t&&s\)\{s\.replaceWith\(t\.content\.cloneNode\(true\)\);t\.remove\(\);\}\}\)\)\("[\w-]+","[\w-]+"\);<\/script>)/g;
@@ -251,6 +254,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	let css = "";
 	let swaps = false;
 	const maxBody = options.maxBody ?? MAX_BODY;
+	const maxFields = options.maxFields ?? MAX_FIELDS;
 	const publicUrl = (): string => options.baseUrl ?? config.General.url;
 	setPublicOrigin(publicUrl);
 	if (config.General.requireActionAuth === true) assertActionsDeclareAuth();
@@ -649,6 +653,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			} catch {
 				return plain(400, "Bad Request");
 			}
+			let fields = 0;
+			for (const _ of form.keys()) if (++fields > maxFields) return plain(413, "Payload Too Large");
 
 			// Only what this page names, or a public action: never a name off the wire alone.
 			const short = form.get(ACTION_FIELD);

@@ -190,7 +190,9 @@ export function inputOf(form: FormData): Record<string, string | string[]> {
 	for (const [key, value] of form) {
 		if (key === ACTION_FIELD || key === CSRF_FIELD || typeof value !== "string") continue;
 		const held = out[key];
-		out[key] = held === undefined ? value : Array.isArray(held) ? [...held, value] : [held, value];
+		if (held === undefined) out[key] = value;
+		else if (Array.isArray(held)) held.push(value);
+		else out[key] = [held, value];
 	}
 	return out;
 }
@@ -200,7 +202,7 @@ const SECRET_FIELD = /pass|secret|token|csrf|code|card|cvc|cvv|otp/i;
 
 /** What a refused form shows again: its text fields, less anything secret, each at most 4000 characters. */
 export function valuesOf(input: Record<string, string | string[]>): Record<string, string | string[]> {
-	const out: Record<string, string | string[]> = {};
+	const out: Record<string, string | string[]> = Object.create(null);
 	for (const [key, value] of Object.entries(input)) {
 		if (SECRET_FIELD.test(key)) continue;
 		out[key] = Array.isArray(value) ? value.map((v) => v.slice(0, 4000)) : value.slice(0, 4000);
