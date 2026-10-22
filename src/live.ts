@@ -86,6 +86,7 @@ export interface LiveSocketData {
 	/** Live-data tag topics, which the next `watch` replaces. */
 	tags?: Set<string>;
 	ip?: string;
+	ended?: boolean;
 }
 
 interface ClientFrame {
@@ -159,9 +160,40 @@ export function stopPublishing(scopeId: string): void {
  */
 export function endSession(sessionId: string): void {
 	if (!sessionId) return;
+	closeSocketsOf(sessionId);
 	stopPublishing(sessionId);
 	revokeSession(sessionId);
 	dropScope(sessionId);
+}
+
+const socketsBySession = new Map<string, Set<ServerWebSocket<LiveSocketData>>>();
+
+function trackSocket(ws: ServerWebSocket<LiveSocketData>): void {
+	const id = ws.data.scopeId;
+	if (!id) return;
+	const set = socketsBySession.get(id) ?? new Set();
+	set.add(ws);
+	socketsBySession.set(id, set);
+}
+
+function untrackSocket(ws: ServerWebSocket<LiveSocketData>): void {
+	const id = ws.data.scopeId;
+	const set = id ? socketsBySession.get(id) : undefined;
+	if (!set) return;
+	set.delete(ws);
+	if (set.size === 0) socketsBySession.delete(id);
+}
+
+function closeSocketsOf(sessionId: string): void {
+	const set = socketsBySession.get(sessionId);
+	if (!set) return;
+	socketsBySession.delete(sessionId);
+	for (const ws of set) {
+		ws.data.ended = true;
+		try {
+			ws.close(4401, "session ended");
+		} catch {}
+	}
 }
 
 /** Forget every subscription. Tests and hot reload. */
@@ -170,6 +202,7 @@ export function resetLive(): void {
 	publishing.clear();
 	hooks = {};
 	socketsByIp.clear();
+	socketsBySession.clear();
 }
 
 const socketsByIp = new Map<string, number>();
@@ -274,6 +307,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			// actually holds: a connection that subscribed to everything would
 			// receive patches for state its page never rendered.
 			ws.data.topics = new Set();
+			trackSocket(ws);
 			try {
 				hooks.open?.(callerOf(ws.data));
 			} catch (error) {
@@ -283,6 +317,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 
 		message(ws: ServerWebSocket<LiveSocketData>, raw: string | Buffer) {
 			if (!isLive(ws)) return next?.message?.(ws as never, raw as never);
+			if (ws.data.ended) return;
 
 			let frame: ClientFrame;
 			try {
@@ -364,6 +399,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 		close(ws: ServerWebSocket<LiveSocketData>, code: number, reason: string) {
 			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
 			releaseIp(ws.data.ip);
+			untrackSocket(ws);
 			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
 			try {
 				hooks.close?.(callerOf(ws.data));

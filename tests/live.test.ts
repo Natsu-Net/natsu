@@ -667,6 +667,61 @@ describe("a session ending", () => {
 	});
 });
 
+@State("ledger")
+class Ledger {
+	@Networked() entries = 0;
+	static calls = 0;
+
+	@Action()
+	record() {
+		Ledger.calls += 1;
+		this.entries += 1;
+	}
+}
+
+describe("a destroyed session's sockets", () => {
+	async function ledgerApp() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/login", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.response.body = ctx.session.id;
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const response = await running.fetch("/login");
+		const id = await response.text();
+		const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		return { manager, id, cookie };
+	}
+
+	test("are closed with 4401 when the session is destroyed", async () => {
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		const closed = new Promise<number>((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+
+		await manager.destroy(id);
+
+		expect(await Promise.race([closed, Bun.sleep(1000).then(() => -1)])).toBe(4401);
+	});
+
+	test("cannot call actions after the session is destroyed", async () => {
+		Ledger.calls = 0;
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["ledger"] }));
+		await client.next(1);
+
+		await manager.destroy(id);
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["ledger"] }));
+		client.socket.send(JSON.stringify({ t: "call", store: "ledger", method: "record", args: [] }));
+		await Bun.sleep(100);
+
+		expect(Ledger.calls).toBe(0);
+		expect(client.frames.length).toBe(1);
+	});
+});
+
 describe("who is calling", () => {
 	async function partyApp() {
 		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
