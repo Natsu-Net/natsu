@@ -333,6 +333,10 @@ export function decodeFlash(raw: string | undefined): Flash | null {
 
 /** A redirect target an action may name: a path on this site, never `//host` or a scheme. */
 export function sameSitePath(target: string): string | null {
-	if (!target.startsWith("/") || /^\/[/\\]/.test(target) || /[\u0000-\u001f]/.test(target)) return null;
-	return target;
+	if (!target.startsWith("/") || /^\/[/\\]/.test(target) || /[\u0000-\u001f\u007f]/.test(target)) return null;
+	try {
+		return target.replace(/[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
+	} catch {
+		return null;
+	}
 }
