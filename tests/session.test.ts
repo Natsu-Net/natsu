@@ -428,6 +428,42 @@ describe("default headers on session pages", () => {
 	});
 });
 
+describe("anonymous session lifetime", () => {
+	const horizon = (seconds: number) => nowSeconds() + seconds;
+
+	test("a session with no data expires on the short bound", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		expect(session.expire).toBeLessThanOrEqual(horizon(10));
+		expect(session.expire).toBeGreaterThan(horizon(5));
+	});
+
+	test("the first Set promotes it to the full lifetime", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		session.Set("user", "aiko");
+		expect(session.expire).toBeGreaterThan(horizon(900));
+	});
+
+	test("renewing a still-anonymous session keeps the short bound", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		session.Renew();
+		expect(session.expire).toBeLessThanOrEqual(horizon(10));
+	});
+
+	test("without the option the lifetime is the ttl, as before", () => {
+		const manager = new SessionManager({ ttl: 1000, sweepInterval: 0 });
+		expect(manager.create().expire).toBeGreaterThan(horizon(900));
+	});
+
+	test("the config default is an hour", () => {
+		reset({ Session: { driver: "memory", sweepInterval: 0, ttl: 86400 } });
+		const manager = SessionManager.fromConfig(config);
+		expect(manager.anonymousTtl).toBe(3600);
+	});
+});
+
 describe("rotate", () => {
 	let running: RunningApp | undefined;
 
@@ -458,6 +494,7 @@ describe("rotate", () => {
 		expect(before).toBe(oldId);
 		expect(after).not.toBe(oldId);
 		expect(user).toBe("aiko");
+		expect((await manager.get(after!))!.expire).toBeGreaterThan(nowSeconds() + 3600);
 		expect(login.headers.get("set-cookie")).toContain(`SID=${after}`);
 		expect(await manager.get(oldId)).toBeUndefined();
 		expect((await manager.get(after!))?.Get("user")).toBe("aiko");

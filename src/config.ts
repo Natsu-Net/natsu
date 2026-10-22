@@ -102,6 +102,8 @@ export interface SessionConfig {
 	driver: "sqlite" | "memory" | "none";
 	/** Lifetime in seconds. */
 	ttl: number;
+	/** Lifetime in seconds of a session that holds no data yet; the first `Set` promotes it to `ttl`. */
+	anonymousTtl: number;
 	/** Expiry sweep interval in seconds; 0 disables the timer. */
 	sweepInterval: number;
 	/** sqlite driver only. `:memory:` keeps it in-process. */
@@ -178,6 +180,7 @@ export function defaultConfig(): NatsuConfig {
 			CookieName: "NATSU_SESSION",
 			driver: "sqlite",
 			ttl: 60 * 60 * 24 * 7,
+			anonymousTtl: 3600,
 			sweepInterval: 300,
 			path: ".natsu/sessions.sqlite",
 			cookie: {
@@ -238,6 +241,9 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(socketMaxPerIp) || socketMaxPerIp < 0) {
 		throw new ConfigError(`General.socketMaxPerIp must be a non-negative integer, got ${String(socketMaxPerIp)}`);
+	}
+	if (!Number.isInteger(config.Session.anonymousTtl) || config.Session.anonymousTtl < 1) {
+		throw new ConfigError(`Session.anonymousTtl must be a positive integer, got ${String(config.Session.anonymousTtl)}`);
 	}
 	const { socketMessageRate, socketMessageBurst, socketSilenceTimeout } = config.General;
 	if (!Number.isFinite(socketMessageRate) || socketMessageRate < 0) {

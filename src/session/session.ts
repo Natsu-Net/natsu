@@ -33,6 +33,7 @@ export class Session {
 	private manager: SessionManager | undefined;
 	private saving: Promise<void> | undefined;
 	private queued = false;
+	private limited = false;
 
 	constructor(id: string, expire: number, data: Record<string, unknown> = {}, manager?: SessionManager) {
 		this.id = id;
@@ -40,6 +41,13 @@ export class Session {
 		this.expire = expire;
 		this.data = data;
 		this.manager = manager;
+		this.limited = manager !== undefined && manager.anonymousTtl < manager.ttl && Object.keys(data).length === 0;
+	}
+
+	private promote(): void {
+		if (!this.limited) return;
+		this.limited = false;
+		this.expire = Math.floor(Date.now() / 1000) + (this.manager?.ttl ?? 60 * 60 * 24 * 7);
 	}
 
 	/** Write without scheduling a save — for values that live and die with the request. */
@@ -50,6 +58,7 @@ export class Session {
 	public Set(key: string, value: unknown): void {
 		this.data[key] = value;
 		this.dirty = true;
+		this.promote();
 	}
 
 	/** v1 returns `false`, not `undefined`, for an absent key. Kept as-is. */
@@ -79,7 +88,8 @@ export class Session {
 	}
 
 	public Renew(ttl?: number): void {
-		this.SetExpires(ttl ?? this.manager?.ttl ?? 60 * 60 * 24 * 7);
+		const fallback = this.limited ? this.manager?.anonymousTtl : this.manager?.ttl;
+		this.SetExpires(ttl ?? fallback ?? 60 * 60 * 24 * 7);
 	}
 
 	public IsExpired(now: number = Date.now() / 1000): boolean {
@@ -132,6 +142,7 @@ export interface SessionManagerOptions {
 	adapter?: SessionAdapter;
 	/** Lifetime in seconds. */
 	ttl?: number;
+	anonymousTtl?: number;
 	cookieName?: string;
 	cookie?: Partial<SessionCookieConfig>;
 	/** Push expiry forward on every request that loads the session. */
@@ -146,6 +157,7 @@ export type SessionHook = (ctx: Context) => void | Promise<void>;
 export class SessionManager {
 	public readonly adapter: SessionAdapter;
 	public readonly ttl: number;
+	public readonly anonymousTtl: number;
 	public readonly cookieName: string;
 	public readonly cookie: SessionCookieConfig;
 	public readonly rolling: boolean;
@@ -158,6 +170,7 @@ export class SessionManager {
 	constructor(options: SessionManagerOptions = {}) {
 		this.adapter = options.adapter ?? new MemoryAdapter();
 		this.ttl = options.ttl ?? 60 * 60 * 24 * 7;
+		this.anonymousTtl = Math.min(options.anonymousTtl ?? this.ttl, this.ttl);
 		this.cookieName = options.cookieName ?? "NATSU_SESSION";
 		this.cookie = {
 			path: options.cookie?.path ?? "/",
@@ -188,6 +201,7 @@ export class SessionManager {
 		return new SessionManager({
 			adapter,
 			ttl: config.Session.ttl,
+			anonymousTtl: config.Session.anonymousTtl,
 			cookieName: hostBound ? `__Host-${name}` : name,
 			cookie,
 			sweepInterval: config.Session.sweepInterval,
@@ -195,7 +209,7 @@ export class SessionManager {
 	}
 
 	public create(): Session {
-		const session = new Session(crypto.randomUUID(), Math.floor(Date.now() / 1000) + this.ttl, {}, this);
+		const session = new Session(crypto.randomUUID(), Math.floor(Date.now() / 1000) + this.anonymousTtl, {}, this);
 		session.dirty = true;
 		this.live.set(session.id, session);
 		return session;
@@ -241,7 +255,7 @@ export class SessionManager {
 	public async rotate(ctx: Context, options: { keepData?: boolean } = {}): Promise<Session> {
 		const old = ctx.sessionLoaded ? ctx.session : undefined;
 		const next = this.create();
-		if (old && options.keepData !== false) next.data = { ...old.data };
+		if (old && options.keepData !== false) for (const [key, value] of Object.entries(old.data)) next.Set(key, value);
 		ctx.session = next;
 		this.attachCookie(ctx, next);
 		if (old) await this.destroy(old.id);
