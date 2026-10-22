@@ -184,7 +184,7 @@ export class SessionManager {
 		const interval = options.sweepInterval ?? 300;
 		if (interval > 0) {
 			this.timer = setInterval(() => {
-				void this.sweep();
+				this.sweep().catch((error: Error) => log.warn(`[<yellow>SESSION</yellow>] sweep failed: ${error.message}`));
 			}, interval * 1000);
 			// A background sweep must never be the reason a process stays up.
 			this.timer.unref?.();

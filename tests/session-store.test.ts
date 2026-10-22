@@ -53,3 +53,25 @@ describe("session data keys", () => {
 		expect(({} as Record<string, unknown>).admin).toBeUndefined();
 	});
 });
+
+describe("the expiry sweep", () => {
+	test("a store that fails during it is logged, not an unhandled rejection", async () => {
+		const { SessionManager } = await import("../src/session/session.ts");
+		const { MemoryAdapter } = await import("../src/session/adapter.ts");
+		const failing = new MemoryAdapter();
+		failing.sweep = () => {
+			throw new Error("disk full");
+		};
+		const thrown: string[] = [];
+		const listener = (reason: unknown) => void thrown.push(String((reason as Error)?.message ?? reason));
+		process.on("unhandledRejection", listener);
+		const manager = new SessionManager({ adapter: failing, sweepInterval: 0.02 });
+		try {
+			await Bun.sleep(100);
+			expect(thrown).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", listener);
+			await manager.close();
+		}
+	});
+});
