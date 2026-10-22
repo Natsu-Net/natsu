@@ -55,16 +55,31 @@ export interface CookieOptions {
 	sameSite?: "strict" | "lax" | "none";
 }
 
+const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const COOKIE_PATH = /^\/[\x20-\x3a\x3c-\x7e]*$/;
+const COOKIE_DOMAIN = /^\.?[0-9A-Za-z](?:[0-9A-Za-z.-]*[0-9A-Za-z])?$/;
+
 /** Serialise one `Set-Cookie` value. Exported because the session store needs it. */
 export function serializeCookie(name: string, value: string, options: CookieOptions = {}): string {
+	if (!COOKIE_NAME.test(name)) throw new TypeError(`natsu: ${JSON.stringify(name)} is not a cookie name`);
+	const path = options.path ?? "/";
+	if (!COOKIE_PATH.test(path)) throw new TypeError(`natsu: ${JSON.stringify(path)} is not a cookie path`);
+	if (options.domain && !COOKIE_DOMAIN.test(options.domain)) throw new TypeError(`natsu: ${JSON.stringify(options.domain)} is not a cookie domain`);
+	if (options.maxAge !== undefined && !Number.isFinite(options.maxAge)) throw new TypeError("natsu: a cookie's maxAge is a finite number");
+	if (options.expires && Number.isNaN(options.expires.getTime())) throw new TypeError("natsu: a cookie's expires is a valid date");
+	const sameSite = options.sameSite ?? "lax";
+	const prefixed = name.startsWith("__Host-") || name.startsWith("__Secure-");
+	if (name.startsWith("__Host-") && (options.domain || path !== "/")) {
+		throw new TypeError(`natsu: ${name} is a __Host- cookie: no domain, and path /`);
+	}
 	const parts = [`${name}=${encodeURIComponent(value)}`];
 	if (options.maxAge !== undefined) parts.push(`Max-Age=${Math.floor(options.maxAge)}`);
 	if (options.domain) parts.push(`Domain=${options.domain}`);
-	parts.push(`Path=${options.path ?? "/"}`);
+	parts.push(`Path=${path}`);
 	if (options.expires) parts.push(`Expires=${options.expires.toUTCString()}`);
 	if (options.httpOnly !== false) parts.push("HttpOnly");
-	if (options.secure) parts.push("Secure");
-	parts.push(`SameSite=${capitalise(options.sameSite ?? "lax")}`);
+	if (options.secure || prefixed || sameSite === "none") parts.push("Secure");
+	parts.push(`SameSite=${capitalise(sameSite)}`);
 	return parts.join("; ");
 }
 
@@ -81,6 +96,7 @@ export function parseCookies(header: string | null): Map<string, string> {
 		if (eq < 1) continue;
 		const key = pair.slice(0, eq).trim();
 		if (!key) continue;
+		if (out.has(key)) continue;
 		const raw = pair.slice(eq + 1).trim();
 		try {
 			out.set(key, decodeURIComponent(raw));
@@ -90,6 +106,22 @@ export function parseCookies(header: string | null): Map<string, string> {
 		}
 	}
 	return out;
+}
+
+function keepCookiesPrivate(headers: Headers): void {
+	if (!headers.has("set-cookie")) return;
+	const control = headers.get("cache-control");
+	if (control === null) {
+		headers.set("cache-control", "private");
+		return;
+	}
+	const kept = control
+		.split(",")
+		.map((directive) => directive.trim())
+		.filter((directive) => !/^s-maxage\b/i.test(directive))
+		.map((directive) => (/^public$/i.test(directive) ? "private" : directive));
+	const next = kept.join(", ");
+	if (next !== control) headers.set("cache-control", next);
 }
 
 export class NatsuResponse {
@@ -278,17 +310,24 @@ export class Context {
 	 * PNG never mints a row — v1 created one for every request that arrived.
 	 */
 	public get session(): Session {
+		this.sessionTouched = true;
 		if (this._session) return this._session;
 		if (!this.sessions) {
 			throw new Error("natsu: ctx.session is unavailable — Session support is disabled in config");
 		}
-		this._session = this.sessions.create();
+		this._session = this.sessions.create(this.ip);
 		this.sessions.attachCookie(this, this._session);
 		return this._session;
 	}
 
 	public set session(session: Session) {
 		this._session = session;
+	}
+
+	public sessionTouched = false;
+
+	public get currentSession(): Session | undefined {
+		return this._session;
 	}
 
 	/** Whether a session was loaded or created — used to skip cookie work. */
@@ -333,7 +372,9 @@ export class Context {
 	public joinRoom<T extends object>(Class: StateClass<T>, roomId: string): T {
 		if (Class.scope !== "room") throw new Error(`natsu/state: ${Class.stateKey} is not room-scoped`);
 		if (!roomId) throw new Error(`natsu/state: ${Class.stateKey} needs a room id`);
-		grantRoom(this.session.id, Class as unknown as StateClass, roomId);
+		if (!grantRoom(this.session.id, Class as unknown as StateClass, roomId)) {
+			throw new Error(`natsu/state: this session holds too many rooms to join ${Class.stateKey}`);
+		}
 		return resolveState(Class, roomId);
 	}
 
@@ -346,6 +387,11 @@ export class Context {
 	/** Build the outgoing `Response`. Called once, by the server. */
 	public toResponse(): Response {
 		const { response } = this;
+		if (this.sessionTouched) {
+			const { headers } = response;
+			if (!headers.has("Cache-Control")) headers.set("Cache-Control", "private, no-store");
+			if (!headers.has("X-Content-Type-Options")) headers.set("X-Content-Type-Options", "nosniff");
+		}
 		const body = response.body;
 
 		// A handler that builds its own Response owns it completely; we only
@@ -356,9 +402,13 @@ export class Context {
 					if (key === "set-cookie") body.headers.append(key, value);
 					else if (!body.headers.has(key)) body.headers.set(key, value);
 				}
+				try {
+					keepCookiesPrivate(body.headers);
+				} catch {}
 			}
 			return body;
 		}
+		if (response.headersInitialized) keepCookiesPrivate(response.headers);
 
 		const status = response.status;
 		const headers = response.headersInitialized ? response.headers : undefined;

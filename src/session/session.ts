@@ -15,7 +15,7 @@
 
 import type { Context, Middleware } from "../context.ts";
 import type { NatsuConfig, SessionCookieConfig } from "../config.ts";
-import { endSession } from "../live.ts";
+import { endSession, ipKey, socketSessionIds } from "../live.ts";
 import { log } from "../logger.ts";
 import { MemoryAdapter, type SessionAdapter, type SessionRecord } from "./adapter.ts";
 import { SqliteAdapter } from "./sqlite.ts";
@@ -30,9 +30,15 @@ export class Session {
 	/** Set by any mutation; cleared once the store has the current value. */
 	public dirty = false;
 
+	public destroyed = false;
+
+	/** @internal */
+	public holder: string | undefined;
+
 	private manager: SessionManager | undefined;
 	private saving: Promise<void> | undefined;
 	private queued = false;
+	private limited = false;
 
 	constructor(id: string, expire: number, data: Record<string, unknown> = {}, manager?: SessionManager) {
 		this.id = id;
@@ -40,6 +46,14 @@ export class Session {
 		this.expire = expire;
 		this.data = data;
 		this.manager = manager;
+		this.limited = manager !== undefined && manager.anonymousTtl < manager.ttl && Object.keys(data).length === 0;
+	}
+
+	private promote(): void {
+		if (!this.limited) return;
+		this.limited = false;
+		this.manager?.release(this);
+		this.expire = Math.floor(Date.now() / 1000) + (this.manager?.ttl ?? 60 * 60 * 24 * 7);
 	}
 
 	/** Write without scheduling a save — for values that live and die with the request. */
@@ -50,16 +64,17 @@ export class Session {
 	public Set(key: string, value: unknown): void {
 		this.data[key] = value;
 		this.dirty = true;
+		this.promote();
 	}
 
 	/** v1 returns `false`, not `undefined`, for an absent key. Kept as-is. */
 	public Get<T = unknown>(key: string): T | false {
-		const value = this.data[key];
+		const value = Object.hasOwn(this.data, key) ? this.data[key] : undefined;
 		return value === undefined ? false : (value as T);
 	}
 
 	public Has(key: string): boolean {
-		return this.data[key] !== undefined;
+		return Object.hasOwn(this.data, key) && this.data[key] !== undefined;
 	}
 
 	public delete(key: string): void {
@@ -79,7 +94,8 @@ export class Session {
 	}
 
 	public Renew(ttl?: number): void {
-		this.SetExpires(ttl ?? this.manager?.ttl ?? 60 * 60 * 24 * 7);
+		const fallback = this.limited ? this.manager?.anonymousTtl : this.manager?.ttl;
+		this.SetExpires(ttl ?? fallback ?? 60 * 60 * 24 * 7);
 	}
 
 	public IsExpired(now: number = Date.now() / 1000): boolean {
@@ -97,7 +113,7 @@ export class Session {
 	 */
 	public async Save(): Promise<void> {
 		const manager = this.manager;
-		if (!manager) return;
+		if (!manager || this.destroyed) return;
 		if (this.saving) {
 			if (this.queued) return this.saving;
 			this.queued = true;
@@ -105,6 +121,7 @@ export class Session {
 			this.saving = (async () => {
 				await previous.catch(() => undefined);
 				this.queued = false;
+				if (this.destroyed) return;
 				await manager.adapter.save(this.toRecord());
 				this.dirty = false;
 			})();
@@ -132,12 +149,15 @@ export interface SessionManagerOptions {
 	adapter?: SessionAdapter;
 	/** Lifetime in seconds. */
 	ttl?: number;
+	anonymousTtl?: number;
 	cookieName?: string;
 	cookie?: Partial<SessionCookieConfig>;
 	/** Push expiry forward on every request that loads the session. */
 	rolling?: boolean;
 	/** Seconds between expiry sweeps; 0 disables. */
 	sweepInterval?: number;
+	/** Sessions without data one address may hold; 0 means unlimited. */
+	maxAnonymousPerIp?: number;
 }
 
 /** Hooks that run right after a session is attached to a request (v1's session middleware registry). */
@@ -146,9 +166,13 @@ export type SessionHook = (ctx: Context) => void | Promise<void>;
 export class SessionManager {
 	public readonly adapter: SessionAdapter;
 	public readonly ttl: number;
+	public readonly anonymousTtl: number;
 	public readonly cookieName: string;
 	public readonly cookie: SessionCookieConfig;
 	public readonly rolling: boolean;
+	public readonly maxAnonymousPerIp: number;
+
+	private readonly anonymous = new Map<string, Set<Session>>();
 
 	/** id -> live instance. The identity map is what makes concurrent requests safe. */
 	private readonly live = new Map<string, Session>();
@@ -158,6 +182,7 @@ export class SessionManager {
 	constructor(options: SessionManagerOptions = {}) {
 		this.adapter = options.adapter ?? new MemoryAdapter();
 		this.ttl = options.ttl ?? 60 * 60 * 24 * 7;
+		this.anonymousTtl = Math.min(options.anonymousTtl ?? this.ttl, this.ttl);
 		this.cookieName = options.cookieName ?? "NATSU_SESSION";
 		this.cookie = {
 			path: options.cookie?.path ?? "/",
@@ -167,11 +192,12 @@ export class SessionManager {
 			...(options.cookie?.domain ? { domain: options.cookie.domain } : {}),
 		};
 		this.rolling = options.rolling ?? true;
+		this.maxAnonymousPerIp = options.maxAnonymousPerIp ?? 0;
 
 		const interval = options.sweepInterval ?? 300;
 		if (interval > 0) {
 			this.timer = setInterval(() => {
-				void this.sweep();
+				this.sweep().catch((error: Error) => log.warn(`[<yellow>SESSION</yellow>] sweep failed: ${error.message}`));
 			}, interval * 1000);
 			// A background sweep must never be the reason a process stays up.
 			this.timer.unref?.();
@@ -181,20 +207,47 @@ export class SessionManager {
 	static fromConfig(config: NatsuConfig): SessionManager {
 		const adapter: SessionAdapter =
 			config.Session.driver === "sqlite" ? new SqliteAdapter({ path: config.Session.path }) : new MemoryAdapter();
+		const https = config.General.url.startsWith("https:");
+		const cookie = { ...config.Session.cookie, secure: config.Session.cookie.secure || https };
+		const name = config.Session.CookieName;
+		const hostBound = https && cookie.path === "/" && !cookie.domain && !/^__(Host|Secure)-/.test(name);
 		return new SessionManager({
 			adapter,
 			ttl: config.Session.ttl,
-			cookieName: config.Session.CookieName,
-			cookie: config.Session.cookie,
+			anonymousTtl: config.Session.anonymousTtl,
+			cookieName: hostBound ? `__Host-${name}` : name,
+			cookie,
 			sweepInterval: config.Session.sweepInterval,
+			maxAnonymousPerIp: config.Session.maxAnonymousPerIp,
 		});
 	}
 
-	public create(): Session {
-		const session = new Session(crypto.randomUUID(), Math.floor(Date.now() / 1000) + this.ttl, {}, this);
+	public create(ip?: string): Session {
+		const session = new Session(crypto.randomUUID(), Math.floor(Date.now() / 1000) + this.anonymousTtl, {}, this);
 		session.dirty = true;
 		this.live.set(session.id, session);
+		if (ip && this.maxAnonymousPerIp > 0) this.hold(session, ipKey(ip));
 		return session;
+	}
+
+	private hold(session: Session, key: string): void {
+		session.holder = key;
+		const held = this.anonymous.get(key) ?? new Set<Session>();
+		this.anonymous.set(key, held);
+		held.add(session);
+		for (const oldest of held) {
+			if (held.size <= this.maxAnonymousPerIp) break;
+			this.destroy(oldest.id).catch((error: Error) => log.warn(`[<yellow>SESSION</yellow>] dropping an anonymous session failed: ${error.message}`));
+		}
+	}
+
+	/** @internal */
+	public release(session: Session): void {
+		const key = session.holder;
+		if (key === undefined) return;
+		session.holder = undefined;
+		const held = this.anonymous.get(key);
+		if (held?.delete(session) && held.size === 0) this.anonymous.delete(key);
 	}
 
 	/**
@@ -227,11 +280,26 @@ export class SessionManager {
 	}
 
 	public async destroy(id: string): Promise<void> {
+		const session = this.live.get(id);
+		if (session) {
+			session.destroyed = true;
+			this.release(session);
+		}
 		this.live.delete(id);
 		// Networkable state is keyed by session id, so a session that goes away
 		// takes its stores, its room grants and its socket fan-out with it.
 		endSession(id);
 		await this.adapter.destroy(id);
+	}
+
+	public async rotate(ctx: Context, options: { keepData?: boolean } = {}): Promise<Session> {
+		const old = ctx.sessionLoaded ? ctx.session : undefined;
+		const next = this.create();
+		if (old && options.keepData !== false) for (const [key, value] of Object.entries(old.data)) next.Set(key, value);
+		ctx.session = next;
+		this.attachCookie(ctx, next);
+		if (old) await this.destroy(old.id);
+		return next;
 	}
 
 	/** Write the session out if anything changed. */
@@ -243,10 +311,15 @@ export class SessionManager {
 	public async sweep(now: number = Date.now() / 1000): Promise<number> {
 		for (const [id, session] of this.live) {
 			if (!session.IsExpired(now)) continue;
+			session.destroyed = true;
+			this.release(session);
 			this.live.delete(id);
 			endSession(id);
 		}
 		const removed = await this.adapter.sweep(now);
+		for (const id of socketSessionIds()) {
+			if (!this.live.has(id) && !(await this.adapter.load(id))) endSession(id);
+		}
 		if (removed > 0) log.debug(`[<yellow>SESSION</yellow>] swept <cyan>${removed}</cyan> expired`);
 		return removed;
 	}
@@ -275,13 +348,17 @@ export class SessionManager {
 	/** Forget in-memory instances without touching the store. */
 	public evict(id?: string): void {
 		if (id) this.live.delete(id);
-		else this.live.clear();
+		else {
+			this.live.clear();
+			this.anonymous.clear();
+		}
 	}
 
 	public async close(): Promise<void> {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
 		this.live.clear();
+		this.anonymous.clear();
 		await this.adapter.close();
 	}
 }
@@ -313,6 +390,7 @@ export function sessionMiddleware(manager: SessionManager): Middleware {
 
 		// Persist after the handler, so N writes in one request are one write
 		// to the store.
-		if (ctx.sessionLoaded) await manager.persist(ctx.session);
+		const current = ctx.currentSession;
+		if (current) await manager.persist(current);
 	};
 }

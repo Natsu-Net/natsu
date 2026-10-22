@@ -19,7 +19,7 @@ import { clearSources, defaultKind, registerModelResolver, source } from "../src
 import { Forbidden, NotFound, PageCompileError } from "../src/pages/errors.ts";
 import { type PagesOptions, type PageSite, mountPages } from "../src/pages/mount.ts";
 import { Application } from "../src/server.ts";
-import { type RunningApp, reset, startApp } from "./helpers.ts";
+import { type RunningApp, rawRequest, reset, startApp } from "./helpers.ts";
 
 let dir: string;
 let running: RunningApp | undefined;
@@ -557,6 +557,42 @@ describe("service fetches", () => {
 			expect((await get("/p/missing")).status).toBe(404);
 			expect((await get("/p/locked")).status).toBe(403);
 			expect((await get("/broken")).status).toBe(502);
+		} finally {
+			stub.stop(true);
+		}
+	});
+});
+
+describe("service fetch paths", () => {
+	test("a dot-segment param never reaches the service, and the cookie stays home", async () => {
+		const seen: { path: string; cookie: string | null }[] = [];
+		const stub = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				const url = new URL(request.url);
+				seen.push({ path: url.pathname, cookie: request.headers.get("cookie") });
+				return Response.json({ path: url.pathname });
+			},
+		});
+		try {
+			const base = `http://127.0.0.1:${stub.port}`;
+			await serve(
+				{
+					"_error.uwu": `<template>{{error.status}}</template>`,
+					"jobs/[id].uwu": `<page><data job="api:GET /jobs/{{params.id}}" required></data></page><template>{{job.path}}</template>`,
+				},
+				{ services: { api: { base: `${base}/v1` } } },
+			);
+
+			for (const dots of ["%2e%2e", "%2E%2E", "%2e", ".", "a%2F..%2Fb", "..%5Cb", "%2e%2e%2f", "x%5C.%5Cy"]) {
+				const answer = await rawRequest(running!.base, `GET /jobs/${dots} HTTP/1.1`, ["cookie: sid=visitor"]);
+				expect(answer).toContain(" 404 ");
+			}
+			expect(seen.filter((s) => s.path !== "/v1/jobs/ok")).toEqual([]);
+
+			const fine = await rawRequest(running!.base, "GET /jobs/ok HTTP/1.1", ["cookie: sid=visitor"]);
+			expect(fine).toContain("/v1/jobs/ok");
 		} finally {
 			stub.stop(true);
 		}

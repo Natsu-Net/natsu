@@ -41,7 +41,10 @@ describe("socket and proxy limits", () => {
 		expect(General.proxyHops).toBe(1);
 		expect(General.socketMaxPayload).toBe(32768);
 		expect(General.socketIdleTimeout).toBe(120);
-		expect(General.socketMaxPerIp).toBe(0);
+		expect(General.socketMaxPerIp).toBe(32);
+		expect(General.socketMessageRate).toBe(20);
+		expect(General.socketMessageBurst).toBe(100);
+		expect(General.socketSilenceTimeout).toBe(900);
 	});
 
 	test("nonsense values are refused", () => {

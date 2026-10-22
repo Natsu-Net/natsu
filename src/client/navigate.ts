@@ -108,13 +108,15 @@
  *
  * **The swap**, step by step:
  *
- *  1. The part is parsed with `DOMParser`. The server leaves every
+ *  1. The part is parsed into an `<html>` element of an inert document, which
+ *     the page's CSP never sees (a `DOMParser` document inherits it, and
+ *     Chromium reports every inline `<style>` in it). The server leaves every
  *     `<noscript>` out of it: a parser with scripting off reads their content
  *     as markup, so `<noscript><style>` would become a live style, and a
  *     `</div>` inside would let the rest out of it. A part that cannot be
- *     parsed (Trusted Types refuses `DOMParser`), or still holds a
+ *     parsed (Trusted Types refuses `innerHTML`), or still holds a
  *     `<noscript>`, is a real load. A region with a declarative shadow root
- *     (`<template shadowrootmode>`, which DOMParser leaves inert) is never
+ *     (`<template shadowrootmode>`, which this parse leaves inert) is never
  *     sent as a part: the server answers with a real load. An answer already in hand (prefetched)
  *     yields a frame first, so the click's own frame paints.
  *  2. Its region ids must equal the current ones, in order.
@@ -420,7 +422,7 @@ const counts = (s: HTMLScriptElement) =>
  * one that called it is in `aware` itself, so it is never listed.
  */
 const blind = (s: HTMLScriptElement) => !aware.has(s.src || s);
-const regions = (doc: Document) => [...doc.querySelectorAll(REGION)];
+const regions = (root: ParentNode) => [...root.querySelectorAll(REGION)];
 /**
  * Whether a script that counts has not called `mount`, noting the
  * document's scripts first: before every visit, for one a loader added since.
@@ -548,6 +550,7 @@ const watchLive = (refresh: () => unknown) => {
 	let want: string | string[] = "";
 	let wait = 1e3;
 	let back = 0;
+	let aged = 0;
 	let t: ReturnType<typeof setTimeout>;
 	const say = () => ws && ws.readyState == 1 && ws.send(JSON.stringify({ t: "watch", tags: want }));
 	const open = () => {
@@ -561,6 +564,7 @@ const watchLive = (refresh: () => unknown) => {
 		s.onmessage = (e) => {
 			try {
 				const m = JSON.parse(e.data);
+				if (m.t == "stale") Date.now() - aged > 3e4 && ((aged = Date.now()), acting || refresh());
 				if (m.t == "invalidate")
 					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(() => fire("invalidate", { tag: m.tag }) && refresh(), 30)));
 					else
@@ -947,7 +951,18 @@ if (!first && KEY && regions(D)[0]) {
 	);
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
-	const sheets = (doc: Document) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
+	const sheets = (doc: { head: Element }) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
+	const parse = (text: string) => {
+		const inert = D.implementation.createHTMLDocument("");
+		const root = inert.createElement("html");
+		root.innerHTML = text;
+		const attrs = /<html((?:"[^"]*"|'[^']*'|[^>"'])*)>/i.exec(text)?.[1];
+		if (attrs) {
+			inert.body.innerHTML = `<i${attrs}>`;
+			for (const { name, value } of inert.body.firstElementChild!.attributes) root.setAttribute(name, value);
+		}
+		return { root, head: root.querySelector("head")!, body: root.querySelector("body")! };
+	};
 	const href = (l: Element) => l.getAttribute("href");
 
 	const visit = async (url: string | URL, o: Opts = {}): Promise<void> => {
@@ -1016,16 +1031,16 @@ if (!first && KEY && regions(D)[0]) {
 		try {
 			const f = new URL(r.url || u);
 			f.hash = u.hash;
-			const doc = new DOMParser().parseFromString(text, "text/html");
+			const doc = parse(text);
 			// Read now: the swap moves the head's elements out of `doc`.
-			const live = doc.querySelector('meta[name="natsu-live"]');
+			const live = doc.root.querySelector('meta[name="natsu-live"]');
 			// A nonce in the part's head is the real one, and Natsu-Nonce lists the
 			// ones the server vouched for. Those read "" (as a live element shows its
 			// hidden nonce, so the merge sees an unchanged one as unchanged) and
 			// carry the boot nonce, the only one the CSP takes, if they go in; any
 			// other nonce goes.
 			const vouched = (head.get("natsu-nonce") || "").split(" ");
-			for (const e of doc.head.querySelectorAll<HTMLElement>("[nonce]")) {
+			for (const e of doc.root.querySelectorAll<HTMLElement>("[nonce]")) {
 				const v = e.getAttribute("nonce");
 				if (v && vouched.includes(v)) e.setAttribute("nonce", ""), (e.nonce = NONCE);
 				else e.removeAttribute("nonce");
@@ -1039,18 +1054,18 @@ if (!first && KEY && regions(D)[0]) {
 				.map((p) => [new URL(p.get("src")!, f).href, p] as const);
 			const whole = head.get("natsu-part") == "body";
 			const now = regions(D);
-			const next = regions(doc);
-			const key = doc.querySelector<HTMLMetaElement>('meta[name="natsu"]')?.content;
+			const next = regions(doc.root);
+			const key = doc.root.querySelector<HTMLMetaElement>('meta[name="natsu"]')?.content;
 			// DOMParser reads a <noscript> with scripting off, as markup: the server
 			// drops them, and one left (in svg, say) is refused. (A declarative
 			// shadow root, which DOMParser would leave an inert <template>, the
 			// server never sends: a region with one is a real load.)
-			if ((!whole && ids(now) != ids(next)) || doc.querySelector("noscript")) {
+			if ((!whole && ids(now) != ids(next)) || doc.root.querySelector("noscript")) {
 				if (DEV)
 					why(
 						...(ids(now) != ids(next)
 							? ["regions differ:", now.map((e) => e.id), "->", next.map((e) => e.id)]
-							: ["a <noscript> in the part:", doc.querySelector("noscript")]),
+							: ["a <noscript> in the part:", doc.root.querySelector("noscript")]),
 					);
 				return full(u, h);
 			}
@@ -1145,7 +1160,7 @@ if (!first && KEY && regions(D)[0]) {
 				if (whole) {
 					unmount(D.body);
 					for (const n of [...D.body.childNodes]) parsed.has(n) && n.remove();
-					sync(H, doc.documentElement);
+					sync(H, doc.root);
 					sync(D.body, doc.body);
 					const nodes = [...doc.body.childNodes];
 					D.body.prepend(...nodes);

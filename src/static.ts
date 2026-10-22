@@ -132,18 +132,17 @@ export class StaticFiles {
 			}
 		}
 
-		if (!this.options.followSymlinks) {
-			try {
-				// realpath only answers for paths that exist; a miss is handled
-				// later as a plain 404.
-				const real = realpathSync(target);
-				if (!this.contains(real)) return { rejected: "escape" };
-			} catch {
-				// ENOENT here means "no such file", not "unsafe".
-			}
-		}
+		if (!this.options.followSymlinks && !this.staysInside(target)) return { rejected: "escape" };
 
 		return { path: target };
+	}
+
+	private staysInside(target: string): boolean {
+		try {
+			return this.contains(realpathSync(target));
+		} catch {
+			return true;
+		}
 	}
 
 	private contains(path: string): boolean {
@@ -193,6 +192,7 @@ export class StaticFiles {
 			if (!this.options.index) return false;
 			filePath = resolve(filePath, this.options.index);
 			if (!this.contains(filePath)) return false;
+			if (!this.options.followSymlinks && !this.staysInside(filePath)) return false;
 			stat = statOf(filePath);
 		}
 
@@ -204,6 +204,7 @@ export class StaticFiles {
 		const { headers } = ctx.response;
 		headers.set("Content-Type", MIME_OVERRIDES[extname(filePath)] ?? file.type ?? "application/octet-stream");
 		headers.set("Accept-Ranges", "bytes");
+		headers.set("X-Content-Type-Options", "nosniff");
 
 		const mtime = Math.floor(stat.mtimeMs);
 		const etag = this.options.etag ? `W/"${stat.size.toString(16)}-${mtime.toString(16)}"` : undefined;

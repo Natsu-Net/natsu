@@ -27,6 +27,7 @@
 
 import { config } from "../config.ts";
 import type { Context } from "../context.ts";
+import { bindTo } from "../invalidate.ts";
 import type { Session } from "../session/session.ts";
 
 /** What an action is handed. */
@@ -189,7 +190,9 @@ export function inputOf(form: FormData): Record<string, string | string[]> {
 	for (const [key, value] of form) {
 		if (key === ACTION_FIELD || key === CSRF_FIELD || typeof value !== "string") continue;
 		const held = out[key];
-		out[key] = held === undefined ? value : Array.isArray(held) ? [...held, value] : [held, value];
+		if (held === undefined) out[key] = value;
+		else if (Array.isArray(held)) held.push(value);
+		else out[key] = [held, value];
 	}
 	return out;
 }
@@ -199,7 +202,7 @@ const SECRET_FIELD = /pass|secret|token|csrf|code|card|cvc|cvv|otp/i;
 
 /** What a refused form shows again: its text fields, less anything secret, each at most 4000 characters. */
 export function valuesOf(input: Record<string, string | string[]>): Record<string, string | string[]> {
-	const out: Record<string, string | string[]> = {};
+	const out: Record<string, string | string[]> = Object.create(null);
 	for (const [key, value] of Object.entries(input)) {
 		if (SECRET_FIELD.test(key)) continue;
 		out[key] = Array.isArray(value) ? value.map((v) => v.slice(0, 4000)) : value.slice(0, 4000);
@@ -235,6 +238,10 @@ export function newToken(): string {
 export function tokenOf(ctx: Context): string | undefined {
 	const value = ctx.cookies.get(CSRF_COOKIE);
 	return value !== undefined && TOKEN.test(value) ? value : undefined;
+}
+
+export function sessionToken(ctx: Context): string | undefined {
+	return ctx.sessionLoaded ? bindTo("csrf", ctx.session.id) : undefined;
 }
 
 const MASKED_MIN = 65;
@@ -281,6 +288,8 @@ export function csrfOk(ctx: Context, form: FormData): boolean {
 	const cookie = tokenOf(ctx);
 	const sent = form.get(CSRF_FIELD) ?? ctx.headers.get("natsu-csrf");
 	if (cookie === undefined || typeof sent !== "string") return false;
+	const bound = sessionToken(ctx);
+	if (bound !== undefined && !same(cookie, bound)) return false;
 	const token = unmaskToken(sent);
 	return token !== undefined && same(cookie, token);
 }
@@ -304,13 +313,18 @@ export interface Flash {
 }
 
 export function encodeFlash(flash: Flash): string {
-	return Buffer.from(JSON.stringify({ m: flash.message.slice(0, 500), ok: flash.ok }), "utf8").toString("base64url");
+	const body = Buffer.from(JSON.stringify({ m: flash.message.slice(0, 500), ok: flash.ok }), "utf8").toString("base64url");
+	return `${body}.${bindTo("flash", body)}`;
 }
 
 export function decodeFlash(raw: string | undefined): Flash | null {
 	if (!raw || raw.length > 2048) return null;
+	const dot = raw.lastIndexOf(".");
+	if (dot < 1) return null;
+	const body = raw.slice(0, dot);
+	if (!same(raw.slice(dot + 1), bindTo("flash", body))) return null;
 	try {
-		const value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as { m?: unknown; ok?: unknown };
+		const value = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { m?: unknown; ok?: unknown };
 		return typeof value.m === "string" ? { message: value.m.slice(0, 500), ok: value.ok !== false } : null;
 	} catch {
 		return null;
@@ -319,6 +333,10 @@ export function decodeFlash(raw: string | undefined): Flash | null {
 
 /** A redirect target an action may name: a path on this site, never `//host` or a scheme. */
 export function sameSitePath(target: string): string | null {
-	if (!target.startsWith("/") || /^\/[/\\]/.test(target) || /[\u0000-\u001f]/.test(target)) return null;
-	return target;
+	if (!target.startsWith("/") || /^\/[/\\]/.test(target) || /[\u0000-\u001f\u007f]/.test(target)) return null;
+	try {
+		return target.replace(/[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
+	} catch {
+		return null;
+	}
 }

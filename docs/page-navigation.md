@@ -260,6 +260,15 @@ watch what the server handed them. A tag the page itself depends on still
 redraws the page. Live islands need the live socket (`/_uwu/socket`),
 which page files with a live source already open.
 
+A signed list expires (`General.liveTagTtl`, 3600 seconds by default; a page
+drawn again signs a fresh one) and, when it was drawn for a visitor with a
+session, is bound to that session: a socket of another session, or none,
+cannot use it. A socket that offers an expired list is told `{ "t": "stale" }`
+and the runtime redraws the page, which brings a fresh one. Pages kept by
+`PageCache` carry lists signed for everyone, so keep them no longer than the
+lifetime. A visitor identified by something other than the session (a header,
+a custom cookie) gets a list anyone holding it can use until it expires.
+
 ## Links in page files
 
 In a page file (`pages/**/*.uwu`), write links to other pages with uwu's

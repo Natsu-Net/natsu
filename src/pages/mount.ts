@@ -45,8 +45,9 @@ import { join } from "node:path";
 import type { Assets } from "../assets.ts";
 import { config } from "../config.ts";
 import type { Context, Handler } from "../context.ts";
-import { invalidate, onInvalidate, signTags } from "../invalidate.ts";
+import { invalidate, liveScope, onInvalidate, signTags } from "../invalidate.ts";
 import { log } from "../logger.ts";
+import { scriptNonce } from "../csp.ts";
 import { navigable } from "../navigate.ts";
 import { PageCache, type PageCacheOptions } from "../page-cache.ts";
 import { Router } from "../router.ts";
@@ -64,6 +65,7 @@ import {
 	allowed,
 	anyPublicAction,
 	csrfOk,
+	sessionToken,
 	decodeFlash,
 	encodeFlash,
 	assertActionsDeclareAuth,
@@ -128,8 +130,11 @@ export interface PagesOptions {
 	 * place and filled per answer. `csrf` is natsu's own on a page with actions.
 	 */
 	secrets?: (ctx: Context) => Record<string, string>;
+	maxFields?: number;
 	/** Public origin for canonical URLs (default `config.General.url`). */
 	baseUrl?: string;
+	/** Most live-data tags remembered for kept pages (default 20000); past it the pages of the oldest go. */
+	maxKeptTags?: number;
 	/** PageCache for signed-out visitors; `false` turns it off for every page. */
 	cache?: false | Omit<PageCacheOptions, "prepare">;
 	/** Keep cached pages rewritten by these assets (`assets.rewrite`). */
@@ -226,6 +231,15 @@ const NO_SECRETS: Record<string, string> = Object.freeze({}) as Record<string, s
 /** What uwu draws as the first child of a `<form @submit="action:…">`. */
 const ACTION_INPUT = /<input type="hidden" name="_action" value="[^"]*">/g;
 const MAX_BODY = 1024 * 1024;
+const MAX_FIELDS = 1000;
+const SWAP_MARKER = "__uwuSwap";
+const SWAP_SCRIPT =
+	/<script>(\(window\.__uwuSwap\|\|\(window\.__uwuSwap=function\(r,p\)\{var t=document\.getElementById\(r\),s=document\.getElementById\(p\);if\(t&&s\)\{s\.replaceWith\(t\.content\.cloneNode\(true\)\);t\.remove\(\);\}\}\)\)\("[\w-]+","[\w-]+"\);<\/script>)/g;
+
+function nonceSwapScripts(html: string, nonce: string | undefined): string {
+	if (!nonce || !html.includes(SWAP_MARKER)) return html;
+	return html.replace(SWAP_SCRIPT, (_, script: string) => `<script nonce="${nonce}">${script}`);
+}
 
 export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	if (!options.dir && !options.built) throw new TypeError("natsu/pages: mountPages needs { dir } or { built }");
@@ -239,7 +253,9 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	let notFoundPage: Drawn | undefined;
 	let summary: PageRoute[] = [];
 	let css = "";
+	let swaps = false;
 	const maxBody = options.maxBody ?? MAX_BODY;
+	const maxFields = options.maxFields ?? MAX_FIELDS;
 	const publicUrl = (): string => options.baseUrl ?? config.General.url;
 	setPublicOrigin(publicUrl);
 	if (config.General.requireActionAuth === true) assertActionsDeclareAuth();
@@ -270,27 +286,40 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		}
 		return cache;
 	};
+	const liveHold = (seconds: number): { fresh: number; stale: number } => {
+		const settings = options.cache === false ? {} : options.cache ?? {};
+		const lifetime = config.General.liveTagTtl;
+		return { fresh: Math.min(seconds, lifetime / 2), stale: Math.min(settings.stale ?? 30, lifetime / 4) };
+	};
 	const defaultSeconds = options.cache === false ? undefined : options.cache?.fresh ?? 10;
 
 	// Kept pages by live-data tag, so an invalidation lets them go at once.
 	const kept = new Map<string, Set<string>>();
+	const maxKeptTags = options.maxKeptTags ?? 20_000;
+	const drop = (entry: string): void => {
+		const cut = entry.indexOf("\0");
+		caches.get(Number(entry.slice(0, cut)))?.delete(entry.slice(cut + 1));
+	};
+	const release = (tag: string): void => {
+		for (const entry of kept.get(tag) ?? []) drop(entry);
+		kept.delete(tag);
+	};
 	const keep = (seconds: number, key: string, tags: Iterable<string>): void => {
 		for (const tag of tags) {
-			let keys = kept.get(tag);
-			if (!keys) kept.set(tag, (keys = new Set()));
+			const keys = kept.get(tag) ?? new Set<string>();
+			kept.delete(tag);
+			kept.set(tag, keys);
 			keys.add(`${seconds}\0${key}`);
-			// PageCache forgets pages on its own; this forgets the oldest names past a bound.
-			if (keys.size > 4096) keys.delete(keys.values().next().value as string);
+			if (keys.size > 4096) {
+				const oldest = keys.values().next().value as string;
+				keys.delete(oldest);
+				drop(oldest);
+			}
 		}
+		while (kept.size > maxKeptTags) release(kept.keys().next().value as string);
 	};
 	const stopListening = onInvalidate((tags) => {
-		for (const tag of tags) {
-			for (const entry of kept.get(tag) ?? []) {
-				const cut = entry.indexOf("\0");
-				caches.get(Number(entry.slice(0, cut)))?.delete(entry.slice(cut + 1));
-			}
-			kept.delete(tag);
-		}
+		for (const tag of tags) release(tag);
 	});
 
 	// --- building the table -----------------------------------------------------
@@ -411,6 +440,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		const rootError = loaded.get("_error.uwu");
 		const nextNotFound = rootError ? drawn(rootError, chain(""), "/", [], ["error"]) : undefined;
 
+		swaps = [...loaded.values()].some((file) => file.server.includes(SWAP_MARKER));
 		routes = next;
 		notFoundPage = nextNotFound;
 		renderOptions = {
@@ -471,7 +501,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		styles,
 	});
 
-	const drawPage = async (drawn: Drawn, values: Record<string, unknown>, meta: PageMeta, fallbackTitle: string, live = ""): Promise<string> => {
+	const drawPage = async (drawn: Drawn, values: Record<string, unknown>, meta: PageMeta, fallbackTitle: string, live = "", nonce?: string): Promise<string> => {
 		// The page itself sees `page` without the <h1> title (that comes from what it draws).
 		if ("page" in drawn.page.reads) values.page = pageValue(meta, drawn.styles, live);
 		const html = await renderToString(drawn.page.render, values, renderOptions);
@@ -479,7 +509,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		values.page = pageValue(meta, drawn.styles, live);
 		let out = html;
 		for (const layout of drawn.layouts) out = await renderToString(layout.render, values, { ...renderOptions, child: out });
-		return out;
+		return nonceSwapScripts(out, nonce);
 	};
 
 	const canonical = (ctx: Context): string => publicUrl().replace(/\/+$/, "") + ctx.path;
@@ -500,7 +530,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				canonical: canonical(ctx),
 				robots: state.noindex ? "noindex" : "",
 			};
-			const html = await drawPage(state, values, meta, "", signTags(tags));
+			const html = await drawPage(state, values, meta, "", signTags(tags, liveScope(ctx)), secrets.nonce);
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
 		} catch (thrown) {
 			const error = known(thrown);
@@ -521,7 +551,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				const scope = scopeFor(ctx, state, secrets, { error: { status, message } });
 				const { values } = await resolvePlan(page.plan, scope);
 				const meta: PageMeta = { title: "", description: "", canonical: "", robots: "noindex" };
-				return { body: await drawPage(page, values, meta, String(status)), status, html: true };
+				return { body: await drawPage(page, values, meta, String(status), "", secrets.nonce), status, html: true };
 			} catch (inner) {
 				log.error(`[<red>pages</red>] pages/${page.page.file} failed drawing a ${status}: ${(inner as Error)?.stack ?? inner}`);
 			}
@@ -541,13 +571,21 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return out.body;
 	};
 
+	const baseSecrets = (ctx: Context): Record<string, string> => {
+		const own = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		if (!swaps) return own;
+		const nonce = scriptNonce(ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null);
+		return nonce === undefined ? own : { ...own, nonce };
+	};
+
 	/** The visitor's secrets, with the CSRF token on a route with actions (minted, and its cookie set, if there is none). */
 	const secretsFor = (ctx: Context, state: RouteState): Record<string, string> => {
-		const own = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		const own = baseSecrets(ctx);
 		if (state.actions.size === 0) return own;
+		const bound = sessionToken(ctx);
 		let token = tokenOf(ctx);
-		if (token === undefined) {
-			token = newToken();
+		if (token === undefined || (bound !== undefined && token !== bound)) {
+			token = bound ?? newToken();
 			// Readable by the runtime, which sends it back with a click; a
 			// cross-site page can neither read it nor set it.
 			ctx.setCookie(CSRF_COOKIE, token, { httpOnly: false, sameSite: "lax", secure: secure(), path: "/" });
@@ -571,7 +609,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			}
 
 			const secrets = secretsFor(ctx, state);
-			const names = state.actions.size > 0 || options.secrets ? Object.keys(secrets).sort() : [];
+			if (state.actions.size > 0 && !ctx.response.headers.has("cache-control")) ctx.response.headers.set("cache-control", "private");
+			const names = state.actions.size > 0 || options.secrets || swaps ? Object.keys(secrets).sort() : [];
 
 			const cacheable =
 				state.cache !== "off" &&
@@ -594,7 +633,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 							body: out.body,
 							status: out.status,
 							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
-							keep: out.status === 200,
+							keep: out.status === 200 && !ctx.sessionLoaded,
+							...(out.tags && out.tags.size > 0 && { hold: liveHold(seconds) }),
 						};
 					},
 				);
@@ -629,6 +669,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			} catch {
 				return plain(400, "Bad Request");
 			}
+			let fields = 0;
+			for (const _ of form.keys()) if (++fields > maxFields) return plain(413, "Payload Too Large");
 
 			// Only what this page names, or a public action: never a name off the wire alone.
 			const short = form.get(ACTION_FIELD);
@@ -638,6 +680,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (!target || !entry || typeof short !== "string") return plain(404, "Unknown action");
 
 			const secrets = secretsFor(ctx, state);
+			const sessionBefore = ctx.currentSession?.id;
+			const secretsNow = (): Record<string, string> => (ctx.currentSession?.id === sessionBefore ? secrets : secretsFor(ctx, state));
 			const refuse = async (thrown: unknown): Promise<string> => {
 				const error = known(thrown);
 				// Sent elsewhere (a sign-in first, a step the app asks for): a 303, as a success is.
@@ -681,7 +725,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 
 			if (result.errors && (Object.keys(result.errors).length > 0 || result.message)) {
 				// Refused: the page again, with what was typed and why, for the visitor to fix.
-				const out = await draw(ctx, state, secrets, {
+				const out = await draw(ctx, state, secretsNow(), {
 					form: { action: short, errors: result.errors, values: valuesOf(input), message: result.message ?? "" },
 				});
 				return answer(ctx, { ...out, status: out.status === 200 ? 422 : out.status });
@@ -697,7 +741,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 
 			if (result.show) {
 				// Shown once: drawn into this answer only, never kept by a cache or the history's URL.
-				const out = await draw(ctx, state, secrets, {
+				const out = await draw(ctx, state, secretsNow(), {
 					form: { action: short, errors: {}, values: {}, message: result.flash ?? "", shown: result.show },
 				});
 				ctx.response.headers.set("cache-control", "no-store");
@@ -718,7 +762,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const notFound: Handler = wrapped(async (ctx) => {
 		const page = notFoundPage;
 		if (!page) return undefined;
-		const secrets = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		const secrets = baseSecrets(ctx);
 		return answer(ctx, await drawError(ctx, { path: "/", page: page.page }, page, secrets, new NotFound()));
 	});
 

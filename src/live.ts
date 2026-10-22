@@ -47,7 +47,7 @@ export interface LiveServer {
 }
 
 import type { NatsuSocketData } from "./context.ts";
-import { onInvalidate, tagTopic, verifyTags } from "./invalidate.ts";
+import { checkTags, onInvalidate, tagTopic } from "./invalidate.ts";
 
 import { log } from "./logger.ts";
 import {
@@ -59,6 +59,7 @@ import {
 	callAction,
 	dropScope,
 	hasRoom,
+	onRoomRevoked,
 	resolveState,
 	revokeSession,
 	snapshotOf,
@@ -86,6 +87,54 @@ export interface LiveSocketData {
 	/** Live-data tag topics, which the next `watch` replaces. */
 	tags?: Set<string>;
 	ip?: string;
+	ended?: boolean;
+	tokens?: number;
+	refilledAt?: number;
+	lastFrameAt?: number;
+}
+
+export interface LiveLimits {
+	messageRate: number;
+	messageBurst: number;
+	silenceSeconds: number;
+}
+
+let limits: LiveLimits = { messageRate: 0, messageBurst: 1, silenceSeconds: 0 };
+let silenceTimer: ReturnType<typeof setInterval> | undefined;
+const allSockets = new Set<ServerWebSocket<LiveSocketData>>();
+
+export function configureLive(next: LiveLimits): void {
+	limits = next;
+	if (silenceTimer) clearInterval(silenceTimer);
+	silenceTimer = undefined;
+	if (next.silenceSeconds <= 0) return;
+	silenceTimer = setInterval(closeSilent, Math.max(250, (next.silenceSeconds * 1000) / 4));
+	silenceTimer.unref?.();
+}
+
+function closeSilent(): void {
+	const cutoff = Date.now() - limits.silenceSeconds * 1000;
+	for (const ws of allSockets) {
+		if ((ws.data.lastFrameAt ?? 0) > cutoff) continue;
+		ws.data.ended = true;
+		try {
+			ws.close(4408, "silent");
+		} catch {}
+	}
+}
+
+function withinRate(data: LiveSocketData): boolean {
+	if (limits.messageRate <= 0) return true;
+	const now = Date.now();
+	const last = data.refilledAt ?? now;
+	const tokens = Math.min(limits.messageBurst, (data.tokens ?? limits.messageBurst) + ((now - last) / 1000) * limits.messageRate);
+	data.refilledAt = now;
+	if (tokens < 1) {
+		data.tokens = 0;
+		return false;
+	}
+	data.tokens = tokens - 1;
+	return true;
 }
 
 interface ClientFrame {
@@ -159,47 +208,128 @@ export function stopPublishing(scopeId: string): void {
  */
 export function endSession(sessionId: string): void {
 	if (!sessionId) return;
+	closeSocketsOf(sessionId);
 	stopPublishing(sessionId);
 	revokeSession(sessionId);
 	dropScope(sessionId);
 }
 
+const socketsBySession = new Map<string, Set<ServerWebSocket<LiveSocketData>>>();
+
+function trackSocket(ws: ServerWebSocket<LiveSocketData>): void {
+	const id = ws.data.scopeId;
+	if (!id) return;
+	const set = socketsBySession.get(id) ?? new Set();
+	set.add(ws);
+	socketsBySession.set(id, set);
+}
+
+function untrackSocket(ws: ServerWebSocket<LiveSocketData>): void {
+	const id = ws.data.scopeId;
+	const set = id ? socketsBySession.get(id) : undefined;
+	if (!set) return;
+	set.delete(ws);
+	if (set.size === 0) socketsBySession.delete(id);
+}
+
+export function socketSessionIds(): string[] {
+	return [...socketsBySession.keys()];
+}
+
+onRoomRevoked((sessionId, topic) => {
+	for (const ws of socketsBySession.get(sessionId) ?? []) {
+		if (!ws.data.topics.delete(topic)) continue;
+		try {
+			ws.unsubscribe(topic);
+		} catch {}
+	}
+});
+
+function closeSocketsOf(sessionId: string): void {
+	const set = socketsBySession.get(sessionId);
+	if (!set) return;
+	socketsBySession.delete(sessionId);
+	for (const ws of set) {
+		ws.data.ended = true;
+		try {
+			ws.close(4401, "session ended");
+		} catch {}
+	}
+}
+
 /** Forget every subscription. Tests and hot reload. */
 export function resetLive(): void {
+	allSockets.clear();
+	if (silenceTimer) clearInterval(silenceTimer);
+	silenceTimer = undefined;
 	for (const stop of publishing.values()) stop();
 	publishing.clear();
 	hooks = {};
 	socketsByIp.clear();
+	socketsBySession.clear();
 }
 
 const socketsByIp = new Map<string, number>();
 
+export function ipKey(ip: string): string {
+	if (!ip.includes(":")) return ip;
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+	if (mapped) return mapped[1]!;
+	const [head = "", tail] = ip.split("::");
+	const front = head === "" ? [] : head.split(":");
+	const back = tail === undefined || tail === "" ? [] : tail.split(":");
+	const groups = tail === undefined ? front : [...front, ...Array(Math.max(0, 8 - front.length - back.length)).fill("0"), ...back];
+	return groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, "")).join(":") + "::/64";
+}
+
 export function socketCountFor(ip: string): number {
-	return socketsByIp.get(ip) ?? 0;
+	return socketsByIp.get(ipKey(ip)) ?? 0;
 }
 
 function releaseIp(ip: string | undefined): void {
 	if (!ip) return;
-	const left = (socketsByIp.get(ip) ?? 0) - 1;
-	if (left > 0) socketsByIp.set(ip, left);
-	else socketsByIp.delete(ip);
+	const key = ipKey(ip);
+	const left = (socketsByIp.get(key) ?? 0) - 1;
+	if (left > 0) socketsByIp.set(key, left);
+	else socketsByIp.delete(key);
 }
 
-export function sameOriginSocket(request: Request, publicUrl: string): boolean {
+export interface OriginPolicy {
+	allowed?: readonly string[];
+	requireOrigin?: boolean;
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function hostOf(value: string): string | undefined {
+	try {
+		return new URL(value.includes("://") ? value : `http://${value}`).host;
+	} catch {
+		return undefined;
+	}
+}
+
+function browserLike(request: Request): boolean {
+	const { headers } = request;
+	if (headers.has("sec-fetch-mode") || headers.has("sec-fetch-site") || headers.has("sec-fetch-dest")) return true;
+	return (headers.get("user-agent") ?? "").startsWith("Mozilla/");
+}
+
+export function sameOriginSocket(request: Request, publicUrl: string, policy: OriginPolicy = {}): boolean {
 	const origin = request.headers.get("origin");
-	if (origin === null) return true;
+	if (origin === null) return !(policy.requireOrigin ?? true) || !browserLike(request);
 	let originHost: string;
 	try {
 		originHost = new URL(origin).host;
 	} catch {
 		return false;
 	}
-	if (originHost === request.headers.get("host")) return true;
-	try {
-		return originHost === new URL(publicUrl).host;
-	} catch {
-		return false;
+	if (originHost === hostOf(publicUrl)) return true;
+	for (const entry of policy.allowed ?? []) {
+		if (originHost === hostOf(entry)) return true;
 	}
+	const requestHost = request.headers.get("host");
+	return originHost === requestHost && LOOPBACK_HOSTS.has(new URL(`http://${originHost}`).hostname);
 }
 
 /** A store a connection is allowed to address, and where it lives. */
@@ -274,6 +404,9 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			// actually holds: a connection that subscribed to everything would
 			// receive patches for state its page never rendered.
 			ws.data.topics = new Set();
+			trackSocket(ws);
+			ws.data.lastFrameAt = Date.now();
+			allSockets.add(ws);
 			try {
 				hooks.open?.(callerOf(ws.data));
 			} catch (error) {
@@ -283,76 +416,96 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 
 		message(ws: ServerWebSocket<LiveSocketData>, raw: string | Buffer) {
 			if (!isLive(ws)) return next?.message?.(ws as never, raw as never);
+			if (ws.data.ended) return;
+			ws.data.lastFrameAt = Date.now();
+			if (!withinRate(ws.data)) {
+				ws.data.ended = true;
+				ws.close(4429, "too many frames");
+				return;
+			}
 
 			let frame: ClientFrame;
 			try {
-				frame = JSON.parse(String(raw)) as ClientFrame;
+				const parsed: unknown = JSON.parse(String(raw));
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return next?.message?.(ws as never, raw as never);
+				frame = parsed as ClientFrame;
 			} catch {
 				return;
 			}
 
-			if (frame.t === "hello") {
-				const asked = Array.isArray(frame.stores) ? frame.stores : [];
-				for (const key of asked.slice(0, 64)) {
-					const found = instanceFor(ws.data, key);
-					if (!found) continue;
-					const topic = topicFor(found.Class, found.scopeId);
-					// Publishing before subscribing, so a write that lands between
-					// the two is not lost between the snapshot and the stream.
-					if (liveServer) ensurePublishing(liveServer, found);
-					ws.subscribe(topic);
-					ws.data.topics.add(topic);
-					ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
+			try {
+				if (frame.t === "hello") {
+					const asked = Array.isArray(frame.stores) ? frame.stores : [];
+					for (const key of asked.slice(0, 64)) {
+						const found = instanceFor(ws.data, key);
+						if (!found) continue;
+						const topic = topicFor(found.Class, found.scopeId);
+						// Publishing before subscribing, so a write that lands between
+						// the two is not lost between the snapshot and the stream.
+						if (liveServer) ensurePublishing(liveServer, found);
+						ws.subscribe(topic);
+						ws.data.topics.add(topic);
+						ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
+					}
+					return;
 				}
-				return;
-			}
 
-			if (frame.t === "watch") {
-				// Signed by the server that drew the page: a socket watches what a
-				// page listed, never a tag it made up. Anything else clears the list.
-				// One signed list per thing on the page that drew live data: the
-				// page's own, then each live island's. A list that does not verify
-				// is dropped alone.
-				const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
-				const tags = lists.flatMap((list: unknown) => verifyTags(list) ?? []);
-				const next = new Set(tags.map(tagTopic));
-				for (const topic of ws.data.tags ?? []) {
-					if (next.has(topic)) continue;
-					ws.unsubscribe(topic);
-					ws.data.topics.delete(topic);
+				if (frame.t === "watch") {
+					// Signed by the server that drew the page: a socket watches what a
+					// page listed, never a tag it made up. Anything else clears the list.
+					// One signed list per thing on the page that drew live data: the
+					// page's own, then each live island's. A list that does not verify
+					// is dropped alone.
+					const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
+					const checked = lists.map((list: unknown) => checkTags(list, ws.data.scopeId));
+					const tags = checked.flatMap((entry) => (entry && !entry.expired ? entry.tags : []));
+					if (checked.some((entry) => entry?.expired)) ws.send(JSON.stringify({ t: "stale" }));
+					const next = new Set(tags.map(tagTopic));
+					for (const topic of ws.data.tags ?? []) {
+						if (next.has(topic)) continue;
+						ws.unsubscribe(topic);
+						ws.data.topics.delete(topic);
+					}
+					for (const topic of next) {
+						ws.subscribe(topic);
+						ws.data.topics.add(topic);
+					}
+					ws.data.tags = next;
+					return;
 				}
-				for (const topic of next) {
-					ws.subscribe(topic);
-					ws.data.topics.add(topic);
-				}
-				ws.data.tags = next;
-				return;
-			}
 
-			if (frame.t === "set") {
-				const found = instanceFor(ws.data, frame.store);
-				if (!found || typeof frame.key !== "string") return;
-				// Re-checked here whatever the client believes. The manifest it
-				// holds says which fields the UI should offer to edit; it is not
-				// a capability.
-				if (!applyWrite(found.instance, frame.key, frame.value)) {
-					log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.wire}.${frame.key}</cyan>`);
+				if (frame.t === "set") {
+					const found = instanceFor(ws.data, frame.store);
+					if (!found || typeof frame.key !== "string") return;
+					// Re-checked here whatever the client believes. The manifest it
+					// holds says which fields the UI should offer to edit; it is not
+					// a capability.
+					if (!applyWrite(found.instance, frame.key, frame.value)) {
+						log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.wire}.${frame.key}</cyan>`);
+					}
+					return;
 				}
-				return;
-			}
 
-			if (frame.t === "call") {
-				const found = instanceFor(ws.data, frame.store);
-				if (!found || typeof frame.method !== "string") return;
-				const args = Array.isArray(frame.args) ? frame.args : [];
-				// An action that cannot tell one caller from another cannot enforce
-				// anything — no host check, no per-person rate limit.
-				const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
-				try {
-					callAction(found.instance, frame.method, args, who);
-				} catch (error) {
-					log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
+				if (frame.t === "call") {
+					const found = instanceFor(ws.data, frame.store);
+					if (!found || typeof frame.method !== "string") return;
+					const args = Array.isArray(frame.args) ? frame.args : [];
+					// An action that cannot tell one caller from another cannot enforce
+					// anything — no host check, no per-person rate limit.
+					const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
+					try {
+						const result = callAction(found.instance, frame.method, args, who);
+					if (result instanceof Promise) {
+						const method = frame.method;
+						result.catch((error: Error) => log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${method}: ${error?.message}`));
+					}
+					} catch (error) {
+						log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
+					}
+					return;
 				}
+			} catch (error) {
+				log.warn(`[<yellow>live</yellow>] frame refused: ${(error as Error).message}`);
 				return;
 			}
 
@@ -364,6 +517,8 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 		close(ws: ServerWebSocket<LiveSocketData>, code: number, reason: string) {
 			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
 			releaseIp(ws.data.ip);
+			untrackSocket(ws);
+			allSockets.delete(ws);
 			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
 			try {
 				hooks.close?.(callerOf(ws.data));
@@ -424,6 +579,6 @@ export function upgradeLive(
 		data: { live: true, scopeId, session, topics: new Set<string>(), ip },
 	});
 	if (!upgraded) return new Response("expected a websocket", { status: 400 });
-	if (ip) socketsByIp.set(ip, socketCountFor(ip) + 1);
+	if (ip) socketsByIp.set(ipKey(ip), socketCountFor(ip) + 1);
 	return undefined;
 }

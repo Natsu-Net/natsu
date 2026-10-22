@@ -7,7 +7,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { SessionAdapter, SessionRecord } from "./adapter.ts";
 
@@ -45,7 +45,11 @@ export class SqliteAdapter implements SessionAdapter {
 			throw new Error(`natsu/session: invalid table name ${JSON.stringify(table)}`);
 		}
 
-		if (path !== ":memory:") mkdirSync(dirname(resolve(path)), { recursive: true });
+		if (path !== ":memory:") {
+			mkdirSync(dirname(resolve(path)), { recursive: true, mode: 0o700 });
+			writeFileSync(path, "", { flag: "a", mode: 0o600 });
+			chmodSync(path, 0o600);
+		}
 
 		this.db = new Database(path, { create: true });
 		if (options.wal !== false && path !== ":memory:") this.db.exec("PRAGMA journal_mode = WAL");

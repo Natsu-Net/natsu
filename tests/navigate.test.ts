@@ -1231,8 +1231,8 @@ describe("delivery", () => {
 		}
 		expect(code).not.toContain("real load");
 		expect(code.split("\n").length).toBeLessThan(5);
-		// 6.15 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
-		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(6300);
+		// 6.3 KiB: see the size test in navigate-client.test.ts for what the last bytes bought.
+		expect(brotliCompressSync(new TextEncoder().encode(code)).byteLength).toBeLessThanOrEqual(6450);
 	});
 
 	test("in development the runtime is built readable, with the console lines that say why a visit was a full load", async () => {

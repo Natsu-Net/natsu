@@ -23,6 +23,8 @@ beforeAll(() => {
 	// A symlink that leaves the document root — the case a string filter cannot see.
 	symlinkSync(join(dir.path, "secret.txt"), join(root, "escape-link.txt"));
 	symlinkSync(join(root, "ok.txt"), join(root, "inside-link.txt"));
+	mkdirSync(join(root, "linked-index"), { recursive: true });
+	symlinkSync(join(dir.path, "secret.txt"), join(root, "linked-index", "index.html"));
 });
 
 afterAll(() => {
@@ -109,6 +111,18 @@ describe("path resolution", () => {
 
 	test("the root itself resolves to the root", () => {
 		expect(files.resolvePath("/")).toEqual({ path: root });
+	});
+});
+
+describe("directory index", () => {
+	test("an index that is a symlink out of the root is not served", async () => {
+		const ctx = ctxFor("/linked-index/");
+		expect(await statics().serve(ctx)).toBe(false);
+	});
+
+	test("followSymlinks: true still serves it", async () => {
+		const ctx = ctxFor("/linked-index/");
+		expect(await statics({ followSymlinks: true }).serve(ctx)).toBe(true);
 	});
 });
 

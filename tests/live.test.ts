@@ -10,7 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Application } from "../src/server.ts";
-import { endSession, resetLive } from "../src/live.ts";
+import { endSession, ipKey, resetLive, sameOriginSocket } from "../src/live.ts";
 import { Action, Networked, State, caller, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
 import { Router } from "../src/router.ts";
 import { SessionManager } from "../src/session/session.ts";
@@ -28,6 +28,22 @@ class Room {
 
 	notAnAction() {
 		this.online = -1;
+	}
+}
+
+@State("faulty", { scope: "global" })
+class Faulty {
+	@Networked() n = 0;
+
+	@Action()
+	async later() {
+		await Bun.sleep(1);
+		throw new Error("rejected later");
+	}
+
+	@Action()
+	now() {
+		throw new Error("thrown now");
 	}
 }
 
@@ -119,6 +135,71 @@ function open(base: string, headers?: Record<string, string>): {
 		},
 	};
 }
+
+describe("frames that are not frames", () => {
+	test("none of them takes a handler down, and the socket still answers a hello", async () => {
+		const thrown: string[] = [];
+		const listener = (error: Error) => void thrown.push(error.message);
+		process.on("uncaughtException", listener);
+		try {
+			running = await startApp(new Application());
+			const client = open(running.base);
+			await client.ready;
+			for (const frame of ["null", "1", "[]", '"x"', "true", "{bad", '{"t":"watch","tags":null}', '{"t":"watch","tags":[null,5,{"a":1}]}', '{"t":"hello","stores":"x"}', '{"t":"hello","stores":[null,{},[]]}', '{"t":"call","store":{},"method":[]}', '{"t":"set","store":"room","key":{}}']) {
+				client.socket.send(frame);
+			}
+			client.socket.send(new Uint8Array([1, 2, 3, 255]));
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+			const frames = await client.next(1);
+			expect(thrown).toEqual([]);
+			expect(frames[0]).toEqual({ t: "sync", store: "room", value: { online: 0, topic: "hello" } });
+			client.socket.close();
+		} finally {
+			process.off("uncaughtException", listener);
+		}
+	});
+
+	test("an async action that rejects is logged, not an unhandled rejection", async () => {
+		const thrown: string[] = [];
+		const listener = (reason: unknown) => void thrown.push(String((reason as Error)?.message ?? reason));
+		process.on("unhandledRejection", listener);
+		try {
+			running = await startApp(new Application());
+			expect(resolveState(AsClass<Faulty>(Faulty), "").n).toBe(0);
+			const client = open(running.base);
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "call", store: "faulty", method: "later", args: [] }));
+			client.socket.send(JSON.stringify({ t: "call", store: "faulty", method: "now", args: [] }));
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["faulty"] }));
+			const frames = await client.next(1);
+			await Bun.sleep(50);
+			expect(thrown).toEqual([]);
+			expect(frames[0]?.t).toBe("sync");
+			client.socket.close();
+		} finally {
+			process.off("unhandledRejection", listener);
+		}
+	});
+
+	test("a store that cannot be written out as JSON costs the sender nothing but the answer", async () => {
+		const thrown: string[] = [];
+		const listener = (error: Error) => void thrown.push(error.message);
+		process.on("uncaughtException", listener);
+		try {
+			running = await startApp(new Application());
+			const room = resolveState(AsClass<Room>(Room), "");
+			(room as unknown as { topic: unknown }).topic = 10n;
+			const client = open(running.base);
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+			await Bun.sleep(100);
+			expect(thrown).toEqual([]);
+			client.socket.close();
+		} finally {
+			process.off("uncaughtException", listener);
+		}
+	});
+});
 
 describe("the handshake", () => {
 	test("hello gets a snapshot of each store the page holds", async () => {
@@ -359,12 +440,28 @@ describe("who may connect", () => {
 		expect(await outcome(undefined)).toBe("open");
 	});
 
-	test("the same origin is let in", async () => {
+	test("the same origin is let in on a loopback host", async () => {
 		reset();
 		running = await startApp(new Application());
 		const client = open(running.base, { Origin: running.base });
 		await client.ready;
 		client.socket.close();
+	});
+
+	test("an Origin that only matches a non-loopback Host header is refused", () => {
+		const request = new Request("http://rebind.test/_uwu/socket", { headers: { origin: "http://rebind.test", host: "rebind.test" } });
+		expect(sameOriginSocket(request, "https://shop.test")).toBe(false);
+	});
+
+	test("a browser-like upgrade without an Origin is refused unless opted out", async () => {
+		const browser = { "Sec-Fetch-Mode": "websocket", "Sec-Fetch-Site": "cross-site" };
+		expect(await outcome(browser)).toBe("refused");
+		expect(await outcome(browser, { socketRequireOrigin: false })).toBe("open");
+	});
+
+	test("an allow-listed origin is accepted", async () => {
+		expect(await outcome({ Origin: "https://app.shop.test" }, { socketAllowedOrigins: ["https://app.shop.test"] })).toBe("open");
+		expect(await outcome({ Origin: "https://other.test" }, { socketAllowedOrigins: ["https://app.shop.test"] })).toBe("refused");
 	});
 
 	test("another site's page is refused", async () => {
@@ -430,6 +527,49 @@ describe("who may connect", () => {
 		);
 		expect(results.filter((r) => r === "open").length).toBe(2);
 		for (const c of clients) c.socket.close();
+	});
+});
+
+describe("socket abuse limits", () => {
+	function closeCode(client: ReturnType<typeof open>): Promise<number> {
+		return new Promise((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+	}
+
+	test("a socket flooding frames is closed with 4429", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMessageRate: 5, socketMessageBurst: 10 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		const closed = closeCode(client);
+		for (let i = 0; i < 200; i++) client.socket.send(JSON.stringify({ t: "set", store: "room", key: "topic", value: String(i) }));
+		expect(await Promise.race([closed, Bun.sleep(1500).then(() => -1)])).toBe(4429);
+	});
+
+	test("a socket inside the limit is left alone", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMessageRate: 5, socketMessageBurst: 10 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		for (let i = 0; i < 8; i++) client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+		await Bun.sleep(150);
+		expect(client.socket.readyState).toBe(WebSocket.OPEN);
+		client.socket.close();
+	});
+
+	test("a socket that never sends a frame is eventually closed", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketSilenceTimeout: 1 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		const closed = closeCode(client);
+		expect(await Promise.race([closed, Bun.sleep(4000).then(() => -1)])).not.toBe(-1);
+	});
+
+	test("IPv6 addresses are counted per /64", () => {
+		expect(ipKey("2001:db8:1:2::1")).toBe(ipKey("2001:db8:1:2:ffff::9"));
+		expect(ipKey("2001:db8:1:2::1")).not.toBe(ipKey("2001:db8:1:3::1"));
+		expect(ipKey("203.0.113.9")).toBe("203.0.113.9");
+		expect(ipKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
 	});
 });
 
@@ -667,6 +807,76 @@ describe("a session ending", () => {
 	});
 });
 
+@State("ledger")
+class Ledger {
+	@Networked() entries = 0;
+	static calls = 0;
+
+	@Action()
+	record() {
+		Ledger.calls += 1;
+		this.entries += 1;
+	}
+}
+
+describe("a destroyed session's sockets", () => {
+	async function ledgerApp() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/login", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.response.body = ctx.session.id;
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const response = await running.fetch("/login");
+		const id = await response.text();
+		const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		return { manager, id, cookie };
+	}
+
+	test("are closed with 4401 when the session is destroyed", async () => {
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		const closed = new Promise<number>((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+
+		await manager.destroy(id);
+
+		expect(await Promise.race([closed, Bun.sleep(1000).then(() => -1)])).toBe(4401);
+	});
+
+	test("are closed with 4401 when a sweep finds the session expired in the store only", async () => {
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		const closed = new Promise<number>((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+
+		const session = (await manager.get(id))!;
+		session.expire = Math.floor(Date.now() / 1000) - 1;
+		await manager.adapter.save(session.toRecord());
+		manager.evict(id);
+		await manager.sweep();
+
+		expect(await Promise.race([closed, Bun.sleep(1000).then(() => -1)])).toBe(4401);
+	});
+
+	test("cannot call actions after the session is destroyed", async () => {
+		Ledger.calls = 0;
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["ledger"] }));
+		await client.next(1);
+
+		await manager.destroy(id);
+		client.socket.send(JSON.stringify({ t: "hello", stores: ["ledger"] }));
+		client.socket.send(JSON.stringify({ t: "call", store: "ledger", method: "record", args: [] }));
+		await Bun.sleep(100);
+
+		expect(Ledger.calls).toBe(0);
+		expect(client.frames.length).toBe(1);
+	});
+});
+
 describe("who is calling", () => {
 	async function partyApp() {
 		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
@@ -732,6 +942,50 @@ describe("who is calling", () => {
 
 		alice.client.socket.close();
 		bob.client.socket.close();
+	});
+});
+
+describe("leaving a room", () => {
+	test("stops the patches that room sends to the sockets of the session that left", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/join/:code", (ctx) => {
+			ctx.joinRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = ctx.session.id;
+		});
+		new Router().get("/leave/:code", (ctx) => {
+			ctx.leaveRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = "left";
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const member = async (code: string) => {
+			const response = await fetch(`${running!.base}/join/${code}`);
+			await response.text();
+			const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+			const client = open(running!.base, { cookie });
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "hello", stores: [`party:${code}`] }));
+			await client.next(1);
+			return { cookie, client };
+		};
+		const leaver = await member("room-a");
+		const stayer = await member("room-a");
+
+		resolveState(AsClass<Party>(Party), "room-a").at = 10;
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		expect(stayer.client.frames.length).toBe(2);
+
+		await fetch(`${running.base}/leave/room-a`, { headers: { cookie: leaver.cookie } });
+		resolveState(AsClass<Party>(Party), "room-a").at = 20;
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		expect(stayer.client.frames.length).toBe(3);
+
+		leaver.client.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-a"] }));
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		leaver.client.socket.close();
+		stayer.client.socket.close();
 	});
 });
 

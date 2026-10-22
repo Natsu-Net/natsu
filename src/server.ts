@@ -17,7 +17,7 @@ import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
 import { isIslandRequest, refuseBeforeHandler, refuseWithoutRoute } from "./navigate.ts";
-import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
+import { SOCKET_PATH, type LiveHooks, configureLive, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
 
@@ -345,6 +345,12 @@ export class Application {
 
 	private serveOptions(options: StartOptions): ServeOptions<NatsuSocketData> {
 		const live = options.live !== false;
+		const { General } = this.config;
+		configureLive({
+			messageRate: General.socketMessageRate,
+			messageBurst: General.socketMessageBurst,
+			silenceSeconds: General.socketSilenceTimeout,
+		});
 		const terminal = this.terminalFor(undefined);
 
 		return {
@@ -352,6 +358,7 @@ export class Application {
 			hostname: options.hostname ?? this.config.General.listenOn,
 			development: options.development ?? this.config.General.development,
 			reusePort: options.reusePort ?? false,
+			maxRequestBodySize: General.maxRequestBodySize,
 			routes: this.socketRoute(live, this.buildRoutes()),
 			websocket:
 				options.websocket || live
@@ -366,7 +373,13 @@ export class Application {
 				// The upgrade has to happen before the middleware chain: a
 				// handshake that went through the chain would get a body, and a
 				// request with a body cannot be upgraded.
-				if (live && new URL(request.url).pathname === SOCKET_PATH) {
+				let pathname: string;
+				try {
+					pathname = new URL(request.url).pathname;
+				} catch {
+					return new Response("Bad Request", { status: 400 });
+				}
+				if (live && pathname === SOCKET_PATH) {
 					// The session decides which state this connection can see,
 					// so it is resolved here and nowhere else — a frame never
 					// names a scope.
@@ -392,7 +405,7 @@ export class Application {
 
 	private async upgradeSocket(request: Request, server: NatsuServer): Promise<Response> {
 		const { General } = this.config;
-		if (!sameOriginSocket(request, General.url)) return new Response("Forbidden", { status: 403 });
+		if (!sameOriginSocket(request, General.url, { allowed: General.socketAllowedOrigins, requireOrigin: General.socketRequireOrigin })) return new Response("Forbidden", { status: 403 });
 
 		const probe = new Context(request, server);
 		probe.trustProxy = General.proxy;
@@ -401,7 +414,8 @@ export class Application {
 		if (verdict) return verdict;
 		const ip = probe.ip;
 
-		const session = await this.socketScope(request);
+		const resolved = await this.socketScope(request);
+		const session = resolved && !resolved.destroyed ? resolved : undefined;
 		if (General.socketMaxPerIp > 0 && ip && socketCountFor(ip) >= General.socketMaxPerIp) {
 			return new Response("Too Many Connections", { status: 429 });
 		}
@@ -433,7 +447,8 @@ export class Application {
 			const ctx = new Context(request);
 			const id = ctx.cookies.get(this.sessions.cookieName);
 			if (!id) return undefined;
-			return await this.sessions.get(id);
+			const session = await this.sessions.get(id);
+			return session && !session.destroyed && !session.IsExpired() ? session : undefined;
 		} catch {
 			return undefined;
 		}

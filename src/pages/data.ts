@@ -22,6 +22,7 @@
  */
 
 import type { Context } from "../context.ts";
+import { log } from "../logger.ts";
 import type { Session } from "../session/session.ts";
 import type { Arg, DataDecl, TextTemplate } from "./block.ts";
 import { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
@@ -526,7 +527,10 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 						if (typeof part === "string") path += part;
 						else {
 							const v = walk(await get(part[0]!), part.slice(1));
-							path += encodeURIComponent(v === null || v === undefined ? "" : String(v));
+							const text = v === null || v === undefined ? "" : String(v);
+							if (text.split(/[/\\]/).some((piece) => piece === "." || piece === "..")) throw new NotFound(`${loader.name} not found`);
+							const segment = encodeURIComponent(text);
+							path += segment;
 						}
 					}
 					return fetchService(scope.services[loader.service]!, loader.service, path, ctx);
@@ -588,11 +592,20 @@ async function fetchService(service: ServiceConfig, name: string, path: string, 
 	const cookie = ctx.headers.get("cookie");
 	// The visitor's cookie goes to configured services only, and only those that did not opt out.
 	if (service.cookie !== false && cookie) headers.cookie = cookie;
-	const url = service.base.replace(/\/+$/, "") + path;
+	const root = service.base.replace(/\/+$/, "");
+	const url = root + path;
+	const rootPath = new URL(root + "/").pathname;
+	if (!new URL(url).pathname.startsWith(rootPath)) throw new NotFound();
 	const response = await fetch(url, { headers, signal: AbortSignal.timeout(service.timeout ?? 5000), redirect: "manual" });
 	if (response.status === 404) return undefined;
-	if (response.status === 401 || response.status === 403) throw new Forbidden(`${name} refused ${path}`);
-	if (!response.ok) throw new HttpError(502, `service ${name} answered ${response.status} for ${path}`);
+	if (response.status === 401 || response.status === 403) {
+		log.warn(`[<yellow>pages</yellow>] service ${name} refused ${path} (${response.status})`);
+		throw new Forbidden();
+	}
+	if (!response.ok) {
+		log.warn(`[<yellow>pages</yellow>] service ${name} answered ${response.status} for ${path}`);
+		throw new HttpError(502, "Bad Gateway");
+	}
 	const type = response.headers.get("content-type") ?? "";
 	return type.includes("json") ? response.json() : response.text();
 }

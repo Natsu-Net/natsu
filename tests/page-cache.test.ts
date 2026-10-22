@@ -709,3 +709,28 @@ describe("PageCache tags", () => {
 		expect(cache.size).toBe(1);
 	});
 });
+
+describe("PageCache query variants", () => {
+	test("one path keeps a bounded number of query variants and leaves other paths alone", async () => {
+		const cache = new PageCache({ maxPerPath: 8 });
+		const page = renderer();
+		await cache.serve("/home", [NONCE_A, CSRF_A], page.draw);
+		for (let i = 0; i < 100; i++) await cache.serve(`/search?q=${i}`, [NONCE_A, CSRF_A], page.draw);
+		expect(cache.size).toBe(9);
+		const before = page.renders();
+		await cache.serve("/home", [NONCE_B, CSRF_B], page.draw);
+		expect(page.renders()).toBe(before);
+	});
+
+	test("the newest variants are the ones kept", async () => {
+		const cache = new PageCache({ maxPerPath: 2 });
+		const page = renderer();
+		for (const q of ["a", "b", "c"]) await cache.serve(`/s?q=${q}`, [NONCE_A, CSRF_A], page.draw);
+		const before = page.renders();
+		await cache.serve("/s?q=c", [NONCE_A, CSRF_A], page.draw);
+		await cache.serve("/s?q=b", [NONCE_A, CSRF_A], page.draw);
+		expect(page.renders()).toBe(before);
+		await cache.serve("/s?q=a", [NONCE_A, CSRF_A], page.draw);
+		expect(page.renders()).toBe(before + 1);
+	});
+});

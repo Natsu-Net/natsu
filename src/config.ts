@@ -25,8 +25,21 @@ export interface GeneralConfig {
 	socketMaxPayload: number;
 	/** Seconds of silence after which an idle socket is closed. */
 	socketIdleTimeout: number;
-	/** Live sockets one address may hold open; 0 means unlimited. */
+	/** Live sockets one address (an IPv6 /64) may hold open; 0 means unlimited. */
 	socketMaxPerIp: number;
+	/** Frames per second one live socket may sustain; 0 means unlimited. */
+	socketMessageRate: number;
+	/** Frames one live socket may send in a burst before it is closed. */
+	socketMessageBurst: number;
+	/** Seconds a live socket may go without sending a frame before it is closed; 0 means never. */
+	socketSilenceTimeout: number;
+	/** Extra origins (`https://app.example`) allowed to open a live socket besides `url`. */
+	socketAllowedOrigins: string[];
+	/** Refuse browser-like socket upgrades that carry no Origin header. */
+	socketRequireOrigin: boolean;
+	liveTagTtl: number;
+	/** Largest request body, in bytes, any route accepts; Bun enforces it while the body streams in. */
+	maxRequestBodySize: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -92,8 +105,12 @@ export interface SessionConfig {
 	driver: "sqlite" | "memory" | "none";
 	/** Lifetime in seconds. */
 	ttl: number;
+	/** Lifetime in seconds of a session that holds no data yet; the first `Set` promotes it to `ttl`. */
+	anonymousTtl: number;
 	/** Expiry sweep interval in seconds; 0 disables the timer. */
 	sweepInterval: number;
+	/** Sessions without data one address (an IPv6 /64) may hold; the oldest go first. 0 means unlimited. */
+	maxAnonymousPerIp: number;
 	/** sqlite driver only. `:memory:` keeps it in-process. */
 	path: string;
 	cookie: SessionCookieConfig;
@@ -133,7 +150,14 @@ export function defaultConfig(): NatsuConfig {
 			proxyHops: 1,
 			socketMaxPayload: 32768,
 			socketIdleTimeout: 120,
-			socketMaxPerIp: 0,
+			socketMaxPerIp: 32,
+			socketMessageRate: 20,
+			socketMessageBurst: 100,
+			socketSilenceTimeout: 900,
+			socketAllowedOrigins: [],
+			socketRequireOrigin: true,
+			liveTagTtl: 3600,
+			maxRequestBodySize: 16 * 1024 * 1024,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
@@ -163,7 +187,9 @@ export function defaultConfig(): NatsuConfig {
 			CookieName: "NATSU_SESSION",
 			driver: "sqlite",
 			ttl: 60 * 60 * 24 * 7,
+			anonymousTtl: 3600,
 			sweepInterval: 300,
+			maxAnonymousPerIp: 1000,
 			path: ".natsu/sessions.sqlite",
 			cookie: {
 				path: "/",
@@ -223,6 +249,34 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(socketMaxPerIp) || socketMaxPerIp < 0) {
 		throw new ConfigError(`General.socketMaxPerIp must be a non-negative integer, got ${String(socketMaxPerIp)}`);
+	}
+	if (!Number.isInteger(config.Session.anonymousTtl) || config.Session.anonymousTtl < 1) {
+		throw new ConfigError(`Session.anonymousTtl must be a positive integer, got ${String(config.Session.anonymousTtl)}`);
+	}
+	const { socketMessageRate, socketMessageBurst, socketSilenceTimeout } = config.General;
+	if (!Number.isFinite(socketMessageRate) || socketMessageRate < 0) {
+		throw new ConfigError(`General.socketMessageRate must be a non-negative number, got ${String(socketMessageRate)}`);
+	}
+	if (!Number.isInteger(socketMessageBurst) || socketMessageBurst < 1) {
+		throw new ConfigError(`General.socketMessageBurst must be a positive integer, got ${String(socketMessageBurst)}`);
+	}
+	if (!Number.isInteger(socketSilenceTimeout) || socketSilenceTimeout < 0) {
+		throw new ConfigError(`General.socketSilenceTimeout must be a non-negative integer, got ${String(socketSilenceTimeout)}`);
+	}
+	if (!["strict", "lax", "none"].includes(config.Session.cookie.sameSite)) {
+		throw new ConfigError(`Session.cookie.sameSite must be one of strict|lax|none, got ${String(config.Session.cookie.sameSite)}`);
+	}
+	if (!Array.isArray(config.General.socketAllowedOrigins) || !config.General.socketAllowedOrigins.every((origin) => typeof origin === "string")) {
+		throw new ConfigError("General.socketAllowedOrigins must be a list of origin strings");
+	}
+	if (!Number.isInteger(config.General.liveTagTtl) || config.General.liveTagTtl < 1) {
+		throw new ConfigError(`General.liveTagTtl must be a positive integer, got ${String(config.General.liveTagTtl)}`);
+	}
+	if (!Number.isInteger(config.General.maxRequestBodySize) || config.General.maxRequestBodySize < 1) {
+		throw new ConfigError(`General.maxRequestBodySize must be a positive integer, got ${String(config.General.maxRequestBodySize)}`);
+	}
+	if (!Number.isInteger(config.Session.maxAnonymousPerIp) || config.Session.maxAnonymousPerIp < 0) {
+		throw new ConfigError(`Session.maxAnonymousPerIp must be a non-negative integer, got ${String(config.Session.maxAnonymousPerIp)}`);
 	}
 	return config;
 }
@@ -308,7 +362,11 @@ function coerceEnvValue(value: string, fallback: unknown): unknown {
 		if (Number.isNaN(n)) throw new ConfigError(`${JSON.stringify(value)} is not a number`);
 		return n;
 	}
-	if (typeof fallback === "boolean") return /^(1|true|yes|on)$/i.test(value);
+	if (typeof fallback === "boolean") {
+		if (/^(1|true|yes|on)$/i.test(value)) return true;
+		if (/^(0|false|no|off)$/i.test(value)) return false;
+		throw new ConfigError(`${JSON.stringify(value)} is not a boolean (use true or false)`);
+	}
 	if (Array.isArray(fallback) || isPlainObject(fallback)) return parseJson(value);
 	if (typeof fallback === "string") return value;
 

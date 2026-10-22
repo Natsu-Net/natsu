@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { config } from "../src/config.ts";
 import { Application } from "../src/server.ts";
 import { Context } from "../src/context.ts";
 import { Router } from "../src/router.ts";
@@ -328,6 +329,191 @@ describe("SessionManager", () => {
 		manager.registerMiddleware("audit", () => {});
 		expect([...manager.getAllMiddleware().keys()]).toEqual(["audit"]);
 		await manager.close();
+	});
+});
+
+describe("cookie hardening from config", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	function managerFor(general: Record<string, unknown>, session: Record<string, unknown> = {}) {
+		reset({ General: { logFormat: "", logLevel: "silent", ...general }, Session: { driver: "memory", sweepInterval: 0, ...session } });
+		return SessionManager.fromConfig(config);
+	}
+
+	test("an https public url makes the cookie Secure and __Host- prefixed", () => {
+		const manager = managerFor({ url: "https://shop.test" });
+		expect(manager.cookie.secure).toBe(true);
+		expect(manager.cookieName).toBe("__Host-NATSU_SESSION");
+	});
+
+	test("an http public url leaves the cookie as configured", () => {
+		const manager = managerFor({ url: "http://shop.test" });
+		expect(manager.cookie.secure).toBe(false);
+		expect(manager.cookieName).toBe("NATSU_SESSION");
+	});
+
+	test("a Domain cookie cannot take the __Host- prefix but is still Secure", () => {
+		const manager = managerFor({ url: "https://shop.test" }, { cookie: { domain: "shop.test" } });
+		expect(manager.cookie.secure).toBe(true);
+		expect(manager.cookieName).toBe("NATSU_SESSION");
+	});
+
+	test("a name that already carries a prefix is kept", () => {
+		expect(managerFor({ url: "https://shop.test" }, { CookieName: "__Secure-SID" }).cookieName).toBe("__Secure-SID");
+	});
+
+	test("the Set-Cookie header carries Secure and the prefixed name", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test" } });
+		new Router().get("/", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.body = "ok";
+		});
+		running = await startApp(new Application());
+		const setCookie = (await running.fetch("/")).headers.get("set-cookie") ?? "";
+		expect(setCookie).toStartWith("__Host-NATSU_SESSION=");
+		expect(setCookie).toContain("Secure");
+	});
+});
+
+describe("default headers on session pages", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	async function app() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/mine", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.body = "mine";
+		});
+		new Router().get("/kept", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.headers.set("Cache-Control", "public, max-age=60");
+			ctx.response.body = "kept";
+		});
+		new Router().get("/plain", (ctx) => {
+			ctx.response.body = "plain";
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const cookie = (await running.fetch("/mine")).headers.get("set-cookie")!.split(";")[0]!;
+		return cookie;
+	}
+
+	test("a page that touches the session is private, no-store and nosniff", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/mine", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBe("private, no-store");
+		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+	});
+
+	test("a value the app set is kept, except that public becomes private beside a cookie", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/kept", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBe("private, max-age=60");
+	});
+
+	test("a page that never touches the session gets no-store or nosniff, only private", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/plain", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBe("private");
+		expect(response.headers.get("x-content-type-options")).toBeNull();
+	});
+});
+
+describe("anonymous session lifetime", () => {
+	const horizon = (seconds: number) => nowSeconds() + seconds;
+
+	test("a session with no data expires on the short bound", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		expect(session.expire).toBeLessThanOrEqual(horizon(10));
+		expect(session.expire).toBeGreaterThan(horizon(5));
+	});
+
+	test("the first Set promotes it to the full lifetime", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		session.Set("user", "aiko");
+		expect(session.expire).toBeGreaterThan(horizon(900));
+	});
+
+	test("renewing a still-anonymous session keeps the short bound", () => {
+		const manager = new SessionManager({ ttl: 1000, anonymousTtl: 10, sweepInterval: 0 });
+		const session = manager.create();
+		session.Renew();
+		expect(session.expire).toBeLessThanOrEqual(horizon(10));
+	});
+
+	test("without the option the lifetime is the ttl, as before", () => {
+		const manager = new SessionManager({ ttl: 1000, sweepInterval: 0 });
+		expect(manager.create().expire).toBeGreaterThan(horizon(900));
+	});
+
+	test("the config default is an hour", () => {
+		reset({ Session: { driver: "memory", sweepInterval: 0, ttl: 86400 } });
+		const manager = SessionManager.fromConfig(config);
+		expect(manager.anonymousTtl).toBe(3600);
+	});
+});
+
+describe("rotate", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	test("destroys the old id, issues a new one and keeps the data", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/seed", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.response.body = ctx.session.id;
+		});
+		new Router().get("/login", async (ctx) => {
+			const before = ctx.session.id;
+			const next = await manager.rotate(ctx);
+			ctx.response.body = `${before} ${next.id} ${String(next.Get("user"))}`;
+		});
+		running = await startApp(new Application({ sessions: manager }));
+
+		const seed = await running.fetch("/seed");
+		const oldId = await seed.text();
+		const cookie = (seed.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		const login = await running.fetch("/login", { headers: { cookie } });
+		const [before, after, user] = (await login.text()).split(" ");
+
+		expect(before).toBe(oldId);
+		expect(after).not.toBe(oldId);
+		expect(user).toBe("aiko");
+		expect((await manager.get(after!))!.expire).toBeGreaterThan(nowSeconds() + 3600);
+		expect(login.headers.get("set-cookie")).toContain(`SID=${after}`);
+		expect(await manager.get(oldId)).toBeUndefined();
+		expect((await manager.get(after!))?.Get("user")).toBe("aiko");
+	});
+
+	test("keepData: false starts the new session empty", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		const old = manager.create();
+		old.Set("user", "aiko");
+		await old.Save();
+		const ctx = new Context(new Request("http://x.test/"));
+		ctx.sessions = manager;
+		ctx.session = old;
+
+		const next = await manager.rotate(ctx, { keepData: false });
+
+		expect(next.id).not.toBe(old.id);
+		expect(next.Get("user")).toBe(false);
+		expect(ctx.session).toBe(next);
 	});
 });
 

@@ -147,6 +147,21 @@ describe("refusals", () => {
 		expect(applyWrite(counter, "topic.length", 0)).toBe(false);
 	});
 
+	test("a __proto__ key in a client value pollutes nothing", () => {
+		const counter = resolveState(AsClass<Counter>(Counter), "");
+		const value = JSON.parse('{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted2":1}}}');
+		applyWrite(counter, "topic", value);
+		flushPatches(storeOf(counter));
+
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		expect(({} as Record<string, unknown>).polluted2).toBeUndefined();
+		const stored = counter.topic as unknown as Record<string, unknown>;
+		expect(stored.polluted).toBeUndefined();
+		expect(Object.getPrototypeOf(stored)).toBe(Object.prototype);
+		expect(applyWrite(counter, "__proto__", { polluted: 1 })).toBe(false);
+		expect(applyWrite(counter, "constructor", 1)).toBe(false);
+	});
+
 	test("calling a method that is not an @Action throws", () => {
 		const counter = resolveState(AsClass<Counter>(Counter), "");
 		expect(() => callAction(counter, "nuke", [])).toThrow(/not an @Action/);
@@ -272,6 +287,16 @@ describe("rooms", () => {
 		grantRoom("session-a", AsClass(Party), "room-a");
 		revokeRoom("session-a", AsClass(Party), "room-a");
 		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
+	});
+
+	test("a session holds a bounded number of rooms", () => {
+		const granted = Array.from({ length: 300 }, (_, i) => grantRoom("session-a", AsClass(Party), `room-${i}`));
+		expect(granted.filter(Boolean).length).toBe(256);
+		expect(hasRoom("session-a", "party", "room-0")).toBe(true);
+		expect(hasRoom("session-a", "party", "room-299")).toBe(false);
+		expect(grantRoom("session-a", AsClass(Party), "room-0")).toBe(true);
+		revokeRoom("session-a", AsClass(Party), "room-0");
+		expect(grantRoom("session-a", AsClass(Party), "room-299")).toBe(true);
 	});
 
 	test("ending a session drops every room it held", () => {

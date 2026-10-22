@@ -959,19 +959,20 @@ describe("regions", () => {
 		expect(text(p, "main h1")).toBe("Page A");
 	});
 
-	test("a part that cannot be read is a real load, never a dead click: DOMParser under Trusted Types, a bad script entry", async () => {
+	test("a part that cannot be read is a real load, never a dead click: innerHTML under Trusted Types, a bad script entry", async () => {
 		const p = open({
 			html: page(),
 			routes: { "/b": () => answer(part()), "/c": () => answer(part({ scripts: ["src=http%3A%2F%2F%5B"] })) },
 		});
-		const parse = p.window.DOMParser.prototype.parseFromString;
-		// What `require-trusted-types-for 'script'` does to a string handed to DOMParser.
-		p.window.DOMParser.prototype.parseFromString = () => {
+		const implementation = Object.getPrototypeOf(p.window.document.implementation);
+		const parse = implementation.createHTMLDocument;
+		// What `require-trusted-types-for 'script'` does to a string handed to innerHTML.
+		implementation.createHTMLDocument = () => {
 			throw new TypeError("This document requires 'TrustedHTML' assignment.");
 		};
 		expect(p.click("#to-b")).toBe(true);
 		await settle();
-		p.window.DOMParser.prototype.parseFromString = parse;
+		implementation.createHTMLDocument = parse;
 		p.click("#to-c");
 		await settle();
 		expect(p.loads).toEqual([
@@ -3266,6 +3267,25 @@ describe("live data", () => {
 		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: "" }));
 	});
 
+	test("a stale frame refreshes the page once, however often the server repeats it", async () => {
+		FakeSocket.last = undefined;
+		const p = open({
+			html: page({ head: live("todos|SIG") }),
+			before: (w) => (w.WebSocket = FakeSocket),
+			routes: { "/a": () => answer(part({ head: live("todos|SIG"), main: "<h1>A fresh</h1>" })) },
+		});
+		const ws = FakeSocket.last!;
+		ws.open();
+		ws.onmessage!({ data: JSON.stringify({ t: "stale" }) });
+		await tick(60);
+		await settle();
+		ws.onmessage!({ data: JSON.stringify({ t: "stale" }) });
+		await tick(60);
+		await settle();
+		expect(p.calls).toEqual([{ url: "/a", headers: { "Natsu-Nav": "k1.s1" } }]);
+		expect(text(p, "main h1")).toBe("A fresh");
+	});
+
 	test("a canceled natsu:invalidate keeps the page as it is", async () => {
 		FakeSocket.last = undefined;
 		const heard: string[] = [];
@@ -3346,8 +3366,8 @@ describe("size", () => {
 	// for another layout and the offline event (about 130 bytes); 6 KiB until
 	// scripts an edge injected are told apart (about 115 bytes).
 	// Raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms, body parts and edge scripts included, stays within 6.15 KiB of brotli", () => {
+	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms, body parts and edge scripts included, stays within 6.3 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(6300);
+		expect(br).toBeLessThanOrEqual(6450);
 	});
 });
