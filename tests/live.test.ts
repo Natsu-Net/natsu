@@ -120,6 +120,49 @@ function open(base: string, headers?: Record<string, string>): {
 	};
 }
 
+describe("frames that are not frames", () => {
+	test("none of them takes a handler down, and the socket still answers a hello", async () => {
+		const thrown: string[] = [];
+		const listener = (error: Error) => void thrown.push(error.message);
+		process.on("uncaughtException", listener);
+		try {
+			running = await startApp(new Application());
+			const client = open(running.base);
+			await client.ready;
+			for (const frame of ["null", "1", "[]", '"x"', "true", "{bad", '{"t":"watch","tags":null}', '{"t":"watch","tags":[null,5,{"a":1}]}', '{"t":"hello","stores":"x"}', '{"t":"hello","stores":[null,{},[]]}', '{"t":"call","store":{},"method":[]}', '{"t":"set","store":"room","key":{}}']) {
+				client.socket.send(frame);
+			}
+			client.socket.send(new Uint8Array([1, 2, 3, 255]));
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+			const frames = await client.next(1);
+			expect(thrown).toEqual([]);
+			expect(frames[0]).toEqual({ t: "sync", store: "room", value: { online: 0, topic: "hello" } });
+			client.socket.close();
+		} finally {
+			process.off("uncaughtException", listener);
+		}
+	});
+
+	test("a store that cannot be written out as JSON costs the sender nothing but the answer", async () => {
+		const thrown: string[] = [];
+		const listener = (error: Error) => void thrown.push(error.message);
+		process.on("uncaughtException", listener);
+		try {
+			running = await startApp(new Application());
+			const room = resolveState(AsClass<Room>(Room), "");
+			(room as unknown as { topic: unknown }).topic = 10n;
+			const client = open(running.base);
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+			await Bun.sleep(100);
+			expect(thrown).toEqual([]);
+			client.socket.close();
+		} finally {
+			process.off("uncaughtException", listener);
+		}
+	});
+});
+
 describe("the handshake", () => {
 	test("hello gets a snapshot of each store the page holds", async () => {
 		running = await startApp(new Application());

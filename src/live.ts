@@ -416,75 +416,82 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 
 			let frame: ClientFrame;
 			try {
-				frame = JSON.parse(String(raw)) as ClientFrame;
+				const parsed: unknown = JSON.parse(String(raw));
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return next?.message?.(ws as never, raw as never);
+				frame = parsed as ClientFrame;
 			} catch {
 				return;
 			}
 
-			if (frame.t === "hello") {
-				const asked = Array.isArray(frame.stores) ? frame.stores : [];
-				for (const key of asked.slice(0, 64)) {
-					const found = instanceFor(ws.data, key);
-					if (!found) continue;
-					const topic = topicFor(found.Class, found.scopeId);
-					// Publishing before subscribing, so a write that lands between
-					// the two is not lost between the snapshot and the stream.
-					if (liveServer) ensurePublishing(liveServer, found);
-					ws.subscribe(topic);
-					ws.data.topics.add(topic);
-					ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
+			try {
+				if (frame.t === "hello") {
+					const asked = Array.isArray(frame.stores) ? frame.stores : [];
+					for (const key of asked.slice(0, 64)) {
+						const found = instanceFor(ws.data, key);
+						if (!found) continue;
+						const topic = topicFor(found.Class, found.scopeId);
+						// Publishing before subscribing, so a write that lands between
+						// the two is not lost between the snapshot and the stream.
+						if (liveServer) ensurePublishing(liveServer, found);
+						ws.subscribe(topic);
+						ws.data.topics.add(topic);
+						ws.send(JSON.stringify({ t: "sync", store: found.wire, value: snapshotOf(found.instance) }));
+					}
+					return;
 				}
-				return;
-			}
 
-			if (frame.t === "watch") {
-				// Signed by the server that drew the page: a socket watches what a
-				// page listed, never a tag it made up. Anything else clears the list.
-				// One signed list per thing on the page that drew live data: the
-				// page's own, then each live island's. A list that does not verify
-				// is dropped alone.
-				const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
-				const checked = lists.map((list: unknown) => checkTags(list, ws.data.scopeId));
-				const tags = checked.flatMap((entry) => (entry && !entry.expired ? entry.tags : []));
-				if (checked.some((entry) => entry?.expired)) ws.send(JSON.stringify({ t: "stale" }));
-				const next = new Set(tags.map(tagTopic));
-				for (const topic of ws.data.tags ?? []) {
-					if (next.has(topic)) continue;
-					ws.unsubscribe(topic);
-					ws.data.topics.delete(topic);
+				if (frame.t === "watch") {
+					// Signed by the server that drew the page: a socket watches what a
+					// page listed, never a tag it made up. Anything else clears the list.
+					// One signed list per thing on the page that drew live data: the
+					// page's own, then each live island's. A list that does not verify
+					// is dropped alone.
+					const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
+					const checked = lists.map((list: unknown) => checkTags(list, ws.data.scopeId));
+					const tags = checked.flatMap((entry) => (entry && !entry.expired ? entry.tags : []));
+					if (checked.some((entry) => entry?.expired)) ws.send(JSON.stringify({ t: "stale" }));
+					const next = new Set(tags.map(tagTopic));
+					for (const topic of ws.data.tags ?? []) {
+						if (next.has(topic)) continue;
+						ws.unsubscribe(topic);
+						ws.data.topics.delete(topic);
+					}
+					for (const topic of next) {
+						ws.subscribe(topic);
+						ws.data.topics.add(topic);
+					}
+					ws.data.tags = next;
+					return;
 				}
-				for (const topic of next) {
-					ws.subscribe(topic);
-					ws.data.topics.add(topic);
-				}
-				ws.data.tags = next;
-				return;
-			}
 
-			if (frame.t === "set") {
-				const found = instanceFor(ws.data, frame.store);
-				if (!found || typeof frame.key !== "string") return;
-				// Re-checked here whatever the client believes. The manifest it
-				// holds says which fields the UI should offer to edit; it is not
-				// a capability.
-				if (!applyWrite(found.instance, frame.key, frame.value)) {
-					log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.wire}.${frame.key}</cyan>`);
+				if (frame.t === "set") {
+					const found = instanceFor(ws.data, frame.store);
+					if (!found || typeof frame.key !== "string") return;
+					// Re-checked here whatever the client believes. The manifest it
+					// holds says which fields the UI should offer to edit; it is not
+					// a capability.
+					if (!applyWrite(found.instance, frame.key, frame.value)) {
+						log.warn(`[<yellow>live</yellow>] refused write to <cyan>${found.wire}.${frame.key}</cyan>`);
+					}
+					return;
 				}
-				return;
-			}
 
-			if (frame.t === "call") {
-				const found = instanceFor(ws.data, frame.store);
-				if (!found || typeof frame.method !== "string") return;
-				const args = Array.isArray(frame.args) ? frame.args : [];
-				// An action that cannot tell one caller from another cannot enforce
-				// anything — no host check, no per-person rate limit.
-				const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
-				try {
-					callAction(found.instance, frame.method, args, who);
-				} catch (error) {
-					log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
+				if (frame.t === "call") {
+					const found = instanceFor(ws.data, frame.store);
+					if (!found || typeof frame.method !== "string") return;
+					const args = Array.isArray(frame.args) ? frame.args : [];
+					// An action that cannot tell one caller from another cannot enforce
+					// anything — no host check, no per-person rate limit.
+					const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
+					try {
+						callAction(found.instance, frame.method, args, who);
+					} catch (error) {
+						log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
+					}
+					return;
 				}
+			} catch (error) {
+				log.warn(`[<yellow>live</yellow>] frame refused: ${(error as Error).message}`);
 				return;
 			}
 
