@@ -93,3 +93,13 @@ describe("an action's post", () => {
 		expect(Object.keys(shown)).toEqual(["__proto__"]);
 	});
 });
+
+describe("a page that carries a visitor's form token", () => {
+	test("is private to a shared cache", async () => {
+		action("x.go", () => {}, { public: true });
+		await serve();
+		const answer = await running!.fetch("/");
+		expect(answer.headers.get("cache-control")).toBe("private");
+		expect(await answer.text()).toContain('name="_csrf"');
+	});
+});

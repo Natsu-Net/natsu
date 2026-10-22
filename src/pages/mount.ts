@@ -595,6 +595,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			}
 
 			const secrets = secretsFor(ctx, state);
+			if (state.actions.size > 0 && !ctx.response.headers.has("cache-control")) ctx.response.headers.set("cache-control", "private");
 			const names = state.actions.size > 0 || options.secrets || swaps ? Object.keys(secrets).sort() : [];
 
 			const cacheable =
