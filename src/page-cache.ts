@@ -60,6 +60,12 @@ export interface PageCacheOptions {
 	 * them (default false). `listen()` does the same and can be stopped.
 	 */
 	invalidate?: boolean;
+	/**
+	 * Most query variants of one path kept at once (default 64): the oldest
+	 * go first, so a client that makes up query strings churns its own path
+	 * and no other.
+	 */
+	maxPerPath?: number;
 }
 
 /** A page as `render` draws it, and as `serve` answers it. */
@@ -184,6 +190,11 @@ function drewDropped(tags: readonly string[] | undefined, dropped: Set<string>, 
 	return false;
 }
 
+function pathOf(key: string): string {
+	const query = key.indexOf("?");
+	return query === -1 ? key : key.slice(0, query);
+}
+
 /** Seconds as ms, or `fallback` for anything that is not a number of seconds. */
 function ms(seconds: unknown, fallback: number): number {
 	return typeof seconds === "number" && seconds >= 0 && seconds < 1e9 ? seconds * 1000 : fallback;
@@ -202,6 +213,8 @@ export class PageCache {
 	private readonly refused = new Map<string, number>();
 	/** Kept keys by the tags their pages carry. */
 	private readonly byTag = new Map<string, Set<string>>();
+	private readonly byPath = new Map<string, Set<string>>();
+	private readonly maxPerPath: number;
 	private readonly fresh: number;
 	private readonly stale: number;
 	private readonly maxChars: number;
@@ -219,6 +232,7 @@ export class PageCache {
 		this.fresh = (options.fresh ?? 10) * 1000;
 		this.stale = (options.stale ?? 30) * 1000;
 		this.maxChars = options.maxChars ?? 32_000_000;
+		this.maxPerPath = Math.max(1, options.maxPerPath ?? 64);
 		this.prepare = options.prepare;
 		if (options.invalidate) this.listen();
 	}
@@ -304,6 +318,7 @@ export class PageCache {
 	public clear(): void {
 		this.entries.clear();
 		this.byTag.clear();
+		this.byPath.clear();
 		this.chars = 0;
 		this.refused.clear();
 		for (const running of this.pending.values()) running.void = true;
@@ -456,6 +471,14 @@ export class PageCache {
 		if (entry.chars > this.maxChars) return;
 		this.entries.set(key, entry);
 		this.chars += entry.chars;
+		const path = pathOf(key);
+		const siblings = this.byPath.get(path) ?? new Set<string>();
+		this.byPath.set(path, siblings);
+		siblings.add(key);
+		for (const oldest of siblings) {
+			if (siblings.size <= this.maxPerPath) break;
+			this.forget(oldest);
+		}
 		if (entry.tags) {
 			for (const tag of entry.tags) {
 				let keys = this.byTag.get(tag);
@@ -486,6 +509,9 @@ export class PageCache {
 		if (!entry) return;
 		this.entries.delete(key);
 		this.chars -= entry.chars;
+		const path = pathOf(key);
+		const siblings = this.byPath.get(path);
+		if (siblings?.delete(key) && siblings.size === 0) this.byPath.delete(path);
 		if (entry.tags) {
 			for (const tag of entry.tags) {
 				const keys = this.byTag.get(tag);
