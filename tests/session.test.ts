@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { config } from "../src/config.ts";
 import { Application } from "../src/server.ts";
 import { Context } from "../src/context.ts";
 import { Router } from "../src/router.ts";
@@ -328,6 +329,54 @@ describe("SessionManager", () => {
 		manager.registerMiddleware("audit", () => {});
 		expect([...manager.getAllMiddleware().keys()]).toEqual(["audit"]);
 		await manager.close();
+	});
+});
+
+describe("cookie hardening from config", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	function managerFor(general: Record<string, unknown>, session: Record<string, unknown> = {}) {
+		reset({ General: { logFormat: "", logLevel: "silent", ...general }, Session: { driver: "memory", sweepInterval: 0, ...session } });
+		return SessionManager.fromConfig(config);
+	}
+
+	test("an https public url makes the cookie Secure and __Host- prefixed", () => {
+		const manager = managerFor({ url: "https://shop.test" });
+		expect(manager.cookie.secure).toBe(true);
+		expect(manager.cookieName).toBe("__Host-NATSU_SESSION");
+	});
+
+	test("an http public url leaves the cookie as configured", () => {
+		const manager = managerFor({ url: "http://shop.test" });
+		expect(manager.cookie.secure).toBe(false);
+		expect(manager.cookieName).toBe("NATSU_SESSION");
+	});
+
+	test("a Domain cookie cannot take the __Host- prefix but is still Secure", () => {
+		const manager = managerFor({ url: "https://shop.test" }, { cookie: { domain: "shop.test" } });
+		expect(manager.cookie.secure).toBe(true);
+		expect(manager.cookieName).toBe("NATSU_SESSION");
+	});
+
+	test("a name that already carries a prefix is kept", () => {
+		expect(managerFor({ url: "https://shop.test" }, { CookieName: "__Secure-SID" }).cookieName).toBe("__Secure-SID");
+	});
+
+	test("the Set-Cookie header carries Secure and the prefixed name", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test" } });
+		new Router().get("/", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.body = "ok";
+		});
+		running = await startApp(new Application());
+		const setCookie = (await running.fetch("/")).headers.get("set-cookie") ?? "";
+		expect(setCookie).toStartWith("__Host-NATSU_SESSION=");
+		expect(setCookie).toContain("Secure");
 	});
 });
 

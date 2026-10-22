@@ -181,11 +181,15 @@ export class SessionManager {
 	static fromConfig(config: NatsuConfig): SessionManager {
 		const adapter: SessionAdapter =
 			config.Session.driver === "sqlite" ? new SqliteAdapter({ path: config.Session.path }) : new MemoryAdapter();
+		const https = config.General.url.startsWith("https:");
+		const cookie = { ...config.Session.cookie, secure: config.Session.cookie.secure || https };
+		const name = config.Session.CookieName;
+		const hostBound = https && cookie.path === "/" && !cookie.domain && !/^__(Host|Secure)-/.test(name);
 		return new SessionManager({
 			adapter,
 			ttl: config.Session.ttl,
-			cookieName: config.Session.CookieName,
-			cookie: config.Session.cookie,
+			cookieName: hostBound ? `__Host-${name}` : name,
+			cookie,
 			sweepInterval: config.Session.sweepInterval,
 		});
 	}
