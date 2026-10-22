@@ -47,6 +47,7 @@ import { config } from "../config.ts";
 import type { Context, Handler } from "../context.ts";
 import { invalidate, liveScope, onInvalidate, signTags } from "../invalidate.ts";
 import { log } from "../logger.ts";
+import { scriptNonce } from "../csp.ts";
 import { navigable } from "../navigate.ts";
 import { PageCache, type PageCacheOptions } from "../page-cache.ts";
 import { Router } from "../router.ts";
@@ -227,6 +228,14 @@ const NO_SECRETS: Record<string, string> = Object.freeze({}) as Record<string, s
 /** What uwu draws as the first child of a `<form @submit="action:…">`. */
 const ACTION_INPUT = /<input type="hidden" name="_action" value="[^"]*">/g;
 const MAX_BODY = 1024 * 1024;
+const SWAP_MARKER = "__uwuSwap";
+const SWAP_SCRIPT =
+	/<script>(\(window\.__uwuSwap\|\|\(window\.__uwuSwap=function\(r,p\)\{var t=document\.getElementById\(r\),s=document\.getElementById\(p\);if\(t&&s\)\{s\.replaceWith\(t\.content\.cloneNode\(true\)\);t\.remove\(\);\}\}\)\)\("[\w-]+","[\w-]+"\);<\/script>)/g;
+
+function nonceSwapScripts(html: string, nonce: string | undefined): string {
+	if (!nonce || !html.includes(SWAP_MARKER)) return html;
+	return html.replace(SWAP_SCRIPT, (_, script: string) => `<script nonce="${nonce}">${script}`);
+}
 
 export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	if (!options.dir && !options.built) throw new TypeError("natsu/pages: mountPages needs { dir } or { built }");
@@ -240,6 +249,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	let notFoundPage: Drawn | undefined;
 	let summary: PageRoute[] = [];
 	let css = "";
+	let swaps = false;
 	const maxBody = options.maxBody ?? MAX_BODY;
 	const publicUrl = (): string => options.baseUrl ?? config.General.url;
 	setPublicOrigin(publicUrl);
@@ -412,6 +422,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		const rootError = loaded.get("_error.uwu");
 		const nextNotFound = rootError ? drawn(rootError, chain(""), "/", [], ["error"]) : undefined;
 
+		swaps = [...loaded.values()].some((file) => file.server.includes(SWAP_MARKER));
 		routes = next;
 		notFoundPage = nextNotFound;
 		renderOptions = {
@@ -472,7 +483,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		styles,
 	});
 
-	const drawPage = async (drawn: Drawn, values: Record<string, unknown>, meta: PageMeta, fallbackTitle: string, live = ""): Promise<string> => {
+	const drawPage = async (drawn: Drawn, values: Record<string, unknown>, meta: PageMeta, fallbackTitle: string, live = "", nonce?: string): Promise<string> => {
 		// The page itself sees `page` without the <h1> title (that comes from what it draws).
 		if ("page" in drawn.page.reads) values.page = pageValue(meta, drawn.styles, live);
 		const html = await renderToString(drawn.page.render, values, renderOptions);
@@ -480,7 +491,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		values.page = pageValue(meta, drawn.styles, live);
 		let out = html;
 		for (const layout of drawn.layouts) out = await renderToString(layout.render, values, { ...renderOptions, child: out });
-		return out;
+		return nonceSwapScripts(out, nonce);
 	};
 
 	const canonical = (ctx: Context): string => publicUrl().replace(/\/+$/, "") + ctx.path;
@@ -501,7 +512,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				canonical: canonical(ctx),
 				robots: state.noindex ? "noindex" : "",
 			};
-			const html = await drawPage(state, values, meta, "", signTags(tags, liveScope(ctx)));
+			const html = await drawPage(state, values, meta, "", signTags(tags, liveScope(ctx)), secrets.nonce);
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
 		} catch (thrown) {
 			const error = known(thrown);
@@ -522,7 +533,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				const scope = scopeFor(ctx, state, secrets, { error: { status, message } });
 				const { values } = await resolvePlan(page.plan, scope);
 				const meta: PageMeta = { title: "", description: "", canonical: "", robots: "noindex" };
-				return { body: await drawPage(page, values, meta, String(status)), status, html: true };
+				return { body: await drawPage(page, values, meta, String(status), "", secrets.nonce), status, html: true };
 			} catch (inner) {
 				log.error(`[<red>pages</red>] pages/${page.page.file} failed drawing a ${status}: ${(inner as Error)?.stack ?? inner}`);
 			}
@@ -542,9 +553,16 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return out.body;
 	};
 
+	const baseSecrets = (ctx: Context): Record<string, string> => {
+		const own = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		if (!swaps) return own;
+		const nonce = scriptNonce(ctx.response.headersInitialized ? ctx.response.headers.get("content-security-policy") : null);
+		return nonce === undefined ? own : { ...own, nonce };
+	};
+
 	/** The visitor's secrets, with the CSRF token on a route with actions (minted, and its cookie set, if there is none). */
 	const secretsFor = (ctx: Context, state: RouteState): Record<string, string> => {
-		const own = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		const own = baseSecrets(ctx);
 		if (state.actions.size === 0) return own;
 		const bound = sessionToken(ctx);
 		let token = tokenOf(ctx);
@@ -573,7 +591,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			}
 
 			const secrets = secretsFor(ctx, state);
-			const names = state.actions.size > 0 || options.secrets ? Object.keys(secrets).sort() : [];
+			const names = state.actions.size > 0 || options.secrets || swaps ? Object.keys(secrets).sort() : [];
 
 			const cacheable =
 				state.cache !== "off" &&
@@ -720,7 +738,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const notFound: Handler = wrapped(async (ctx) => {
 		const page = notFoundPage;
 		if (!page) return undefined;
-		const secrets = options.secrets ? options.secrets(ctx) : NO_SECRETS;
+		const secrets = baseSecrets(ctx);
 		return answer(ctx, await drawError(ctx, { path: "/", page: page.page }, page, secrets, new NotFound()));
 	});
 
