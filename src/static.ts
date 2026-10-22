@@ -132,18 +132,17 @@ export class StaticFiles {
 			}
 		}
 
-		if (!this.options.followSymlinks) {
-			try {
-				// realpath only answers for paths that exist; a miss is handled
-				// later as a plain 404.
-				const real = realpathSync(target);
-				if (!this.contains(real)) return { rejected: "escape" };
-			} catch {
-				// ENOENT here means "no such file", not "unsafe".
-			}
-		}
+		if (!this.options.followSymlinks && !this.staysInside(target)) return { rejected: "escape" };
 
 		return { path: target };
+	}
+
+	private staysInside(target: string): boolean {
+		try {
+			return this.contains(realpathSync(target));
+		} catch {
+			return true;
+		}
 	}
 
 	private contains(path: string): boolean {
@@ -193,6 +192,7 @@ export class StaticFiles {
 			if (!this.options.index) return false;
 			filePath = resolve(filePath, this.options.index);
 			if (!this.contains(filePath)) return false;
+			if (!this.options.followSymlinks && !this.staysInside(filePath)) return false;
 			stat = statOf(filePath);
 		}
 
