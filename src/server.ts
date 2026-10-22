@@ -398,7 +398,7 @@ export class Application {
 
 	private async upgradeSocket(request: Request, server: NatsuServer): Promise<Response> {
 		const { General } = this.config;
-		if (!sameOriginSocket(request, General.url)) return new Response("Forbidden", { status: 403 });
+		if (!sameOriginSocket(request, General.url, { allowed: General.socketAllowedOrigins, requireOrigin: General.socketRequireOrigin })) return new Response("Forbidden", { status: 403 });
 
 		const probe = new Context(request, server);
 		probe.trustProxy = General.proxy;

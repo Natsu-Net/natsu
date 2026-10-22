@@ -280,21 +280,42 @@ function releaseIp(ip: string | undefined): void {
 	else socketsByIp.delete(key);
 }
 
-export function sameOriginSocket(request: Request, publicUrl: string): boolean {
+export interface OriginPolicy {
+	allowed?: readonly string[];
+	requireOrigin?: boolean;
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function hostOf(value: string): string | undefined {
+	try {
+		return new URL(value.includes("://") ? value : `http://${value}`).host;
+	} catch {
+		return undefined;
+	}
+}
+
+function browserLike(request: Request): boolean {
+	const { headers } = request;
+	if (headers.has("sec-fetch-mode") || headers.has("sec-fetch-site") || headers.has("sec-fetch-dest")) return true;
+	return (headers.get("user-agent") ?? "").startsWith("Mozilla/");
+}
+
+export function sameOriginSocket(request: Request, publicUrl: string, policy: OriginPolicy = {}): boolean {
 	const origin = request.headers.get("origin");
-	if (origin === null) return true;
+	if (origin === null) return !(policy.requireOrigin ?? true) || !browserLike(request);
 	let originHost: string;
 	try {
 		originHost = new URL(origin).host;
 	} catch {
 		return false;
 	}
-	if (originHost === request.headers.get("host")) return true;
-	try {
-		return originHost === new URL(publicUrl).host;
-	} catch {
-		return false;
+	if (originHost === hostOf(publicUrl)) return true;
+	for (const entry of policy.allowed ?? []) {
+		if (originHost === hostOf(entry)) return true;
 	}
+	const requestHost = request.headers.get("host");
+	return originHost === requestHost && LOOPBACK_HOSTS.has(new URL(`http://${originHost}`).hostname);
 }
 
 /** A store a connection is allowed to address, and where it lives. */

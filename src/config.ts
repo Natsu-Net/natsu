@@ -33,6 +33,10 @@ export interface GeneralConfig {
 	socketMessageBurst: number;
 	/** Seconds a live socket may go without sending a frame before it is closed; 0 means never. */
 	socketSilenceTimeout: number;
+	/** Extra origins (`https://app.example`) allowed to open a live socket besides `url`. */
+	socketAllowedOrigins: string[];
+	/** Refuse browser-like socket upgrades that carry no Origin header. */
+	socketRequireOrigin: boolean;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -143,6 +147,8 @@ export function defaultConfig(): NatsuConfig {
 			socketMessageRate: 20,
 			socketMessageBurst: 100,
 			socketSilenceTimeout: 900,
+			socketAllowedOrigins: [],
+			socketRequireOrigin: true,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",

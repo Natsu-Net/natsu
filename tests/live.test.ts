@@ -10,7 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Application } from "../src/server.ts";
-import { endSession, ipKey, resetLive } from "../src/live.ts";
+import { endSession, ipKey, resetLive, sameOriginSocket } from "../src/live.ts";
 import { Action, Networked, State, caller, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
 import { Router } from "../src/router.ts";
 import { SessionManager } from "../src/session/session.ts";
@@ -359,12 +359,28 @@ describe("who may connect", () => {
 		expect(await outcome(undefined)).toBe("open");
 	});
 
-	test("the same origin is let in", async () => {
+	test("the same origin is let in on a loopback host", async () => {
 		reset();
 		running = await startApp(new Application());
 		const client = open(running.base, { Origin: running.base });
 		await client.ready;
 		client.socket.close();
+	});
+
+	test("an Origin that only matches a non-loopback Host header is refused", () => {
+		const request = new Request("http://rebind.test/_uwu/socket", { headers: { origin: "http://rebind.test", host: "rebind.test" } });
+		expect(sameOriginSocket(request, "https://shop.test")).toBe(false);
+	});
+
+	test("a browser-like upgrade without an Origin is refused unless opted out", async () => {
+		const browser = { "Sec-Fetch-Mode": "websocket", "Sec-Fetch-Site": "cross-site" };
+		expect(await outcome(browser)).toBe("refused");
+		expect(await outcome(browser, { socketRequireOrigin: false })).toBe("open");
+	});
+
+	test("an allow-listed origin is accepted", async () => {
+		expect(await outcome({ Origin: "https://app.shop.test" }, { socketAllowedOrigins: ["https://app.shop.test"] })).toBe("open");
+		expect(await outcome({ Origin: "https://other.test" }, { socketAllowedOrigins: ["https://app.shop.test"] })).toBe("refused");
 	});
 
 	test("another site's page is refused", async () => {
