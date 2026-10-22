@@ -63,12 +63,12 @@ export class Session {
 
 	/** v1 returns `false`, not `undefined`, for an absent key. Kept as-is. */
 	public Get<T = unknown>(key: string): T | false {
-		const value = this.data[key];
+		const value = Object.hasOwn(this.data, key) ? this.data[key] : undefined;
 		return value === undefined ? false : (value as T);
 	}
 
 	public Has(key: string): boolean {
-		return this.data[key] !== undefined;
+		return Object.hasOwn(this.data, key) && this.data[key] !== undefined;
 	}
 
 	public delete(key: string): void {
