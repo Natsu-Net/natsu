@@ -214,7 +214,7 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 
 	const layout = (page: Page): string => {
 		const account = page.layout === "account";
-		const main = `<main id="main" data-natsu-region>${page.main}</main>`;
+		const main = `<main id="main" data-natsu-region>${page.main.replaceAll("{nonce}", page.nonce)}</main>`;
 		return `<!doctype html><html lang="en"${account ? " data-natsu-transition" : ""}><head><meta charset="utf-8">` +
 			`<meta name="viewport" content="width=device-width, initial-scale=1"><title>${escape(page.title)}</title>` +
 			`<link rel="stylesheet" href="/assets/site.css">` +
@@ -347,7 +347,7 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 	Routes.get("/account/orders", navigable(own(() => ({
 		layout: "account",
 		title: "Orders",
-		main: '<h1>Orders</h1><p>Ticks: <span id="clock" data-clock>0</span></p><p id="orders-note">Two orders</p><ol><li>Order 1</li><li>Order 2</li></ol>',
+		main: '<h1>Orders</h1><p>Ticks: <span id="clock" data-clock>0</span></p><p id="orders-note">Two orders</p><style nonce="{nonce}">#orders-list{color:rgb(0,100,100)}</style><ol id="orders-list"><li>Order 1</li><li>Order 2</li></ol>',
 		// This page's own inline style: after a soft visit it applies only with the document's nonce.
 		head: '<style nonce="{nonce}">#orders-note{color:rgb(0,0,200)}</style>',
 		scripts: ["account"],

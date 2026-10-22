@@ -847,11 +847,9 @@ describe("page switching in Chromium, against a natsu app", () => {
 		expect(await page.evaluate((s: Element) => s === document.querySelector("head style") && s.isConnected, layoutStyle)).toBe(true);
 		expect(await color("clock")).toBe("rgb(0, 128, 0)");
 		expect(await color("orders-note")).toBe("rgb(0, 0, 200)");
+		expect(await color("orders-list")).toBe("rgb(0, 100, 100)");
 		expect(await page.evaluate(() => document.head.querySelectorAll("style").length)).toBe(2);
-		// Chromium reports each inline style DOMParser reads in the part against
-		// the page's policy, nonce or not: two here, the layout's and the page's.
-		// They are reports only (both styles above apply); a real load has none.
-		expect(await page.evaluate(() => (window as any).__csp)).toEqual(["style-src-elem inline", "style-src-elem inline"]);
+		expect(await page.evaluate(() => (window as any).__csp)).toEqual([]);
 		await page.click("#side-account");
 		await title(page, "Account");
 		expect(await page.evaluate(() => document.head.querySelectorAll("style").length)).toBe(1);
