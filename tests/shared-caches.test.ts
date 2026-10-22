@@ -52,6 +52,13 @@ describe("a response that sets a cookie is never public", () => {
 		expect(bare.headers.get("cache-control")).toBe("public, max-age=60, s-maxage=600, immutable");
 	});
 
+	test("a response that sets a cookie and says nothing about caching is private", async () => {
+		const answer = await running.fetch("/plain", { headers: { cookie: sessionCookie } });
+		expect(answer.headers.getSetCookie().length).toBe(1);
+		expect(answer.headers.get("cache-control")).toBe("private");
+		expect((await running.fetch("/plain")).headers.get("cache-control")).toBeNull();
+	});
+
 	test("static files say nosniff", async () => {
 		expect((await running.fetch("/app.js")).headers.get("x-content-type-options")).toBe("nosniff");
 	});

@@ -109,8 +109,12 @@ export function parseCookies(header: string | null): Map<string, string> {
 }
 
 function keepCookiesPrivate(headers: Headers): void {
+	if (!headers.has("set-cookie")) return;
 	const control = headers.get("cache-control");
-	if (control === null || !headers.has("set-cookie")) return;
+	if (control === null) {
+		headers.set("cache-control", "private");
+		return;
+	}
 	const kept = control
 		.split(",")
 		.map((directive) => directive.trim())
