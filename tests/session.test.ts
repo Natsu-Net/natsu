@@ -414,10 +414,10 @@ describe("default headers on session pages", () => {
 		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 	});
 
-	test("a value the app set is kept", async () => {
+	test("a value the app set is kept, except that public becomes private beside a cookie", async () => {
 		const cookie = await app();
 		const response = await running!.fetch("/kept", { headers: { cookie } });
-		expect(response.headers.get("cache-control")).toBe("public, max-age=60");
+		expect(response.headers.get("cache-control")).toBe("private, max-age=60");
 	});
 
 	test("a page that never touches the session gets neither", async () => {

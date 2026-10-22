@@ -108,6 +108,18 @@ export function parseCookies(header: string | null): Map<string, string> {
 	return out;
 }
 
+function keepCookiesPrivate(headers: Headers): void {
+	const control = headers.get("cache-control");
+	if (control === null || !headers.has("set-cookie")) return;
+	const kept = control
+		.split(",")
+		.map((directive) => directive.trim())
+		.filter((directive) => !/^s-maxage\b/i.test(directive))
+		.map((directive) => (/^public$/i.test(directive) ? "private" : directive));
+	const next = kept.join(", ");
+	if (next !== control) headers.set("cache-control", next);
+}
+
 export class NatsuResponse {
 	public body: ResponseBody = undefined;
 
@@ -384,9 +396,13 @@ export class Context {
 					if (key === "set-cookie") body.headers.append(key, value);
 					else if (!body.headers.has(key)) body.headers.set(key, value);
 				}
+				try {
+					keepCookiesPrivate(body.headers);
+				} catch {}
 			}
 			return body;
 		}
+		if (response.headersInitialized) keepCookiesPrivate(response.headers);
 
 		const status = response.status;
 		const headers = response.headersInitialized ? response.headers : undefined;

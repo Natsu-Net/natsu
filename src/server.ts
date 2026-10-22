@@ -372,7 +372,13 @@ export class Application {
 				// The upgrade has to happen before the middleware chain: a
 				// handshake that went through the chain would get a body, and a
 				// request with a body cannot be upgraded.
-				if (live && new URL(request.url).pathname === SOCKET_PATH) {
+				let pathname: string;
+				try {
+					pathname = new URL(request.url).pathname;
+				} catch {
+					return new Response("Bad Request", { status: 400 });
+				}
+				if (live && pathname === SOCKET_PATH) {
 					// The session decides which state this connection can see,
 					// so it is resolved here and nowhere else — a frame never
 					// names a scope.

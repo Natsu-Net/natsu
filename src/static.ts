@@ -204,6 +204,7 @@ export class StaticFiles {
 		const { headers } = ctx.response;
 		headers.set("Content-Type", MIME_OVERRIDES[extname(filePath)] ?? file.type ?? "application/octet-stream");
 		headers.set("Accept-Ranges", "bytes");
+		headers.set("X-Content-Type-Options", "nosniff");
 
 		const mtime = Math.floor(stat.mtimeMs);
 		const etag = this.options.etag ? `W/"${stat.size.toString(16)}-${mtime.toString(16)}"` : undefined;
