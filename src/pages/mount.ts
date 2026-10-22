@@ -680,6 +680,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (!target || !entry || typeof short !== "string") return plain(404, "Unknown action");
 
 			const secrets = secretsFor(ctx, state);
+			const sessionBefore = ctx.currentSession?.id;
+			const secretsNow = (): Record<string, string> => (ctx.currentSession?.id === sessionBefore ? secrets : secretsFor(ctx, state));
 			const refuse = async (thrown: unknown): Promise<string> => {
 				const error = known(thrown);
 				// Sent elsewhere (a sign-in first, a step the app asks for): a 303, as a success is.
@@ -723,7 +725,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 
 			if (result.errors && (Object.keys(result.errors).length > 0 || result.message)) {
 				// Refused: the page again, with what was typed and why, for the visitor to fix.
-				const out = await draw(ctx, state, secrets, {
+				const out = await draw(ctx, state, secretsNow(), {
 					form: { action: short, errors: result.errors, values: valuesOf(input), message: result.message ?? "" },
 				});
 				return answer(ctx, { ...out, status: out.status === 200 ? 422 : out.status });
@@ -739,7 +741,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 
 			if (result.show) {
 				// Shown once: drawn into this answer only, never kept by a cache or the history's URL.
-				const out = await draw(ctx, state, secrets, {
+				const out = await draw(ctx, state, secretsNow(), {
 					form: { action: short, errors: {}, values: {}, message: result.flash ?? "", shown: result.show },
 				});
 				ctx.response.headers.set("cache-control", "no-store");
