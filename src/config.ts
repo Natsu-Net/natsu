@@ -37,6 +37,8 @@ export interface GeneralConfig {
 	socketAllowedOrigins: string[];
 	/** Refuse browser-like socket upgrades that carry no Origin header. */
 	socketRequireOrigin: boolean;
+	/** Seconds a signed live-tag list stays valid; a page drawn again signs a fresh one. */
+	liveTagTtl: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -151,6 +153,7 @@ export function defaultConfig(): NatsuConfig {
 			socketSilenceTimeout: 900,
 			socketAllowedOrigins: [],
 			socketRequireOrigin: true,
+			liveTagTtl: 3600,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
@@ -254,6 +257,9 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(socketSilenceTimeout) || socketSilenceTimeout < 0) {
 		throw new ConfigError(`General.socketSilenceTimeout must be a non-negative integer, got ${String(socketSilenceTimeout)}`);
+	}
+	if (!Number.isInteger(config.General.liveTagTtl) || config.General.liveTagTtl < 1) {
+		throw new ConfigError(`General.liveTagTtl must be a positive integer, got ${String(config.General.liveTagTtl)}`);
 	}
 	return config;
 }

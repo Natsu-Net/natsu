@@ -47,7 +47,7 @@ export interface LiveServer {
 }
 
 import type { NatsuSocketData } from "./context.ts";
-import { onInvalidate, tagTopic, verifyTags } from "./invalidate.ts";
+import { checkTags, onInvalidate, tagTopic } from "./invalidate.ts";
 
 import { log } from "./logger.ts";
 import {
@@ -440,7 +440,9 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 				// page's own, then each live island's. A list that does not verify
 				// is dropped alone.
 				const lists = Array.isArray(frame.tags) ? frame.tags.slice(0, MAX_LISTS) : [frame.tags];
-				const tags = lists.flatMap((list: unknown) => verifyTags(list) ?? []);
+				const checked = lists.map((list: unknown) => checkTags(list, ws.data.scopeId));
+				const tags = checked.flatMap((entry) => (entry && !entry.expired ? entry.tags : []));
+				if (checked.some((entry) => entry?.expired)) ws.send(JSON.stringify({ t: "stale" }));
 				const next = new Set(tags.map(tagTopic));
 				for (const topic of ws.data.tags ?? []) {
 					if (next.has(topic)) continue;

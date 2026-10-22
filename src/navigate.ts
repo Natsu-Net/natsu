@@ -49,7 +49,7 @@ import { config } from "./config.ts";
 import type { Context, Handler } from "./context.ts";
 import { GetController } from "./controller.ts";
 import { scriptNonce } from "./csp.ts";
-import { signTags } from "./invalidate.ts";
+import { liveScope, signTags } from "./invalidate.ts";
 import { log } from "./logger.ts";
 import type { CachedPage, Filled } from "./page-cache.ts";
 
@@ -270,7 +270,7 @@ export function island(ref: Handler | string, options: IslandOptions = {}): Hand
 				const out = await handler(ctx);
 				// Signed, as a page's <meta name="natsu-live"> is: the socket
 				// watches what this server said, never a tag a page made up.
-				const signed = signTags(await tags(ctx));
+				const signed = signTags(await tags(ctx), liveScope(ctx));
 				if (signed) ctx.response.headers.set("natsu-live", signed);
 				return out;
 			}

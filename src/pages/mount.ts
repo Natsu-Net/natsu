@@ -45,7 +45,7 @@ import { join } from "node:path";
 import type { Assets } from "../assets.ts";
 import { config } from "../config.ts";
 import type { Context, Handler } from "../context.ts";
-import { invalidate, onInvalidate, signTags } from "../invalidate.ts";
+import { invalidate, liveScope, onInvalidate, signTags } from "../invalidate.ts";
 import { log } from "../logger.ts";
 import { navigable } from "../navigate.ts";
 import { PageCache, type PageCacheOptions } from "../page-cache.ts";
@@ -501,7 +501,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				canonical: canonical(ctx),
 				robots: state.noindex ? "noindex" : "",
 			};
-			const html = await drawPage(state, values, meta, "", signTags(tags));
+			const html = await drawPage(state, values, meta, "", signTags(tags, liveScope(ctx)));
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
 		} catch (thrown) {
 			const error = known(thrown);
@@ -596,7 +596,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 							body: out.body,
 							status: out.status,
 							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
-							keep: out.status === 200,
+							keep: out.status === 200 && !ctx.sessionLoaded,
 						};
 					},
 				);

@@ -31,6 +31,9 @@
  * `NATSU_LIVE_SECRET`).
  */
 
+import { timingSafeEqual } from "node:crypto";
+import { config } from "./config.ts";
+
 /** What a tag may be: no spaces, no `|`, a reasonable length. */
 const TAG = /^[\w.:/@+=-]{1,160}$/;
 /** Most tags one page carries; past it the page is not live. */
@@ -95,28 +98,53 @@ export function bindTo(domain: string, text: string): string {
 	return new Bun.CryptoHasher("sha256", secret).update(`${domain}\0${text}`).digest("base64url");
 }
 
-/** `tags`, signed, as `<meta name="natsu-live">` carries them; "" for none. */
-export function signTags(tags: Iterable<string>): string {
+function equal(a: string, b: string): boolean {
+	const left = Buffer.from(a);
+	const right = Buffer.from(b);
+	return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function tagMac(scope: string, expires: number, text: string): string {
+	return mac(`live\0${scope}\0${expires}\0${text}`);
+}
+
+export function liveScope(ctx: { sessionLoaded: boolean; session: { id: string } }): string {
+	return ctx.sessionLoaded ? ctx.session.id : "";
+}
+
+export function signTags(tags: Iterable<string>, scope = ""): string {
 	const list = [...new Set(tags)].filter(isTag).sort().slice(0, MAX_TAGS);
 	if (list.length === 0) return "";
 	const text = list.join(" ");
-	return `${text}|${mac(text)}`;
+	const expires = Math.floor(Date.now() / 1000) + config.General.liveTagTtl;
+	return `${text}|${scope ? "s" : "p"}.${expires.toString(36)}.${tagMac(scope, expires, text)}`;
 }
 
-/** The tags of a signed list, or null when it was not signed here. */
-export function verifyTags(signed: unknown): string[] | null {
+export interface CheckedTags {
+	tags: string[];
+	expired: boolean;
+}
+
+export function checkTags(signed: unknown, scope = ""): CheckedTags | null {
 	if (typeof signed !== "string" || signed.length > 16384) return null;
 	const bar = signed.lastIndexOf("|");
 	if (bar < 1) return null;
 	const text = signed.slice(0, bar);
-	const given = signed.slice(bar + 1);
-	const want = mac(text);
-	if (given.length !== want.length) return null;
-	let diff = 0;
-	for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ given.charCodeAt(i);
-	if (diff !== 0) return null;
+	const parts = signed.slice(bar + 1).split(".");
+	if (parts.length !== 3) return null;
+	const [kind, stamp, given] = parts as [string, string, string];
+	if ((kind !== "p" && kind !== "s") || !/^[0-9a-z]{1,10}$/.test(stamp)) return null;
+	if (kind === "s" && !scope) return null;
+	const expires = parseInt(stamp, 36);
+	if (!equal(given, tagMac(kind === "s" ? scope : "", expires, text))) return null;
 	const tags = text.split(" ");
-	return tags.length <= MAX_TAGS && tags.every(isTag) ? tags : null;
+	if (tags.length > MAX_TAGS || !tags.every(isTag)) return null;
+	return { tags, expired: expires < Math.floor(Date.now() / 1000) };
+}
+
+export function verifyTags(signed: unknown, scope = ""): string[] | null {
+	const checked = checkTags(signed, scope);
+	return checked && !checked.expired ? checked.tags : null;
 }
 
 /** The pub/sub topic a tag's invalidations go to. */
