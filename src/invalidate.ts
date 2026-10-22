@@ -110,8 +110,8 @@ function tagMac(scope: string, expires: number, text: string): string {
 	return mac(`live\0${scope}\0${expires}\0${text}`);
 }
 
-export function liveScope(ctx: { sessionLoaded: boolean; session: { id: string } }): string {
-	return ctx.sessionLoaded ? ctx.session.id : "";
+export function liveScope(ctx: { currentSession: { id: string } | undefined }): string {
+	return ctx.currentSession?.id ?? "";
 }
 
 export function signTags(tags: Iterable<string>, scope = ""): string {
