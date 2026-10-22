@@ -22,6 +22,7 @@
  */
 
 import type { Context } from "../context.ts";
+import { log } from "../logger.ts";
 import type { Session } from "../session/session.ts";
 import type { Arg, DataDecl, TextTemplate } from "./block.ts";
 import { Forbidden, HttpError, NotFound, PageCompileError } from "./errors.ts";
@@ -593,11 +594,17 @@ async function fetchService(service: ServiceConfig, name: string, path: string, 
 	const root = service.base.replace(/\/+$/, "");
 	const url = root + path;
 	const rootPath = new URL(root + "/").pathname;
-	if (!new URL(url).pathname.startsWith(rootPath)) throw new NotFound(`${name} not found`);
+	if (!new URL(url).pathname.startsWith(rootPath)) throw new NotFound();
 	const response = await fetch(url, { headers, signal: AbortSignal.timeout(service.timeout ?? 5000), redirect: "manual" });
 	if (response.status === 404) return undefined;
-	if (response.status === 401 || response.status === 403) throw new Forbidden(`${name} refused ${path}`);
-	if (!response.ok) throw new HttpError(502, `service ${name} answered ${response.status} for ${path}`);
+	if (response.status === 401 || response.status === 403) {
+		log.warn(`[<yellow>pages</yellow>] service ${name} refused ${path} (${response.status})`);
+		throw new Forbidden();
+	}
+	if (!response.ok) {
+		log.warn(`[<yellow>pages</yellow>] service ${name} answered ${response.status} for ${path}`);
+		throw new HttpError(502, "Bad Gateway");
+	}
 	const type = response.headers.get("content-type") ?? "";
 	return type.includes("json") ? response.json() : response.text();
 }
