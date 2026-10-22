@@ -129,3 +129,22 @@ describe("signed live tags", () => {
 		expect(seen).toEqual([JSON.stringify({ t: "stale" })]);
 	});
 });
+
+describe("live tags in a kept page", () => {
+	test("a page kept longer than the tag lifetime is drawn again before its tags expire", async () => {
+		setConfig({ General: { liveTagTtl: 120 } });
+		let draws = 0;
+		source("room", () => ({ n: ++draws }), { tags: () => ["room:1"] });
+		mkdirSync(join(dir, "pages"), { recursive: true });
+		writeFileSync(join(dir, "pages", "_layout.uwu"), `<template><!doctype html><html><head>{{{page.head}}}</head><body>{{> @child}}</body></html></template>`);
+		writeFileSync(join(dir, "pages", "index.uwu"), `<page cache="86400"><data room="room"></page><template>{{room.n}}</template>`);
+		const app = new Application();
+		site = await mountPages({ dir, app });
+		running = await startApp(app);
+		const meta = async () => /<meta name="natsu-live" content="([^"]+)">/.exec(await (await running!.fetch("/")).text())![1]!.replaceAll("&#124;", "|");
+		expect(checkTags(await meta())?.expired).toBe(false);
+		setSystemTime(new Date(Date.now() + 130_000));
+		expect(checkTags(await meta())?.expired).toBe(false);
+		expect(draws).toBe(2);
+	});
+});

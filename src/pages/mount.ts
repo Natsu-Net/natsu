@@ -286,6 +286,11 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		}
 		return cache;
 	};
+	const liveHold = (seconds: number): { fresh: number; stale: number } => {
+		const settings = options.cache === false ? {} : options.cache ?? {};
+		const lifetime = config.General.liveTagTtl;
+		return { fresh: Math.min(seconds, lifetime / 2), stale: Math.min(settings.stale ?? 30, lifetime / 4) };
+	};
 	const defaultSeconds = options.cache === false ? undefined : options.cache?.fresh ?? 10;
 
 	// Kept pages by live-data tag, so an invalidation lets them go at once.
@@ -629,6 +634,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 							status: out.status,
 							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
 							keep: out.status === 200 && !ctx.sessionLoaded,
+							...(out.tags && out.tags.size > 0 && { hold: liveHold(seconds) }),
 						};
 					},
 				);
