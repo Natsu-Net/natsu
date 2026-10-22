@@ -3266,6 +3266,25 @@ describe("live data", () => {
 		expect(ws.sent.at(-1)).toBe(JSON.stringify({ t: "watch", tags: "" }));
 	});
 
+	test("a stale frame refreshes the page once, however often the server repeats it", async () => {
+		FakeSocket.last = undefined;
+		const p = open({
+			html: page({ head: live("todos|SIG") }),
+			before: (w) => (w.WebSocket = FakeSocket),
+			routes: { "/a": () => answer(part({ head: live("todos|SIG"), main: "<h1>A fresh</h1>" })) },
+		});
+		const ws = FakeSocket.last!;
+		ws.open();
+		ws.onmessage!({ data: JSON.stringify({ t: "stale" }) });
+		await tick(60);
+		await settle();
+		ws.onmessage!({ data: JSON.stringify({ t: "stale" }) });
+		await tick(60);
+		await settle();
+		expect(p.calls).toEqual([{ url: "/a", headers: { "Natsu-Nav": "k1.s1" } }]);
+		expect(text(p, "main h1")).toBe("A fresh");
+	});
+
 	test("a canceled natsu:invalidate keeps the page as it is", async () => {
 		FakeSocket.last = undefined;
 		const heard: string[] = [];

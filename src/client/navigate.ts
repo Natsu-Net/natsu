@@ -548,6 +548,7 @@ const watchLive = (refresh: () => unknown) => {
 	let want: string | string[] = "";
 	let wait = 1e3;
 	let back = 0;
+	let aged = 0;
 	let t: ReturnType<typeof setTimeout>;
 	const say = () => ws && ws.readyState == 1 && ws.send(JSON.stringify({ t: "watch", tags: want }));
 	const open = () => {
@@ -561,6 +562,7 @@ const watchLive = (refresh: () => unknown) => {
 		s.onmessage = (e) => {
 			try {
 				const m = JSON.parse(e.data);
+				if (m.t == "stale") Date.now() - aged > 3e4 && ((aged = Date.now()), acting || refresh());
 				if (m.t == "invalidate")
 					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(() => fire("invalidate", { tag: m.tag }) && refresh(), 30)));
 					else
