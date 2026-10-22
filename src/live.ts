@@ -59,6 +59,7 @@ import {
 	callAction,
 	dropScope,
 	hasRoom,
+	onRoomRevoked,
 	resolveState,
 	revokeSession,
 	snapshotOf,
@@ -234,6 +235,15 @@ function untrackSocket(ws: ServerWebSocket<LiveSocketData>): void {
 export function socketSessionIds(): string[] {
 	return [...socketsBySession.keys()];
 }
+
+onRoomRevoked((sessionId, topic) => {
+	for (const ws of socketsBySession.get(sessionId) ?? []) {
+		if (!ws.data.topics.delete(topic)) continue;
+		try {
+			ws.unsubscribe(topic);
+		} catch {}
+	}
+});
 
 function closeSocketsOf(sessionId: string): void {
 	const set = socketsBySession.get(sessionId);

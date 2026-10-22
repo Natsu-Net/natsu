@@ -150,6 +150,13 @@ export function grantRoom(sessionId: string, Class: StateClass, roomId: string):
 /** Take it away again — leaving a party, or being removed from one. */
 export function revokeRoom(sessionId: string, Class: StateClass, roomId: string): void {
 	grants.get(sessionId)?.delete(`${Class.stateKey}:${roomId}`);
+	roomRevoked?.(sessionId, topicFor(Class, roomId));
+}
+
+let roomRevoked: ((sessionId: string, topic: string) => void) | undefined;
+
+export function onRoomRevoked(fn: ((sessionId: string, topic: string) => void) | undefined): void {
+	roomRevoked = fn;
 }
 
 /** Whether this session was granted this room. */

@@ -907,6 +907,50 @@ describe("who is calling", () => {
 	});
 });
 
+describe("leaving a room", () => {
+	test("stops the patches that room sends to the sockets of the session that left", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/join/:code", (ctx) => {
+			ctx.joinRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = ctx.session.id;
+		});
+		new Router().get("/leave/:code", (ctx) => {
+			ctx.leaveRoom(AsClass<Party>(Party), ctx.params.code ?? "");
+			ctx.response.body = "left";
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const member = async (code: string) => {
+			const response = await fetch(`${running!.base}/join/${code}`);
+			await response.text();
+			const cookie = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+			const client = open(running!.base, { cookie });
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "hello", stores: [`party:${code}`] }));
+			await client.next(1);
+			return { cookie, client };
+		};
+		const leaver = await member("room-a");
+		const stayer = await member("room-a");
+
+		resolveState(AsClass<Party>(Party), "room-a").at = 10;
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		expect(stayer.client.frames.length).toBe(2);
+
+		await fetch(`${running.base}/leave/room-a`, { headers: { cookie: leaver.cookie } });
+		resolveState(AsClass<Party>(Party), "room-a").at = 20;
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		expect(stayer.client.frames.length).toBe(3);
+
+		leaver.client.socket.send(JSON.stringify({ t: "hello", stores: ["party:room-a"] }));
+		await Bun.sleep(60);
+		expect(leaver.client.frames.length).toBe(2);
+		leaver.client.socket.close();
+		stayer.client.socket.close();
+	});
+});
+
 describe("connection hooks", () => {
 	test("an app is told when a live socket opens and closes", async () => {
 		// Presence is the case: the socket is natsu's, so an app has no other
