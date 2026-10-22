@@ -763,6 +763,21 @@ describe("a destroyed session's sockets", () => {
 		expect(await Promise.race([closed, Bun.sleep(1000).then(() => -1)])).toBe(4401);
 	});
 
+	test("are closed with 4401 when a sweep finds the session expired in the store only", async () => {
+		const { manager, id, cookie } = await ledgerApp();
+		const client = open(running!.base, { cookie });
+		await client.ready;
+		const closed = new Promise<number>((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+
+		const session = (await manager.get(id))!;
+		session.expire = Math.floor(Date.now() / 1000) - 1;
+		await manager.adapter.save(session.toRecord());
+		manager.evict(id);
+		await manager.sweep();
+
+		expect(await Promise.race([closed, Bun.sleep(1000).then(() => -1)])).toBe(4401);
+	});
+
 	test("cannot call actions after the session is destroyed", async () => {
 		Ledger.calls = 0;
 		const { manager, id, cookie } = await ledgerApp();

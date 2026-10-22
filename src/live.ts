@@ -231,6 +231,10 @@ function untrackSocket(ws: ServerWebSocket<LiveSocketData>): void {
 	if (set.size === 0) socketsBySession.delete(id);
 }
 
+export function socketSessionIds(): string[] {
+	return [...socketsBySession.keys()];
+}
+
 function closeSocketsOf(sessionId: string): void {
 	const set = socketsBySession.get(sessionId);
 	if (!set) return;

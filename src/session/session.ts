@@ -15,7 +15,7 @@
 
 import type { Context, Middleware } from "../context.ts";
 import type { NatsuConfig, SessionCookieConfig } from "../config.ts";
-import { endSession } from "../live.ts";
+import { endSession, socketSessionIds } from "../live.ts";
 import { log } from "../logger.ts";
 import { MemoryAdapter, type SessionAdapter, type SessionRecord } from "./adapter.ts";
 import { SqliteAdapter } from "./sqlite.ts";
@@ -275,6 +275,9 @@ export class SessionManager {
 			endSession(id);
 		}
 		const removed = await this.adapter.sweep(now);
+		for (const id of socketSessionIds()) {
+			if (!this.live.has(id) && !(await this.adapter.load(id))) endSession(id);
+		}
 		if (removed > 0) log.debug(`[<yellow>SESSION</yellow>] swept <cyan>${removed}</cyan> expired`);
 		return removed;
 	}
