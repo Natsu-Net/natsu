@@ -10,7 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Application } from "../src/server.ts";
-import { endSession, resetLive } from "../src/live.ts";
+import { endSession, ipKey, resetLive } from "../src/live.ts";
 import { Action, Networked, State, caller, grantRoom, hasRoom, resetState, resolveState, type StateClass } from "../src/state.ts";
 import { Router } from "../src/router.ts";
 import { SessionManager } from "../src/session/session.ts";
@@ -430,6 +430,49 @@ describe("who may connect", () => {
 		);
 		expect(results.filter((r) => r === "open").length).toBe(2);
 		for (const c of clients) c.socket.close();
+	});
+});
+
+describe("socket abuse limits", () => {
+	function closeCode(client: ReturnType<typeof open>): Promise<number> {
+		return new Promise((resolve) => client.socket.addEventListener("close", (event) => resolve((event as CloseEvent).code)));
+	}
+
+	test("a socket flooding frames is closed with 4429", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMessageRate: 5, socketMessageBurst: 10 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		const closed = closeCode(client);
+		for (let i = 0; i < 200; i++) client.socket.send(JSON.stringify({ t: "set", store: "room", key: "topic", value: String(i) }));
+		expect(await Promise.race([closed, Bun.sleep(1500).then(() => -1)])).toBe(4429);
+	});
+
+	test("a socket inside the limit is left alone", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketMessageRate: 5, socketMessageBurst: 10 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		for (let i = 0; i < 8; i++) client.socket.send(JSON.stringify({ t: "hello", stores: ["room"] }));
+		await Bun.sleep(150);
+		expect(client.socket.readyState).toBe(WebSocket.OPEN);
+		client.socket.close();
+	});
+
+	test("a socket that never sends a frame is eventually closed", async () => {
+		reset({ General: { logFormat: "", logLevel: "silent", socketSilenceTimeout: 1 } });
+		running = await startApp(new Application());
+		const client = open(running.base);
+		await client.ready;
+		const closed = closeCode(client);
+		expect(await Promise.race([closed, Bun.sleep(4000).then(() => -1)])).not.toBe(-1);
+	});
+
+	test("IPv6 addresses are counted per /64", () => {
+		expect(ipKey("2001:db8:1:2::1")).toBe(ipKey("2001:db8:1:2:ffff::9"));
+		expect(ipKey("2001:db8:1:2::1")).not.toBe(ipKey("2001:db8:1:3::1"));
+		expect(ipKey("203.0.113.9")).toBe("203.0.113.9");
+		expect(ipKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
 	});
 });
 

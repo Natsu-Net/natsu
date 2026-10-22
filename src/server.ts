@@ -17,7 +17,7 @@ import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
 import { isIslandRequest, refuseBeforeHandler, refuseWithoutRoute } from "./navigate.ts";
-import { SOCKET_PATH, type LiveHooks, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
+import { SOCKET_PATH, type LiveHooks, configureLive, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
 
@@ -345,6 +345,12 @@ export class Application {
 
 	private serveOptions(options: StartOptions): ServeOptions<NatsuSocketData> {
 		const live = options.live !== false;
+		const { General } = this.config;
+		configureLive({
+			messageRate: General.socketMessageRate,
+			messageBurst: General.socketMessageBurst,
+			silenceSeconds: General.socketSilenceTimeout,
+		});
 		const terminal = this.terminalFor(undefined);
 
 		return {

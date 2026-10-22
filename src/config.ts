@@ -25,8 +25,14 @@ export interface GeneralConfig {
 	socketMaxPayload: number;
 	/** Seconds of silence after which an idle socket is closed. */
 	socketIdleTimeout: number;
-	/** Live sockets one address may hold open; 0 means unlimited. */
+	/** Live sockets one address (an IPv6 /64) may hold open; 0 means unlimited. */
 	socketMaxPerIp: number;
+	/** Frames per second one live socket may sustain; 0 means unlimited. */
+	socketMessageRate: number;
+	/** Frames one live socket may send in a burst before it is closed. */
+	socketMessageBurst: number;
+	/** Seconds a live socket may go without sending a frame before it is closed; 0 means never. */
+	socketSilenceTimeout: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -133,7 +139,10 @@ export function defaultConfig(): NatsuConfig {
 			proxyHops: 1,
 			socketMaxPayload: 32768,
 			socketIdleTimeout: 120,
-			socketMaxPerIp: 0,
+			socketMaxPerIp: 32,
+			socketMessageRate: 20,
+			socketMessageBurst: 100,
+			socketSilenceTimeout: 900,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
@@ -223,6 +232,16 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(socketMaxPerIp) || socketMaxPerIp < 0) {
 		throw new ConfigError(`General.socketMaxPerIp must be a non-negative integer, got ${String(socketMaxPerIp)}`);
+	}
+	const { socketMessageRate, socketMessageBurst, socketSilenceTimeout } = config.General;
+	if (!Number.isFinite(socketMessageRate) || socketMessageRate < 0) {
+		throw new ConfigError(`General.socketMessageRate must be a non-negative number, got ${String(socketMessageRate)}`);
+	}
+	if (!Number.isInteger(socketMessageBurst) || socketMessageBurst < 1) {
+		throw new ConfigError(`General.socketMessageBurst must be a positive integer, got ${String(socketMessageBurst)}`);
+	}
+	if (!Number.isInteger(socketSilenceTimeout) || socketSilenceTimeout < 0) {
+		throw new ConfigError(`General.socketSilenceTimeout must be a non-negative integer, got ${String(socketSilenceTimeout)}`);
 	}
 	return config;
 }

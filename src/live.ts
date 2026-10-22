@@ -87,6 +87,53 @@ export interface LiveSocketData {
 	tags?: Set<string>;
 	ip?: string;
 	ended?: boolean;
+	tokens?: number;
+	refilledAt?: number;
+	lastFrameAt?: number;
+}
+
+export interface LiveLimits {
+	messageRate: number;
+	messageBurst: number;
+	silenceSeconds: number;
+}
+
+let limits: LiveLimits = { messageRate: 0, messageBurst: 1, silenceSeconds: 0 };
+let silenceTimer: ReturnType<typeof setInterval> | undefined;
+const allSockets = new Set<ServerWebSocket<LiveSocketData>>();
+
+export function configureLive(next: LiveLimits): void {
+	limits = next;
+	if (silenceTimer) clearInterval(silenceTimer);
+	silenceTimer = undefined;
+	if (next.silenceSeconds <= 0) return;
+	silenceTimer = setInterval(closeSilent, Math.max(250, (next.silenceSeconds * 1000) / 4));
+	silenceTimer.unref?.();
+}
+
+function closeSilent(): void {
+	const cutoff = Date.now() - limits.silenceSeconds * 1000;
+	for (const ws of allSockets) {
+		if ((ws.data.lastFrameAt ?? 0) > cutoff) continue;
+		ws.data.ended = true;
+		try {
+			ws.close(4408, "silent");
+		} catch {}
+	}
+}
+
+function withinRate(data: LiveSocketData): boolean {
+	if (limits.messageRate <= 0) return true;
+	const now = Date.now();
+	const last = data.refilledAt ?? now;
+	const tokens = Math.min(limits.messageBurst, (data.tokens ?? limits.messageBurst) + ((now - last) / 1000) * limits.messageRate);
+	data.refilledAt = now;
+	if (tokens < 1) {
+		data.tokens = 0;
+		return false;
+	}
+	data.tokens = tokens - 1;
+	return true;
 }
 
 interface ClientFrame {
@@ -198,6 +245,9 @@ function closeSocketsOf(sessionId: string): void {
 
 /** Forget every subscription. Tests and hot reload. */
 export function resetLive(): void {
+	allSockets.clear();
+	if (silenceTimer) clearInterval(silenceTimer);
+	silenceTimer = undefined;
 	for (const stop of publishing.values()) stop();
 	publishing.clear();
 	hooks = {};
@@ -207,15 +257,27 @@ export function resetLive(): void {
 
 const socketsByIp = new Map<string, number>();
 
+export function ipKey(ip: string): string {
+	if (!ip.includes(":")) return ip;
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+	if (mapped) return mapped[1]!;
+	const [head = "", tail] = ip.split("::");
+	const front = head === "" ? [] : head.split(":");
+	const back = tail === undefined || tail === "" ? [] : tail.split(":");
+	const groups = tail === undefined ? front : [...front, ...Array(Math.max(0, 8 - front.length - back.length)).fill("0"), ...back];
+	return groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, "")).join(":") + "::/64";
+}
+
 export function socketCountFor(ip: string): number {
-	return socketsByIp.get(ip) ?? 0;
+	return socketsByIp.get(ipKey(ip)) ?? 0;
 }
 
 function releaseIp(ip: string | undefined): void {
 	if (!ip) return;
-	const left = (socketsByIp.get(ip) ?? 0) - 1;
-	if (left > 0) socketsByIp.set(ip, left);
-	else socketsByIp.delete(ip);
+	const key = ipKey(ip);
+	const left = (socketsByIp.get(key) ?? 0) - 1;
+	if (left > 0) socketsByIp.set(key, left);
+	else socketsByIp.delete(key);
 }
 
 export function sameOriginSocket(request: Request, publicUrl: string): boolean {
@@ -308,6 +370,8 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			// receive patches for state its page never rendered.
 			ws.data.topics = new Set();
 			trackSocket(ws);
+			ws.data.lastFrameAt = Date.now();
+			allSockets.add(ws);
 			try {
 				hooks.open?.(callerOf(ws.data));
 			} catch (error) {
@@ -318,6 +382,12 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 		message(ws: ServerWebSocket<LiveSocketData>, raw: string | Buffer) {
 			if (!isLive(ws)) return next?.message?.(ws as never, raw as never);
 			if (ws.data.ended) return;
+			ws.data.lastFrameAt = Date.now();
+			if (!withinRate(ws.data)) {
+				ws.data.ended = true;
+				ws.close(4429, "too many frames");
+				return;
+			}
 
 			let frame: ClientFrame;
 			try {
@@ -400,6 +470,7 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 			if (!isLive(ws)) return next?.close?.(ws as never, code, reason);
 			releaseIp(ws.data.ip);
 			untrackSocket(ws);
+			allSockets.delete(ws);
 			for (const topic of ws.data.topics ?? []) ws.unsubscribe(topic);
 			try {
 				hooks.close?.(callerOf(ws.data));
@@ -460,6 +531,6 @@ export function upgradeLive(
 		data: { live: true, scopeId, session, topics: new Set<string>(), ip },
 	});
 	if (!upgraded) return new Response("expected a websocket", { status: 400 });
-	if (ip) socketsByIp.set(ip, socketCountFor(ip) + 1);
+	if (ip) socketsByIp.set(ipKey(ip), socketCountFor(ip) + 1);
 	return undefined;
 }
