@@ -494,7 +494,11 @@ export function liveWebSocketHandler(next?: Partial<Bun.WebSocketHandler<never>>
 					// anything — no host check, no per-person rate limit.
 					const who: Caller = { sessionId: ws.data.scopeId, session: ws.data.session, room: found.scopeId };
 					try {
-						callAction(found.instance, frame.method, args, who);
+						const result = callAction(found.instance, frame.method, args, who);
+					if (result instanceof Promise) {
+						const method = frame.method;
+						result.catch((error: Error) => log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${method}: ${error?.message}`));
+					}
 					} catch (error) {
 						log.warn(`[<yellow>live</yellow>] refused call ${found.wire}.${frame.method}: ${(error as Error).message}`);
 					}

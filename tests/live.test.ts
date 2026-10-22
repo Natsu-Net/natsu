@@ -31,6 +31,22 @@ class Room {
 	}
 }
 
+@State("faulty", { scope: "global" })
+class Faulty {
+	@Networked() n = 0;
+
+	@Action()
+	async later() {
+		await Bun.sleep(1);
+		throw new Error("rejected later");
+	}
+
+	@Action()
+	now() {
+		throw new Error("thrown now");
+	}
+}
+
 @State("cart")
 class Cart {
 	@Networked() items = 0;
@@ -140,6 +156,28 @@ describe("frames that are not frames", () => {
 			client.socket.close();
 		} finally {
 			process.off("uncaughtException", listener);
+		}
+	});
+
+	test("an async action that rejects is logged, not an unhandled rejection", async () => {
+		const thrown: string[] = [];
+		const listener = (reason: unknown) => void thrown.push(String((reason as Error)?.message ?? reason));
+		process.on("unhandledRejection", listener);
+		try {
+			running = await startApp(new Application());
+			expect(resolveState(AsClass<Faulty>(Faulty), "").n).toBe(0);
+			const client = open(running.base);
+			await client.ready;
+			client.socket.send(JSON.stringify({ t: "call", store: "faulty", method: "later", args: [] }));
+			client.socket.send(JSON.stringify({ t: "call", store: "faulty", method: "now", args: [] }));
+			client.socket.send(JSON.stringify({ t: "hello", stores: ["faulty"] }));
+			const frames = await client.next(1);
+			await Bun.sleep(50);
+			expect(thrown).toEqual([]);
+			expect(frames[0]?.t).toBe("sync");
+			client.socket.close();
+		} finally {
+			process.off("unhandledRejection", listener);
 		}
 	});
 

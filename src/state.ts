@@ -244,7 +244,7 @@ export function Networked(options: { writable?: boolean } = {}) {
 
 /** Mark a method callable from the client. It always executes on the server. */
 export function Action() {
-	return function (value: (...args: never[]) => unknown, context: ClassMethodDecoratorContext) {
+	return function <T extends (...args: never[]) => unknown>(value: T, context: ClassMethodDecoratorContext): T {
 		metaOf(context as unknown as { metadata: DecoratorMetadata }).actions.add(String(context.name));
 		return value;
 	};
