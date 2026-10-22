@@ -585,7 +585,7 @@ describe("service fetch paths", () => {
 				{ services: { api: { base: `${base}/v1` } } },
 			);
 
-			for (const dots of ["%2e%2e", "%2E%2E", "%2e", "."]) {
+			for (const dots of ["%2e%2e", "%2E%2E", "%2e", ".", "a%2F..%2Fb", "..%5Cb", "%2e%2e%2f", "x%5C.%5Cy"]) {
 				const answer = await rawRequest(running!.base, `GET /jobs/${dots} HTTP/1.1`, ["cookie: sid=visitor"]);
 				expect(answer).toContain(" 404 ");
 			}

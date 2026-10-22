@@ -527,8 +527,9 @@ export async function resolvePlan(plan: Plan, scope: ResolveScope): Promise<Reso
 						if (typeof part === "string") path += part;
 						else {
 							const v = walk(await get(part[0]!), part.slice(1));
-							const segment = encodeURIComponent(v === null || v === undefined ? "" : String(v));
-							if (segment === "." || segment === "..") throw new NotFound(`${loader.name} not found`);
+							const text = v === null || v === undefined ? "" : String(v);
+							if (text.split(/[/\\]/).some((piece) => piece === "." || piece === "..")) throw new NotFound(`${loader.name} not found`);
+							const segment = encodeURIComponent(text);
 							path += segment;
 						}
 					}
