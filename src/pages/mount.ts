@@ -133,6 +133,8 @@ export interface PagesOptions {
 	maxFields?: number;
 	/** Public origin for canonical URLs (default `config.General.url`). */
 	baseUrl?: string;
+	/** Most live-data tags remembered for kept pages (default 20000); past it the pages of the oldest go. */
+	maxKeptTags?: number;
 	/** PageCache for signed-out visitors; `false` turns it off for every page. */
 	cache?: false | Omit<PageCacheOptions, "prepare">;
 	/** Keep cached pages rewritten by these assets (`assets.rewrite`). */
@@ -288,23 +290,31 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 
 	// Kept pages by live-data tag, so an invalidation lets them go at once.
 	const kept = new Map<string, Set<string>>();
+	const maxKeptTags = options.maxKeptTags ?? 20_000;
+	const drop = (entry: string): void => {
+		const cut = entry.indexOf("\0");
+		caches.get(Number(entry.slice(0, cut)))?.delete(entry.slice(cut + 1));
+	};
+	const release = (tag: string): void => {
+		for (const entry of kept.get(tag) ?? []) drop(entry);
+		kept.delete(tag);
+	};
 	const keep = (seconds: number, key: string, tags: Iterable<string>): void => {
 		for (const tag of tags) {
-			let keys = kept.get(tag);
-			if (!keys) kept.set(tag, (keys = new Set()));
+			const keys = kept.get(tag) ?? new Set<string>();
+			kept.delete(tag);
+			kept.set(tag, keys);
 			keys.add(`${seconds}\0${key}`);
-			// PageCache forgets pages on its own; this forgets the oldest names past a bound.
-			if (keys.size > 4096) keys.delete(keys.values().next().value as string);
+			if (keys.size > 4096) {
+				const oldest = keys.values().next().value as string;
+				keys.delete(oldest);
+				drop(oldest);
+			}
 		}
+		while (kept.size > maxKeptTags) release(kept.keys().next().value as string);
 	};
 	const stopListening = onInvalidate((tags) => {
-		for (const tag of tags) {
-			for (const entry of kept.get(tag) ?? []) {
-				const cut = entry.indexOf("\0");
-				caches.get(Number(entry.slice(0, cut)))?.delete(entry.slice(cut + 1));
-			}
-			kept.delete(tag);
-		}
+		for (const tag of tags) release(tag);
 	});
 
 	// --- building the table -----------------------------------------------------
