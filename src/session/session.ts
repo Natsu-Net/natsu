@@ -30,6 +30,8 @@ export class Session {
 	/** Set by any mutation; cleared once the store has the current value. */
 	public dirty = false;
 
+	public destroyed = false;
+
 	private manager: SessionManager | undefined;
 	private saving: Promise<void> | undefined;
 	private queued = false;
@@ -107,7 +109,7 @@ export class Session {
 	 */
 	public async Save(): Promise<void> {
 		const manager = this.manager;
-		if (!manager) return;
+		if (!manager || this.destroyed) return;
 		if (this.saving) {
 			if (this.queued) return this.saving;
 			this.queued = true;
@@ -115,6 +117,7 @@ export class Session {
 			this.saving = (async () => {
 				await previous.catch(() => undefined);
 				this.queued = false;
+				if (this.destroyed) return;
 				await manager.adapter.save(this.toRecord());
 				this.dirty = false;
 			})();
@@ -245,6 +248,8 @@ export class SessionManager {
 	}
 
 	public async destroy(id: string): Promise<void> {
+		const session = this.live.get(id);
+		if (session) session.destroyed = true;
 		this.live.delete(id);
 		// Networkable state is keyed by session id, so a session that goes away
 		// takes its stores, its room grants and its socket fan-out with it.
@@ -271,6 +276,7 @@ export class SessionManager {
 	public async sweep(now: number = Date.now() / 1000): Promise<number> {
 		for (const [id, session] of this.live) {
 			if (!session.IsExpired(now)) continue;
+			session.destroyed = true;
 			this.live.delete(id);
 			endSession(id);
 		}
