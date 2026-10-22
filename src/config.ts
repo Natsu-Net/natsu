@@ -157,7 +157,7 @@ export function defaultConfig(): NatsuConfig {
 			socketAllowedOrigins: [],
 			socketRequireOrigin: true,
 			liveTagTtl: 3600,
-			maxRequestBodySize: 8 * 1024 * 1024,
+			maxRequestBodySize: 16 * 1024 * 1024,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
