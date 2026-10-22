@@ -147,6 +147,21 @@ describe("refusals", () => {
 		expect(applyWrite(counter, "topic.length", 0)).toBe(false);
 	});
 
+	test("a __proto__ key in a client value pollutes nothing", () => {
+		const counter = resolveState(AsClass<Counter>(Counter), "");
+		const value = JSON.parse('{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted2":1}}}');
+		applyWrite(counter, "topic", value);
+		flushPatches(storeOf(counter));
+
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		expect(({} as Record<string, unknown>).polluted2).toBeUndefined();
+		const stored = counter.topic as unknown as Record<string, unknown>;
+		expect(stored.polluted).toBeUndefined();
+		expect(Object.getPrototypeOf(stored)).toBe(Object.prototype);
+		expect(applyWrite(counter, "__proto__", { polluted: 1 })).toBe(false);
+		expect(applyWrite(counter, "constructor", 1)).toBe(false);
+	});
+
 	test("calling a method that is not an @Action throws", () => {
 		const counter = resolveState(AsClass<Counter>(Counter), "");
 		expect(() => callAction(counter, "nuke", [])).toThrow(/not an @Action/);
