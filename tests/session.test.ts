@@ -420,10 +420,10 @@ describe("default headers on session pages", () => {
 		expect(response.headers.get("cache-control")).toBe("private, max-age=60");
 	});
 
-	test("a page that never touches the session gets neither", async () => {
+	test("a page that never touches the session gets no-store or nosniff, only private", async () => {
 		const cookie = await app();
 		const response = await running!.fetch("/plain", { headers: { cookie } });
-		expect(response.headers.get("cache-control")).toBeNull();
+		expect(response.headers.get("cache-control")).toBe("private");
 		expect(response.headers.get("x-content-type-options")).toBeNull();
 	});
 });
