@@ -313,13 +313,18 @@ export interface Flash {
 }
 
 export function encodeFlash(flash: Flash): string {
-	return Buffer.from(JSON.stringify({ m: flash.message.slice(0, 500), ok: flash.ok }), "utf8").toString("base64url");
+	const body = Buffer.from(JSON.stringify({ m: flash.message.slice(0, 500), ok: flash.ok }), "utf8").toString("base64url");
+	return `${body}.${bindTo("flash", body)}`;
 }
 
 export function decodeFlash(raw: string | undefined): Flash | null {
 	if (!raw || raw.length > 2048) return null;
+	const dot = raw.lastIndexOf(".");
+	if (dot < 1) return null;
+	const body = raw.slice(0, dot);
+	if (!same(raw.slice(dot + 1), bindTo("flash", body))) return null;
 	try {
-		const value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as { m?: unknown; ok?: unknown };
+		const value = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { m?: unknown; ok?: unknown };
 		return typeof value.m === "string" ? { message: value.m.slice(0, 500), ok: value.ok !== false } : null;
 	} catch {
 		return null;

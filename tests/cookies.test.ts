@@ -52,3 +52,24 @@ describe("parseCookies", () => {
 		expect(({} as Record<string, unknown>).x).toBeUndefined();
 	});
 });
+
+describe("the flash cookie", () => {
+	const body = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+
+	test("round-trips what the server wrote", async () => {
+		const { decodeFlash, encodeFlash } = await import("../src/pages/actions.ts");
+		expect(decodeFlash(encodeFlash({ message: "Saved", ok: true }))).toEqual({ message: "Saved", ok: true });
+		expect(decodeFlash(encodeFlash({ message: "No", ok: false }))).toEqual({ message: "No", ok: false });
+	});
+
+	test("a value nobody signed shows nothing", async () => {
+		const { decodeFlash, encodeFlash } = await import("../src/pages/actions.ts");
+		const forged = body({ m: "Call 555-0100 to keep your account", ok: true });
+		expect(decodeFlash(forged)).toBeNull();
+		expect(decodeFlash(`${forged}.`)).toBeNull();
+		expect(decodeFlash(`${forged}.${"A".repeat(43)}`)).toBeNull();
+		const real = encodeFlash({ message: "Saved", ok: true });
+		const mac = real.slice(real.lastIndexOf(".") + 1);
+		expect(decodeFlash(`${forged}.${mac}`)).toBeNull();
+	});
+});
