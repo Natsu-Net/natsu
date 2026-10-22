@@ -278,6 +278,7 @@ export class Context {
 	 * PNG never mints a row — v1 created one for every request that arrived.
 	 */
 	public get session(): Session {
+		this.sessionTouched = true;
 		if (this._session) return this._session;
 		if (!this.sessions) {
 			throw new Error("natsu: ctx.session is unavailable — Session support is disabled in config");
@@ -289,6 +290,12 @@ export class Context {
 
 	public set session(session: Session) {
 		this._session = session;
+	}
+
+	public sessionTouched = false;
+
+	public get currentSession(): Session | undefined {
+		return this._session;
 	}
 
 	/** Whether a session was loaded or created — used to skip cookie work. */
@@ -346,6 +353,11 @@ export class Context {
 	/** Build the outgoing `Response`. Called once, by the server. */
 	public toResponse(): Response {
 		const { response } = this;
+		if (this.sessionTouched) {
+			const { headers } = response;
+			if (!headers.has("Cache-Control")) headers.set("Cache-Control", "private, no-store");
+			if (!headers.has("X-Content-Type-Options")) headers.set("X-Content-Type-Options", "nosniff");
+		}
 		const body = response.body;
 
 		// A handler that builds its own Response owns it completely; we only

@@ -380,6 +380,54 @@ describe("cookie hardening from config", () => {
 	});
 });
 
+describe("default headers on session pages", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	async function app() {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/mine", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.body = "mine";
+		});
+		new Router().get("/kept", (ctx) => {
+			ctx.session.Set("a", 1);
+			ctx.response.headers.set("Cache-Control", "public, max-age=60");
+			ctx.response.body = "kept";
+		});
+		new Router().get("/plain", (ctx) => {
+			ctx.response.body = "plain";
+		});
+		running = await startApp(new Application({ sessions: manager }));
+		const cookie = (await running.fetch("/mine")).headers.get("set-cookie")!.split(";")[0]!;
+		return cookie;
+	}
+
+	test("a page that touches the session is private, no-store and nosniff", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/mine", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBe("private, no-store");
+		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+	});
+
+	test("a value the app set is kept", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/kept", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBe("public, max-age=60");
+	});
+
+	test("a page that never touches the session gets neither", async () => {
+		const cookie = await app();
+		const response = await running!.fetch("/plain", { headers: { cookie } });
+		expect(response.headers.get("cache-control")).toBeNull();
+		expect(response.headers.get("x-content-type-options")).toBeNull();
+	});
+});
+
 describe("rotate", () => {
 	let running: RunningApp | undefined;
 

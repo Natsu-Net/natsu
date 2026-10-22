@@ -327,6 +327,7 @@ export function sessionMiddleware(manager: SessionManager): Middleware {
 
 		// Persist after the handler, so N writes in one request are one write
 		// to the store.
-		if (ctx.sessionLoaded) await manager.persist(ctx.session);
+		const current = ctx.currentSession;
+		if (current) await manager.persist(current);
 	};
 }
