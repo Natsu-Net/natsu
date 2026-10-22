@@ -238,6 +238,16 @@ export class SessionManager {
 		await this.adapter.destroy(id);
 	}
 
+	public async rotate(ctx: Context, options: { keepData?: boolean } = {}): Promise<Session> {
+		const old = ctx.sessionLoaded ? ctx.session : undefined;
+		const next = this.create();
+		if (old && options.keepData !== false) next.data = { ...old.data };
+		ctx.session = next;
+		this.attachCookie(ctx, next);
+		if (old) await this.destroy(old.id);
+		return next;
+	}
+
 	/** Write the session out if anything changed. */
 	public async persist(session: Session): Promise<void> {
 		if (!session.dirty) return;

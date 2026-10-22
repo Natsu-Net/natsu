@@ -380,6 +380,58 @@ describe("cookie hardening from config", () => {
 	});
 });
 
+describe("rotate", () => {
+	let running: RunningApp | undefined;
+
+	afterEach(async () => {
+		await running?.stop();
+		running = undefined;
+	});
+
+	test("destroys the old id, issues a new one and keeps the data", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		new Router().get("/seed", (ctx) => {
+			ctx.session.Set("user", "aiko");
+			ctx.response.body = ctx.session.id;
+		});
+		new Router().get("/login", async (ctx) => {
+			const before = ctx.session.id;
+			const next = await manager.rotate(ctx);
+			ctx.response.body = `${before} ${next.id} ${String(next.Get("user"))}`;
+		});
+		running = await startApp(new Application({ sessions: manager }));
+
+		const seed = await running.fetch("/seed");
+		const oldId = await seed.text();
+		const cookie = (seed.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+		const login = await running.fetch("/login", { headers: { cookie } });
+		const [before, after, user] = (await login.text()).split(" ");
+
+		expect(before).toBe(oldId);
+		expect(after).not.toBe(oldId);
+		expect(user).toBe("aiko");
+		expect(login.headers.get("set-cookie")).toContain(`SID=${after}`);
+		expect(await manager.get(oldId)).toBeUndefined();
+		expect((await manager.get(after!))?.Get("user")).toBe("aiko");
+	});
+
+	test("keepData: false starts the new session empty", async () => {
+		const manager = new SessionManager({ cookieName: "SID", sweepInterval: 0 });
+		const old = manager.create();
+		old.Set("user", "aiko");
+		await old.Save();
+		const ctx = new Context(new Request("http://x.test/"));
+		ctx.sessions = manager;
+		ctx.session = old;
+
+		const next = await manager.rotate(ctx, { keepData: false });
+
+		expect(next.id).not.toBe(old.id);
+		expect(next.Get("user")).toBe(false);
+		expect(ctx.session).toBe(next);
+	});
+});
+
 describe("middleware", () => {
 	let running: RunningApp | undefined;
 
