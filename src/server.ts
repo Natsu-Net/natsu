@@ -414,7 +414,8 @@ export class Application {
 		if (verdict) return verdict;
 		const ip = probe.ip;
 
-		const session = await this.socketScope(request);
+		const resolved = await this.socketScope(request);
+		const session = resolved && !resolved.destroyed ? resolved : undefined;
 		if (General.socketMaxPerIp > 0 && ip && socketCountFor(ip) >= General.socketMaxPerIp) {
 			return new Response("Too Many Connections", { status: 429 });
 		}
@@ -446,7 +447,8 @@ export class Application {
 			const ctx = new Context(request);
 			const id = ctx.cookies.get(this.sessions.cookieName);
 			if (!id) return undefined;
-			return await this.sessions.get(id);
+			const session = await this.sessions.get(id);
+			return session && !session.destroyed && !session.IsExpired() ? session : undefined;
 		} catch {
 			return undefined;
 		}
