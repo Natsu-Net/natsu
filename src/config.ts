@@ -109,6 +109,8 @@ export interface SessionConfig {
 	anonymousTtl: number;
 	/** Expiry sweep interval in seconds; 0 disables the timer. */
 	sweepInterval: number;
+	/** Sessions without data one address (an IPv6 /64) may hold; the oldest go first. 0 means unlimited. */
+	maxAnonymousPerIp: number;
 	/** sqlite driver only. `:memory:` keeps it in-process. */
 	path: string;
 	cookie: SessionCookieConfig;
@@ -187,6 +189,7 @@ export function defaultConfig(): NatsuConfig {
 			ttl: 60 * 60 * 24 * 7,
 			anonymousTtl: 3600,
 			sweepInterval: 300,
+			maxAnonymousPerIp: 1000,
 			path: ".natsu/sessions.sqlite",
 			cookie: {
 				path: "/",
@@ -271,6 +274,9 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(config.General.maxRequestBodySize) || config.General.maxRequestBodySize < 1) {
 		throw new ConfigError(`General.maxRequestBodySize must be a positive integer, got ${String(config.General.maxRequestBodySize)}`);
+	}
+	if (!Number.isInteger(config.Session.maxAnonymousPerIp) || config.Session.maxAnonymousPerIp < 0) {
+		throw new ConfigError(`Session.maxAnonymousPerIp must be a non-negative integer, got ${String(config.Session.maxAnonymousPerIp)}`);
 	}
 	return config;
 }

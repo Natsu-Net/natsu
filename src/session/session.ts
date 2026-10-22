@@ -15,7 +15,7 @@
 
 import type { Context, Middleware } from "../context.ts";
 import type { NatsuConfig, SessionCookieConfig } from "../config.ts";
-import { endSession, socketSessionIds } from "../live.ts";
+import { endSession, ipKey, socketSessionIds } from "../live.ts";
 import { log } from "../logger.ts";
 import { MemoryAdapter, type SessionAdapter, type SessionRecord } from "./adapter.ts";
 import { SqliteAdapter } from "./sqlite.ts";
@@ -31,6 +31,9 @@ export class Session {
 	public dirty = false;
 
 	public destroyed = false;
+
+	/** @internal */
+	public holder: string | undefined;
 
 	private manager: SessionManager | undefined;
 	private saving: Promise<void> | undefined;
@@ -49,6 +52,7 @@ export class Session {
 	private promote(): void {
 		if (!this.limited) return;
 		this.limited = false;
+		this.manager?.release(this);
 		this.expire = Math.floor(Date.now() / 1000) + (this.manager?.ttl ?? 60 * 60 * 24 * 7);
 	}
 
@@ -152,6 +156,8 @@ export interface SessionManagerOptions {
 	rolling?: boolean;
 	/** Seconds between expiry sweeps; 0 disables. */
 	sweepInterval?: number;
+	/** Sessions without data one address may hold; 0 means unlimited. */
+	maxAnonymousPerIp?: number;
 }
 
 /** Hooks that run right after a session is attached to a request (v1's session middleware registry). */
@@ -164,6 +170,9 @@ export class SessionManager {
 	public readonly cookieName: string;
 	public readonly cookie: SessionCookieConfig;
 	public readonly rolling: boolean;
+	public readonly maxAnonymousPerIp: number;
+
+	private readonly anonymous = new Map<string, Set<Session>>();
 
 	/** id -> live instance. The identity map is what makes concurrent requests safe. */
 	private readonly live = new Map<string, Session>();
@@ -183,6 +192,7 @@ export class SessionManager {
 			...(options.cookie?.domain ? { domain: options.cookie.domain } : {}),
 		};
 		this.rolling = options.rolling ?? true;
+		this.maxAnonymousPerIp = options.maxAnonymousPerIp ?? 0;
 
 		const interval = options.sweepInterval ?? 300;
 		if (interval > 0) {
@@ -208,14 +218,36 @@ export class SessionManager {
 			cookieName: hostBound ? `__Host-${name}` : name,
 			cookie,
 			sweepInterval: config.Session.sweepInterval,
+			maxAnonymousPerIp: config.Session.maxAnonymousPerIp,
 		});
 	}
 
-	public create(): Session {
+	public create(ip?: string): Session {
 		const session = new Session(crypto.randomUUID(), Math.floor(Date.now() / 1000) + this.anonymousTtl, {}, this);
 		session.dirty = true;
 		this.live.set(session.id, session);
+		if (ip && this.maxAnonymousPerIp > 0) this.hold(session, ipKey(ip));
 		return session;
+	}
+
+	private hold(session: Session, key: string): void {
+		session.holder = key;
+		const held = this.anonymous.get(key) ?? new Set<Session>();
+		this.anonymous.set(key, held);
+		held.add(session);
+		for (const oldest of held) {
+			if (held.size <= this.maxAnonymousPerIp) break;
+			this.destroy(oldest.id).catch((error: Error) => log.warn(`[<yellow>SESSION</yellow>] dropping an anonymous session failed: ${error.message}`));
+		}
+	}
+
+	/** @internal */
+	public release(session: Session): void {
+		const key = session.holder;
+		if (key === undefined) return;
+		session.holder = undefined;
+		const held = this.anonymous.get(key);
+		if (held?.delete(session) && held.size === 0) this.anonymous.delete(key);
 	}
 
 	/**
@@ -249,7 +281,10 @@ export class SessionManager {
 
 	public async destroy(id: string): Promise<void> {
 		const session = this.live.get(id);
-		if (session) session.destroyed = true;
+		if (session) {
+			session.destroyed = true;
+			this.release(session);
+		}
 		this.live.delete(id);
 		// Networkable state is keyed by session id, so a session that goes away
 		// takes its stores, its room grants and its socket fan-out with it.
@@ -277,6 +312,7 @@ export class SessionManager {
 		for (const [id, session] of this.live) {
 			if (!session.IsExpired(now)) continue;
 			session.destroyed = true;
+			this.release(session);
 			this.live.delete(id);
 			endSession(id);
 		}
@@ -312,13 +348,17 @@ export class SessionManager {
 	/** Forget in-memory instances without touching the store. */
 	public evict(id?: string): void {
 		if (id) this.live.delete(id);
-		else this.live.clear();
+		else {
+			this.live.clear();
+			this.anonymous.clear();
+		}
 	}
 
 	public async close(): Promise<void> {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
 		this.live.clear();
+		this.anonymous.clear();
 		await this.adapter.close();
 	}
 }

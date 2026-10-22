@@ -311,7 +311,7 @@ export class Context {
 		if (!this.sessions) {
 			throw new Error("natsu: ctx.session is unavailable — Session support is disabled in config");
 		}
-		this._session = this.sessions.create();
+		this._session = this.sessions.create(this.ip);
 		this.sessions.attachCookie(this, this._session);
 		return this._session;
 	}
