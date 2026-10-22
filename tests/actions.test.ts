@@ -108,6 +108,51 @@ function unmasked(masked: string): string {
 const form = (fields: Record<string, string>) => new URLSearchParams(fields);
 const cookieOf = (answer: Response, name: string) => answer.headers.getSetCookie().find((c) => c.startsWith(`${name}=`));
 
+describe("csrf bound to the session", () => {
+	async function signedIn() {
+		registerTodos();
+		const { app, get } = await serve({ "todos.uwu": TODOS });
+		const session = app.sessions!.create();
+		const sid = `${app.sessions!.cookieName}=${session.id}`;
+		return { app, get, sid };
+	}
+
+	test("a planted double-submit cookie is refused for a session that has a token of its own", async () => {
+		const { get, sid } = await signedIn();
+		const planted = "A".repeat(43);
+		const post = await get("/todos", {
+			method: "POST",
+			body: form({ _action: "add", _csrf: planted, title: "x" }),
+			headers: { cookie: `${sid}; natsu_csrf=${planted}` },
+		});
+		expect(post.status).toBe(403);
+		expect(todos).toEqual([]);
+	});
+
+	test("the page re-mints a planted cookie, and the minted token then works", async () => {
+		const { get, sid } = await signedIn();
+		const planted = "A".repeat(43);
+		const page = await get("/todos", { headers: { cookie: `${sid}; natsu_csrf=${planted}` } });
+		const set = page.headers.getSetCookie().find((c) => c.startsWith("natsu_csrf="))!;
+		const cookie = set.split(";")[0]!;
+		expect(cookie).not.toBe(`natsu_csrf=${planted}`);
+		const html = await page.text();
+		const token = /name="_csrf" value="([^"]+)"/.exec(html)![1]!;
+		const post = await get("/todos", { method: "POST", body: form({ _action: "add", _csrf: token, title: "x" }), headers: { cookie: `${sid}; ${cookie}` } });
+		expect(post.status).toBe(303);
+	});
+
+	test("one session's token does not work for another", async () => {
+		const { app, get, sid } = await signedIn();
+		const page = await get("/todos", { headers: { cookie: sid } });
+		const cookie = page.headers.getSetCookie().find((c) => c.startsWith("natsu_csrf="))!.split(";")[0]!;
+		const token = /name="_csrf" value="([^"]+)"/.exec(await page.text())![1]!;
+		const other = `${app.sessions!.cookieName}=${app.sessions!.create().id}`;
+		const post = await get("/todos", { method: "POST", body: form({ _action: "add", _csrf: token, title: "x" }), headers: { cookie: `${other}; ${cookie}` } });
+		expect(post.status).toBe(403);
+	});
+});
+
 describe("actions without script", () => {
 	test("a form posts to its page: the action runs, a 303 comes back with a flash shown once", async () => {
 		registerTodos();

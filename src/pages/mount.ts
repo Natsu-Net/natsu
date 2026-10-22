@@ -64,6 +64,7 @@ import {
 	allowed,
 	anyPublicAction,
 	csrfOk,
+	sessionToken,
 	decodeFlash,
 	encodeFlash,
 	assertActionsDeclareAuth,
@@ -545,9 +546,10 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 	const secretsFor = (ctx: Context, state: RouteState): Record<string, string> => {
 		const own = options.secrets ? options.secrets(ctx) : NO_SECRETS;
 		if (state.actions.size === 0) return own;
+		const bound = sessionToken(ctx);
 		let token = tokenOf(ctx);
-		if (token === undefined) {
-			token = newToken();
+		if (token === undefined || (bound !== undefined && token !== bound)) {
+			token = bound ?? newToken();
 			// Readable by the runtime, which sends it back with a click; a
 			// cross-site page can neither read it nor set it.
 			ctx.setCookie(CSRF_COOKIE, token, { httpOnly: false, sameSite: "lax", secure: secure(), path: "/" });

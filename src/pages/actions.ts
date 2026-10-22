@@ -27,6 +27,7 @@
 
 import { config } from "../config.ts";
 import type { Context } from "../context.ts";
+import { bindTo } from "../invalidate.ts";
 import type { Session } from "../session/session.ts";
 
 /** What an action is handed. */
@@ -237,6 +238,10 @@ export function tokenOf(ctx: Context): string | undefined {
 	return value !== undefined && TOKEN.test(value) ? value : undefined;
 }
 
+export function sessionToken(ctx: Context): string | undefined {
+	return ctx.sessionLoaded ? bindTo("csrf", ctx.session.id) : undefined;
+}
+
 const MASKED_MIN = 65;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 
@@ -281,6 +286,8 @@ export function csrfOk(ctx: Context, form: FormData): boolean {
 	const cookie = tokenOf(ctx);
 	const sent = form.get(CSRF_FIELD) ?? ctx.headers.get("natsu-csrf");
 	if (cookie === undefined || typeof sent !== "string") return false;
+	const bound = sessionToken(ctx);
+	if (bound !== undefined && !same(cookie, bound)) return false;
 	const token = unmaskToken(sent);
 	return token !== undefined && same(cookie, token);
 }

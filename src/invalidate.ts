@@ -91,6 +91,10 @@ function mac(text: string): string {
 	return new Bun.CryptoHasher("sha256", secret).update(text).digest("base64url").slice(0, 27);
 }
 
+export function bindTo(domain: string, text: string): string {
+	return new Bun.CryptoHasher("sha256", secret).update(`${domain}\0${text}`).digest("base64url");
+}
+
 /** `tags`, signed, as `<meta name="natsu-live">` carries them; "" for none. */
 export function signTags(tags: Iterable<string>): string {
 	const list = [...new Set(tags)].filter(isTag).sort().slice(0, MAX_TAGS);
