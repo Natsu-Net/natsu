@@ -289,6 +289,16 @@ describe("rooms", () => {
 		expect(hasRoom("session-a", "party", "room-a")).toBe(false);
 	});
 
+	test("a session holds a bounded number of rooms", () => {
+		const granted = Array.from({ length: 300 }, (_, i) => grantRoom("session-a", AsClass(Party), `room-${i}`));
+		expect(granted.filter(Boolean).length).toBe(256);
+		expect(hasRoom("session-a", "party", "room-0")).toBe(true);
+		expect(hasRoom("session-a", "party", "room-299")).toBe(false);
+		expect(grantRoom("session-a", AsClass(Party), "room-0")).toBe(true);
+		revokeRoom("session-a", AsClass(Party), "room-0");
+		expect(grantRoom("session-a", AsClass(Party), "room-299")).toBe(true);
+	});
+
 	test("ending a session drops every room it held", () => {
 		grantRoom("session-a", AsClass(Party), "room-a");
 		grantRoom("session-a", AsClass(Party), "room-b");

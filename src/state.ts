@@ -136,15 +136,20 @@ export function wireKeyFor(Class: StateClass, scopeId: string): string {
  */
 const grants = new Map<string, Set<string>>();
 
-/** Let this session address `roomId` for `Class`. */
-export function grantRoom(sessionId: string, Class: StateClass, roomId: string): void {
-	if (!sessionId || !roomId) return;
+const MAX_ROOMS_PER_SESSION = 256;
+
+/** Let this session address `roomId` for `Class`; false when it already holds the most rooms a session may. */
+export function grantRoom(sessionId: string, Class: StateClass, roomId: string): boolean {
+	if (!sessionId || !roomId) return false;
 	let allowed = grants.get(sessionId);
 	if (!allowed) {
 		allowed = new Set();
 		grants.set(sessionId, allowed);
 	}
-	allowed.add(`${Class.stateKey}:${roomId}`);
+	const entry = `${Class.stateKey}:${roomId}`;
+	if (allowed.size >= MAX_ROOMS_PER_SESSION && !allowed.has(entry)) return false;
+	allowed.add(entry);
+	return true;
 }
 
 /** Take it away again — leaving a party, or being removed from one. */

@@ -372,7 +372,9 @@ export class Context {
 	public joinRoom<T extends object>(Class: StateClass<T>, roomId: string): T {
 		if (Class.scope !== "room") throw new Error(`natsu/state: ${Class.stateKey} is not room-scoped`);
 		if (!roomId) throw new Error(`natsu/state: ${Class.stateKey} needs a room id`);
-		grantRoom(this.session.id, Class as unknown as StateClass, roomId);
+		if (!grantRoom(this.session.id, Class as unknown as StateClass, roomId)) {
+			throw new Error(`natsu/state: this session holds too many rooms to join ${Class.stateKey}`);
+		}
 		return resolveState(Class, roomId);
 	}
 
