@@ -55,16 +55,31 @@ export interface CookieOptions {
 	sameSite?: "strict" | "lax" | "none";
 }
 
+const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const COOKIE_PATH = /^\/[\x20-\x3a\x3c-\x7e]*$/;
+const COOKIE_DOMAIN = /^\.?[0-9A-Za-z](?:[0-9A-Za-z.-]*[0-9A-Za-z])?$/;
+
 /** Serialise one `Set-Cookie` value. Exported because the session store needs it. */
 export function serializeCookie(name: string, value: string, options: CookieOptions = {}): string {
+	if (!COOKIE_NAME.test(name)) throw new TypeError(`natsu: ${JSON.stringify(name)} is not a cookie name`);
+	const path = options.path ?? "/";
+	if (!COOKIE_PATH.test(path)) throw new TypeError(`natsu: ${JSON.stringify(path)} is not a cookie path`);
+	if (options.domain && !COOKIE_DOMAIN.test(options.domain)) throw new TypeError(`natsu: ${JSON.stringify(options.domain)} is not a cookie domain`);
+	if (options.maxAge !== undefined && !Number.isFinite(options.maxAge)) throw new TypeError("natsu: a cookie's maxAge is a finite number");
+	if (options.expires && Number.isNaN(options.expires.getTime())) throw new TypeError("natsu: a cookie's expires is a valid date");
+	const sameSite = options.sameSite ?? "lax";
+	const prefixed = name.startsWith("__Host-") || name.startsWith("__Secure-");
+	if (name.startsWith("__Host-") && (options.domain || path !== "/")) {
+		throw new TypeError(`natsu: ${name} is a __Host- cookie: no domain, and path /`);
+	}
 	const parts = [`${name}=${encodeURIComponent(value)}`];
 	if (options.maxAge !== undefined) parts.push(`Max-Age=${Math.floor(options.maxAge)}`);
 	if (options.domain) parts.push(`Domain=${options.domain}`);
-	parts.push(`Path=${options.path ?? "/"}`);
+	parts.push(`Path=${path}`);
 	if (options.expires) parts.push(`Expires=${options.expires.toUTCString()}`);
 	if (options.httpOnly !== false) parts.push("HttpOnly");
-	if (options.secure) parts.push("Secure");
-	parts.push(`SameSite=${capitalise(options.sameSite ?? "lax")}`);
+	if (options.secure || prefixed || sameSite === "none") parts.push("Secure");
+	parts.push(`SameSite=${capitalise(sameSite)}`);
 	return parts.join("; ");
 }
 
@@ -81,6 +96,7 @@ export function parseCookies(header: string | null): Map<string, string> {
 		if (eq < 1) continue;
 		const key = pair.slice(0, eq).trim();
 		if (!key) continue;
+		if (out.has(key)) continue;
 		const raw = pair.slice(eq + 1).trim();
 		try {
 			out.set(key, decodeURIComponent(raw));
