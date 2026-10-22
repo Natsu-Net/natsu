@@ -38,6 +38,8 @@ export interface GeneralConfig {
 	/** Refuse browser-like socket upgrades that carry no Origin header. */
 	socketRequireOrigin: boolean;
 	liveTagTtl: number;
+	/** Largest request body, in bytes, any route accepts; Bun enforces it while the body streams in. */
+	maxRequestBodySize: number;
 	bantime: number;
 	/** `{method} {path} {status} {ms}` — see `formatLine`. */
 	logFormat: string;
@@ -153,6 +155,7 @@ export function defaultConfig(): NatsuConfig {
 			socketAllowedOrigins: [],
 			socketRequireOrigin: true,
 			liveTagTtl: 3600,
+			maxRequestBodySize: 8 * 1024 * 1024,
 			bantime: 300,
 			logFormat: "[<yellow>{method}</yellow>] {ip} - <magenta>{path}</magenta> <{color}>{status}</{color}> in <{color}>{ms}ms</{color}>",
 			logLevel: "info",
@@ -265,6 +268,9 @@ function validate(config: NatsuConfig): NatsuConfig {
 	}
 	if (!Number.isInteger(config.General.liveTagTtl) || config.General.liveTagTtl < 1) {
 		throw new ConfigError(`General.liveTagTtl must be a positive integer, got ${String(config.General.liveTagTtl)}`);
+	}
+	if (!Number.isInteger(config.General.maxRequestBodySize) || config.General.maxRequestBodySize < 1) {
+		throw new ConfigError(`General.maxRequestBodySize must be a positive integer, got ${String(config.General.maxRequestBodySize)}`);
 	}
 	return config;
 }

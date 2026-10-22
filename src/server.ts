@@ -358,6 +358,7 @@ export class Application {
 			hostname: options.hostname ?? this.config.General.listenOn,
 			development: options.development ?? this.config.General.development,
 			reusePort: options.reusePort ?? false,
+			maxRequestBodySize: General.maxRequestBodySize,
 			routes: this.socketRoute(live, this.buildRoutes()),
 			websocket:
 				options.websocket || live
