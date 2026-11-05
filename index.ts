@@ -46,6 +46,7 @@ export { grantRoom, hasRoom, revokeRoom, revokeSession };
 export { SOCKET_PATH, endSession, liveWebSocketHandler, resetLive, setLiveHooks, setLiveServer, stopPublishing, upgradeLive };
 export { registerController } from "./src/router.ts";
 export { parseCookies, serializeCookie } from "./src/context.ts";
+export type { SpanTimings } from "./src/telemetry.ts";
 export { Forbidden, HttpError, Invalid, NotFound, PageCompileError, Redirect, action, compilePages, evaluateServer, guard, mountPages, registerModelResolver, source } from "./src/pages/index.ts";
 export type {
 	ActionHandler,
