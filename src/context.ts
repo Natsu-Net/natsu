@@ -12,6 +12,7 @@ import type { Server } from "bun";
 import { isIP } from "node:net";
 import { Cache, defaultCache } from "./cache.ts";
 import { type Nav, inertNav } from "./navigate.ts";
+import type { SpanTimings } from "./telemetry.ts";
 import type { Session, SessionManager } from "./session/session.ts";
 import { type StateClass, grantRoom, resolveState, revokeRoom } from "./state.ts";
 
@@ -192,6 +193,10 @@ export class Context {
 	 * handler can call it whether or not navigation is on.
 	 */
 	public nav: Nav = inertNav;
+	/** The route pattern answering this request, set when the terminal runs. */
+	public route: string | undefined;
+	/** Phase wall-times, filled in by the built-ins; see `src/telemetry.ts`. */
+	public readonly timings: SpanTimings = {};
 
 	/** Set by the session middleware; `session` creates one on demand. */
 	public sessions: SessionManager | undefined;

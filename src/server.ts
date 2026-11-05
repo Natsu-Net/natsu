@@ -203,6 +203,7 @@ export class Application {
 	}
 
 	private async routeTerminal(ctx: Context, entry: RouteEntry): Promise<void> {
+		ctx.route = entry.path;
 		// v1 served `public/` ahead of the router; apps that relied on a file
 		// shadowing a route can turn that back on.
 		if (this.config.Static.beforeRoutes && this.statics && (await this.statics.serve(ctx))) return;
@@ -230,7 +231,9 @@ export class Application {
 		// only an island() route.
 		if ((ctx.nav.requested || isIslandRequest(ctx)) && refuseBeforeHandler(ctx, handler)) return;
 
+		const started = Bun.nanoseconds();
 		await this.invoke(handler, ctx);
+		ctx.timings.controllerMs = (Bun.nanoseconds() - started) / 1e6;
 
 		// A guard that refused, or a handler that wrote nothing, still owes the
 		// client an answer.

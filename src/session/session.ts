@@ -375,6 +375,7 @@ export function sessionMiddleware(manager: SessionManager): Middleware {
 		ctx.sessions = manager;
 		const id = ctx.cookies.get(cookieName);
 		if (id) {
+			const started = Bun.nanoseconds();
 			const session = await manager.get(id);
 			if (session) {
 				ctx.session = session;
@@ -384,6 +385,7 @@ export function sessionMiddleware(manager: SessionManager): Middleware {
 				}
 				for (const hook of manager.getAllMiddleware().values()) await hook(ctx);
 			}
+			ctx.timings.sessionMs = (Bun.nanoseconds() - started) / 1e6;
 		}
 
 		await next();

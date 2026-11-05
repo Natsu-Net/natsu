@@ -530,7 +530,9 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				canonical: canonical(ctx),
 				robots: state.noindex ? "noindex" : "",
 			};
+			const started = Bun.nanoseconds();
 			const html = await drawPage(state, values, meta, "", signTags(tags, liveScope(ctx)), secrets.nonce);
+			ctx.timings.renderMs = (Bun.nanoseconds() - started) / 1e6;
 			return { body: withToken(html, state.actions.size > 0 ? secrets.csrf : undefined), status: 200, html: true, tags };
 		} catch (thrown) {
 			const error = known(thrown);
