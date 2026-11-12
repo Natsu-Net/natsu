@@ -39,6 +39,9 @@
  *  - `/account`, `/account/orders`: the account layout, with an inline
  *    `<style nonce>` of its own in the head and the orders page one more;
  *    `account.js` runs a clock that its cleanup must stop.
+ *  - `/s1`, `/s12`, `/s21`: the site chunk and one or both of two extra
+ *    sheets in either order, each setting `#order`'s margin at the same
+ *    specificity; `/s-broken` lists one that answers 404.
  *
  * `state` changes the app from a test: a banner in the header (a different
  * shell), a held stylesheet, `'strict-dynamic'` on or off. `seen` records
@@ -352,6 +355,19 @@ export async function navigateApp(options: { development?: boolean } = {}): Prom
 		head: '<style nonce="{nonce}">#orders-note{color:rgb(0,0,200)}</style>',
 		scripts: ["account"],
 	}))));
+	const extraSheets: Record<string, string> = { "/extra/one.css": "#order{margin-top:11px}", "/extra/two.css": "#order{margin-top:22px}" };
+	for (const [path, css] of Object.entries(extraSheets)) Routes.get(path, () => new Response(css, { headers: { "content-type": "text/css; charset=utf-8" } }));
+	const ordered = (title: string, sheets: string[]): Handler =>
+		own(() => ({
+			title,
+			head: sheets.map((href) => `<link rel="stylesheet" href="${href}">`).join(""),
+			main: `<h1>${title}</h1><p id="order">order</p>`,
+		}));
+	Routes.get("/s1", navigable(ordered("S1", ["/extra/one.css"])));
+	Routes.get("/s12", navigable(ordered("S12", ["/extra/one.css", "/extra/two.css"])));
+	Routes.get("/s21", navigable(ordered("S21", ["/extra/two.css", "/extra/one.css"])));
+	Routes.get("/s-broken", navigable(ordered("Broken", ["/extra/one.css", "/extra/missing.css"])));
+	Routes.get("/extra/missing.css", () => new Response("", { status: 404 }));
 	const font = FONT ? readFileSync(FONT) : undefined;
 	Routes.get("/fonts/probe.ttf", () =>
 		font

@@ -74,6 +74,19 @@ the page's own URL (never the `<base href>`), no field to send is
 `action?`, a file goes as its name and a line break as CRLF. Scroll comes back on Back, Forward and a reload, and
 every scroll the runtime makes is a jump, whatever `scroll-behavior` says.
 
+After a visit the head's stylesheets and inline `<style>`s are in the
+order the new page's head lists them, as a full load of that page has them,
+so rules of equal specificity resolve the same however the visitor got
+there. A sheet already linked, with the same `href`, `media` and
+`disabled`, stays where it is and is never fetched or parsed again; a new
+one, or the fewest sheets that must move for the order to hold, is linked where it belongs
+with `media="not all"` while it loads (the page on screen keeps its look),
+gets its own `media` back at the swap, and must load first: a sheet that
+fails, or takes more than four seconds, makes the visit a full load. An
+inline style or a `disabled` sheet goes in at the swap. A stylesheet or
+style the server sent that the new page does not list is removed; one your
+scripts or another party added is left alone.
+
 ## POST forms
 
 The runtime posts a same-site POST form itself, with `Natsu-Action: 1` and
