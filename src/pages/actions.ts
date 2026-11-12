@@ -87,6 +87,8 @@ export interface ActionOptions {
 	 * page that read it refreshes), a tag, or a function of the input for one.
 	 */
 	touches?: readonly (string | ((input: ActionInput) => string | readonly string[] | undefined))[];
+	secretFields?: readonly string[];
+	echoFields?: readonly string[];
 }
 
 export interface GuardInput {
@@ -197,14 +199,87 @@ export function inputOf(form: FormData): Record<string, string | string[]> {
 	return out;
 }
 
+const FRAMEWORK_SECRET_FIELDS: ReadonlySet<string> = new Set([CSRF_FIELD]);
+const SECRET_FRAGMENT = /passw|passphrase|passcode|secret(?!ar)|credential|csrf|xsrf/;
+const SECRET_ENDING = /(?:pwd|otp|cvc|cvv)$/;
+const LAST_WORD_SECRET_ENDING = /token$/;
+const SECRET_WORDS: ReadonlySet<string> = new Set(["csc", "ccv"]);
+const BARE_SECRET_WORDS: ReadonlySet<string> = new Set(["pass", "pin"]);
+const REPEAT_WORDS: ReadonlySet<string> = new Set(["confirm", "confirmation", "confirmed", "again", "repeat", "repeated", "retype", "check", "verify"]);
+const CREDENTIAL_OWNERS: ReadonlySet<string> = new Set([
+	"old", "new", "current", "user", "username", "admin", "login", "account", "root", "master", "my", "your",
+	"confirm", "repeat", "atm", "card", "wallet", "security", "db", "smtp", "mail", "email", "app", "device", "wifi",
+]);
+const ONE_TIME_CODE_KINDS: ReadonlySet<string> = new Set([
+	"otp", "totp", "hotp", "mfa", "2fa", "tfa", "twofactor", "onetime", "verification", "verify", "confirmation", "confirm",
+	"auth", "oauth", "authorization", "authentication", "security", "recovery", "backup", "reset", "login", "signin",
+	"sms", "pin", "access", "unlock",
+]);
+const SECRET_KEY_KINDS: ReadonlySet<string> = new Set(["api", "private", "access", "signing", "encryption", "master", "secret"]);
+const CARD_NUMBER_KINDS: ReadonlySet<string> = new Set(["card", "cc", "creditcard", "pin"]);
+const PAYMENT_CARD_KINDS: ReadonlySet<string> = new Set(["credit", "debit"]);
+const QUALIFIED_SECRET_NOUNS: Readonly<Record<string, ReadonlySet<string>>> = {
+	pass: CREDENTIAL_OWNERS,
+	pin: CREDENTIAL_OWNERS,
+	code: ONE_TIME_CODE_KINDS,
+	codes: ONE_TIME_CODE_KINDS,
+	key: SECRET_KEY_KINDS,
+	keys: SECRET_KEY_KINDS,
+	number: CARD_NUMBER_KINDS,
+	num: CARD_NUMBER_KINDS,
+	no: CARD_NUMBER_KINDS,
+	nr: CARD_NUMBER_KINDS,
+	card: PAYMENT_CARD_KINDS,
+};
+
+function fieldNameWords(name: string): string[] {
+	return name
+		.replace(/([a-z])([A-Z])/g, "$1 $2")
+		.replace(/([0-9])([A-Z][a-z])/g, "$1 $2")
+		.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.map((word) => word.replace(/[0-9]+$/, ""))
+		.filter((word) => word.length > 1);
+}
+
+function qualifiedSecret(words: readonly string[], at: number): boolean {
+	const word = words[at]!;
+	for (const [noun, kinds] of Object.entries(QUALIFIED_SECRET_NOUNS)) {
+		if (word === noun) {
+			const before = words[at - 1];
+			if (before !== undefined && (kinds.has(before) || kinds.has((words[at - 2] ?? "") + before))) return true;
+		} else if (word.length > noun.length && word.endsWith(noun) && kinds.has(word.slice(0, -noun.length))) return true;
+	}
+	return false;
+}
+
+export function looksSecret(name: string): boolean {
+	const words = fieldNameWords(name);
+	if (words.some((word, at) => SECRET_FRAGMENT.test(word) || SECRET_ENDING.test(word) || SECRET_WORDS.has(word) || qualifiedSecret(words, at))) return true;
+	let end = words.length;
+	while (end > 1 && REPEAT_WORDS.has(words[end - 1]!)) end--;
+	const last = words[end - 1];
+	return last !== undefined && (LAST_WORD_SECRET_ENDING.test(last) || (end === 1 && BARE_SECRET_WORDS.has(last)));
+}
+
+export interface EchoRules {
+	secret?: Iterable<string>;
+	echo?: Iterable<string>;
+}
+
 /** A field that may hold a secret is never drawn back into a refused form. */
-const SECRET_FIELD = /pass|secret|token|csrf|code|card|cvc|cvv|otp/i;
+function hidden(key: string, secret: ReadonlySet<string>, echo: ReadonlySet<string>): boolean {
+	return FRAMEWORK_SECRET_FIELDS.has(key) || secret.has(key) || (!echo.has(key) && looksSecret(key));
+}
 
 /** What a refused form shows again: its text fields, less anything secret, each at most 4000 characters. */
-export function valuesOf(input: Record<string, string | string[]>): Record<string, string | string[]> {
+export function valuesOf(input: Record<string, string | string[]>, rules: EchoRules = {}): Record<string, string | string[]> {
+	const secret = new Set(rules.secret ?? []);
+	const echo = new Set(rules.echo ?? []);
 	const out: Record<string, string | string[]> = Object.create(null);
 	for (const [key, value] of Object.entries(input)) {
-		if (SECRET_FIELD.test(key)) continue;
+		if (hidden(key, secret, echo)) continue;
 		out[key] = Array.isArray(value) ? value.map((v) => v.slice(0, 4000)) : value.slice(0, 4000);
 	}
 	return out;
