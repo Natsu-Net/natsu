@@ -84,6 +84,34 @@ with what the visitor typed put back. A multipart form goes as multipart,
 any other as `application/x-www-form-urlencoded`; `text/plain` is left to
 the browser.
 
+The server draws a refused form again with `form.values`: every text field
+posted, each cut to 4000 characters, except the secret ones. A field is
+secret when it is natsu's own CSRF field, when the route's page, layouts or
+partials draw it as `<input type="password">` or with `autocomplete`
+`current-password`, `new-password`, `one-time-code`, `cc-number` or `cc-csc`
+(a static `name` only), or when its name reads as a secret. Names are split
+into words on punctuation and camelCase (`newPassword`, `new_password` and
+`new-password` are `new password`), and a name is secret when a word holds
+`password`, `passwd`, `passphrase`, `passcode`, `secret`, `credential`,
+`csrf` or `xsrf`, or ends in `pwd`, `otp`, `cvc` or `cvv`; when its last
+word ends in `token` (`apiToken`, not `maxTokens` or `tokenBudget`); for a
+one-time code (`otpCode`, `2faCode`, `verificationCode`, `recoveryCodes`;
+not `code`, `inviteCode` or `postalCode`); for a card (`cardNumber`, `ccNum`,
+`creditCard`, `csc`; not `rankCardBackground`); for a key (`apiKey`,
+`privateKey`, `accessKey`; not `key` or `productKey`); and for `pass` or
+`pin` alone or after an owner (`pass`, `newPass`, `userPin`, `pinConfirm`;
+not `bypass`, `passport` or `battlePass`). An action can say more:
+
+```ts
+action("account.save", run, { secretFields: ["recoveryPhrase"], echoFields: ["pin"] });
+```
+
+`secretFields` hides fields the rule misses; `echoFields` draws again a
+field the name rule hid. Neither the CSRF field nor a password input the page
+draws is ever drawn again, whatever `echoFields` says, and nothing a visitor
+posts changes what is hidden. The runtime puts back what the visitor typed
+on top of that, never a hidden, password, file or one-time-code field.
+
 A route that is not `navigable()`, or a path with no route, is refused
 before its handler runs, and the answer says so with `Natsu-Unrun: 1`: the
 runtime then lets the browser post the form itself, submitter and all, so a

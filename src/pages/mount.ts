@@ -183,6 +183,7 @@ interface RouteState extends Drawn {
 	noindex: boolean;
 	/** Short name to action. */
 	actions: Map<string, RouteAction>;
+	secretInputs: ReadonlySet<string>;
 	error?: Drawn;
 }
 
@@ -434,6 +435,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				readsFlash: routeReads.has("flash"),
 				noindex: "viewer" in page.reads || "session" in page.reads,
 				actions: actionsOf(page, layouts),
+				secretInputs: new Set([page, ...layouts].flatMap((file) => file.secretInputs ?? [])),
 				error,
 			});
 		}
@@ -728,7 +730,12 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			if (result.errors && (Object.keys(result.errors).length > 0 || result.message)) {
 				// Refused: the page again, with what was typed and why, for the visitor to fix.
 				const out = await draw(ctx, state, secretsNow(), {
-					form: { action: short, errors: result.errors, values: valuesOf(input), message: result.message ?? "" },
+					form: {
+						action: short,
+						errors: result.errors,
+						values: valuesOf(input, { secret: [...state.secretInputs, ...(entry.options.secretFields ?? [])], echo: entry.options.echoFields }),
+						message: result.message ?? "",
+					},
 				});
 				return answer(ctx, { ...out, status: out.status === 200 ? 422 : out.status });
 			}

@@ -90,6 +90,7 @@ export interface CompiledFile {
 	actions: { name: string; line: number }[];
 	/** `@href="/path"` links in the template itself, each checked against the page routes (see `checkLinks`). */
 	links?: { href: string; line: number }[];
+	secretInputs?: string[];
 	/** A partial file: the name it is included by. */
 	partial?: string;
 }
@@ -227,6 +228,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 	const unresolved = new Set<string>();
 	const actions = new Map<string, number>();
 	const links: { href: string; line: number }[] = [];
+	const secretInputs = new Set<string>();
 	const scriptNames = scriptDeclarations(result.sfc.scripts);
 	const nodes = result.template?.nodes ?? [];
 	const reads: Reads = collectReads(nodes, {
@@ -244,6 +246,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 			if (!actions.has(name)) actions.set(name, loc.line);
 		},
 		onLink: (href, loc) => void links.push({ href, line: loc.line }),
+		onSecretInput: (name) => void secretInputs.add(name),
 	});
 
 	// The block reads too: title holes, data arguments, service paths.
@@ -275,6 +278,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 			unresolved: [...unresolved],
 			actions: [...actions].map(([name, line]) => ({ name, line })),
 			...(links.length > 0 ? { links } : {}),
+			...(secretInputs.size > 0 ? { secretInputs: [...secretInputs] } : {}),
 			...(options.partial !== undefined ? { partial: options.partial } : {}),
 		},
 		tree: { nodes, scriptNames },
