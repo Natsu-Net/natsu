@@ -902,6 +902,131 @@ describe("stylesheets", () => {
 		expect(pending.size).toBe(0);
 	});
 
+	describe("order", () => {
+		const tag = (s: string) => {
+			const [href, ...attrs] = s.split(" ");
+			return href!.startsWith("style:") ? `<style>${href!.slice(6)}</style>` : `<link rel="stylesheet" href="${href}"${attrs.map((a) => ` ${a}`).join("")}>`;
+		};
+		const NONE = `<link rel="stylesheet" href="/_a/none.css">`;
+		const pageWith = (list: string[]) => page({ sheet: "/_a/none.css", head: list.map(tag).join("") }).replace(NONE, "");
+		const partWith = (list: string[], title = "B") => {
+			const p = part({ title, main: `<h1>Page ${title}</h1>`, sheet: "/_a/none.css", head: list.map(tag).join("") });
+			return answer({ ...p, body: p.body.replace(NONE, "") });
+		};
+		const styled = (p: Opened) =>
+			[...p.document.head.querySelectorAll('link[rel="stylesheet"], style')].map((e: W) =>
+				e.localName === "style"
+					? `style:${e.textContent}`
+					: [e.getAttribute("href"), ...["media", "disabled"].filter((a) => e.hasAttribute(a)).map((a) => `${a}=${e.getAttribute(a)}`)].join(" "),
+			);
+		const watch = (p: Opened) => {
+			const added: string[] = [];
+			new p.window.MutationObserver((records: W[]) => {
+				for (const r of records)
+					for (const n of r.addedNodes) if (n.localName === "link" || n.localName === "style") added.push(n.getAttribute("href") ?? `style:${n.textContent}`);
+			}).observe(p.document.head, { childList: true });
+			return added;
+		};
+		const byHref = (p: Opened) => new Map<string, W>([...p.document.head.querySelectorAll('link[rel="stylesheet"]')].map((l: W) => [l.getAttribute("href"), l]));
+		const hrefOf = (s: string) => s.split(" ")[0]!;
+
+		test.each([
+			["a sheet the new page adds goes after the global one, as a full load has it", ["/g.css"], ["/g.css", "/x.css"], ["/x.css"]],
+			["one the new page lists first goes first", ["/g.css"], ["/x.css", "/g.css"], ["/x.css"]],
+			["a sheet the new page does not list goes", ["/g.css", "/x.css"], ["/g.css"], []],
+			["two extra sheets in the other order: one goes in again, the rest stay", ["/g.css", "/x.css", "/y.css"], ["/g.css", "/y.css", "/x.css"], ["/x.css"]],
+			["a sheet moved to the front: the others stay", ["/a.css", "/b.css", "/c.css", "/d.css"], ["/d.css", "/a.css", "/b.css", "/c.css"], ["/d.css"]],
+			["new sheets between kept ones", ["/a.css", "/c.css"], ["/a.css", "/b.css", "/c.css", "/d.css"], ["/b.css", "/d.css"]],
+			["the same sheet under another media is a new one", ["/g.css"], ["/g.css media=print"], ["/g.css"]],
+			["a page's inline style in its place", ["/g.css", "style:a{}"], ["/g.css", "style:b{}", "/x.css"], ["/x.css", "style:b{}"]],
+			["an inline style moves rather than a sheet loading again", ["/g.css", "style:a{}"], ["style:a{}", "/g.css"], ["style:a{}"]],
+		])("%s", async (_, from, to, inserted) => {
+			const p = open({ html: pageWith(from), routes: { "/b": () => partWith(to) } });
+			const before = byHref(p);
+			const added = watch(p);
+			p.click("#to-b");
+			await settle();
+			expect(text(p, "main h1")).toBe("Page B");
+			expect(styled(p)).toEqual(to);
+			expect(added).toEqual(inserted.map(hrefOf));
+			for (const [href, l] of byHref(p)) if (!inserted.some((s) => hrefOf(s) === href)) expect(l).toBe(before.get(href));
+		});
+
+		test("a new sheet is inert where it belongs while it loads, and applies with its own media at the swap", async () => {
+			const p = open({ html: pageWith(["/g.css"]), routes: { "/b": () => partWith(["/g.css", "/x.css", "/p.css media=print"]) }, holdCss: ["/x.css", "/p.css"] });
+			p.click("#to-b");
+			await settle();
+			expect(styled(p)).toEqual(["/g.css", "/x.css media=not all", "/p.css media=not all"]);
+			expect(text(p, "main h1")).toBe("Page A");
+			p.release("/x.css");
+			p.release("/p.css");
+			await settle();
+			expect(styled(p)).toEqual(["/g.css", "/x.css", "/p.css media=print"]);
+			expect(text(p, "main h1")).toBe("Page B");
+		});
+
+		test("a disabled sheet goes in at the swap, never waited for", async () => {
+			const p = open({ html: pageWith(["/g.css"]), routes: { "/b": () => partWith(["/g.css", "/off.css disabled"]) }, failCss: ["/off.css"] });
+			p.click("#to-b");
+			await settle();
+			expect(p.loads).toEqual([]);
+			expect(styled(p)).toEqual(["/g.css", "/off.css disabled="]);
+		});
+
+		test("A, B, A, B, then back and forward: each page shows its own order and the global sheet never goes in again", async () => {
+			const A = ["/g.css", "style:a{}"];
+			const B = ["/g.css", "/b.css", "style:b{}"];
+			const p = open({ html: pageWith(A), routes: { "/a": () => partWith(A, "A"), "/b": () => partWith(B) } });
+			const global = byHref(p).get("/g.css");
+			const added = watch(p);
+			for (const [to, list] of [["/b", B], ["/a", A], ["/b", B]] as const) {
+				await p.natsu.visit(to);
+				await settle();
+				expect(styled(p)).toEqual(list);
+			}
+			p.window.history.back();
+			await settle();
+			expect(text(p, "main h1")).toBe("Page A");
+			expect(styled(p)).toEqual(A);
+			p.window.history.forward();
+			await settle();
+			expect(text(p, "main h1")).toBe("Page B");
+			expect(styled(p)).toEqual(B);
+			expect(byHref(p).get("/g.css")).toBe(global);
+			expect(added.filter((h) => h === "/g.css")).toEqual([]);
+		});
+
+		test("a sheet that fails while others move leaves the page as it was, and loads the page for real", async () => {
+			const p = open({
+				html: pageWith(["/g.css", "/x.css", "/y.css"]),
+				routes: { "/b": () => partWith(["/g.css", "/y.css", "/x.css", "/z.css"]) },
+				failCss: ["/z.css"],
+			});
+			const before = [...byHref(p).values()];
+			p.click("#to-b");
+			await settle();
+			expect(p.loads).toEqual([["assign", `${ORIGIN}/b`]]);
+			expect(styled(p)).toEqual(["/g.css", "/x.css", "/y.css"]);
+			expect([...byHref(p).values()]).toEqual(before);
+			expect(text(p, "main h1")).toBe("Page A");
+		});
+
+		test("a kept sheet's lazy half stays right after it, and a new sheet goes after the half", async () => {
+			const p = open({
+				html: pageWith(["/g.css data-natsu-later=/g-later.css"]),
+				routes: { "/b": () => partWith(["/g.css data-natsu-later=/g-later.css", "/x.css"]) },
+			});
+			const half = p.document.createElement("link");
+			half.rel = "stylesheet";
+			half.href = "/g-later.css";
+			byHref(p).get("/g.css").after(half);
+			p.click("#to-b");
+			await settle();
+			expect(styled(p)).toEqual(["/g.css", "/g-later.css", "/x.css"]);
+			expect(byHref(p).get("/g-later.css")).toBe(half);
+		});
+	});
+
 	test("a visit overtaken while its sheet loads leaves nothing behind", async () => {
 		const p = open({
 			html: page(),
@@ -3364,10 +3489,11 @@ describe("size", () => {
 	// (about 600 bytes together); 5.5 KiB until live islands (about 50 bytes);
 	// 5.6 KiB until POST forms (about 200 bytes); 5.85 KiB until body parts
 	// for another layout and the offline event (about 130 bytes); 6 KiB until
-	// scripts an edge injected are told apart (about 115 bytes).
+	// scripts an edge injected are told apart (about 115 bytes); 6.3 KiB until
+	// stylesheets and inline styles keep the incoming page's order (about 440 bytes).
 	// Raise it only with a note of what it bought.
-	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms, body parts and edge scripts included, stays within 6.3 KiB of brotli", () => {
+	test("the minified runtime, actions, live data, live islands, the loading bar, prefetch in view, POST forms, body parts, edge scripts and style order included, stays within 6.7 KiB of brotli", () => {
 		const br = brotliCompressSync(Buffer.from(CODE), { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
-		expect(br).toBeLessThanOrEqual(6450);
+		expect(br).toBeLessThanOrEqual(6900);
 	});
 });

@@ -120,11 +120,12 @@
  *     sent as a part: the server answers with a real load. An answer already in hand (prefetched)
  *     yields a frame first, so the click's own frame paints.
  *  2. Its region ids must equal the current ones, in order.
- *  3. Its stylesheets go in before the current ones and must load first
- *     (four seconds at most; one the memory cache had, readable as it goes
- *     in, counts as loaded then). Every page's sheet is a slice of the same
- *     source in source order, so the old sheet, later in the cascade, keeps
- *     the old markup exactly as it was while the new one loads. A lazy half
+ *  3. Its stylesheets and inline styles are to end in the order its head
+ *     lists them, as on a full load. One already in place stays; a new
+ *     sheet, or one of the fewest that must move, goes in where it belongs
+ *     with `media="not all"`, so the page on screen keeps its look, and must
+ *     load first (four seconds at most; one the memory cache had, readable
+ *     as it goes in, counts as loaded then). A lazy half
  *     (`data-natsu-later`) loads too. A visit overtaken meanwhile removes the
  *     sheets it added. There is no font step: in Chromium a
  *     face the new sheet declares again comes from the memory cache as the
@@ -139,11 +140,13 @@
  *     the head merged by `outerHTML` (only what the server sent: scripts,
  *     nodes a third party added and `<html>` attributes are never touched;
  *     a new element the server vouched for gets the boot nonce, so a page's
- *     own inline `<style>` applies under a nonce `style-src`),
- *     the old stylesheets out, each region unmounted and replaced, scroll
- *     (a jump, as every scroll the runtime makes, whatever `scroll-behavior`
- *     says), focus (kept with `scroll: "keep"`), and the title read out
- *     through a `role=status` element.
+ *     own inline `<style>` applies under a nonce `style-src`), the new
+ *     sheets' own `media` back, inline styles and disabled sheets in their
+ *     places, the stylesheets the page does not list out, each region
+ *     unmounted and replaced, scroll (a jump, as every scroll the runtime
+ *     makes, whatever `scroll-behavior` says), focus (kept with
+ *     `scroll: "keep"`), and the title read out through a `role=status`
+ *     element.
  *  5. The mounts already registered run on the new regions. The listed
  *     scripts this document has not run are created from their entries,
  *     with the boot nonce where the entry says so (which `'strict-dynamic'`
@@ -230,6 +233,21 @@
  */
 
 import type { NatsuClient, NatsuVisitOptions } from "./types.ts";
+
+const keptInPlace = (had: string[], want: string[], weight: number[]): number[] => {
+	const used: number[] = [];
+	const at = want.map((key) => {
+		const i = had.findIndex((k, n) => k == key && !used.includes(n));
+		used.push(i);
+		return i;
+	});
+	const worth = (run: number[]) => run.reduce((sum, i) => sum + weight[i]!, 0);
+	const heavier = (a: number[], b: number[]) => (worth(b) > worth(a) ? b : a);
+	const runs: number[][] = [];
+	at.forEach((c, i) => c < 0 || (runs[i] = [...runs.reduce((best, run, j) => (at[j]! < c ? heavier(best, run) : best), []), i]));
+	const best = runs.reduce(heavier, []);
+	return at.map((c, i) => (best.includes(i) ? c : -1));
+};
 
 declare const NATSU_DEV: boolean | undefined;
 const DEV = typeof NATSU_DEV != "undefined" && NATSU_DEV;
@@ -951,7 +969,12 @@ if (!first && KEY && regions(D)[0]) {
 	);
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
-	const sheets = (doc: { head: Element }) => [...doc.head.querySelectorAll<HTMLLinkElement>(SHEET)];
+	const styles = (doc: { head: Element }) => [...doc.head.querySelectorAll<HTMLElement>("style," + SHEET)];
+	const styleKey = (e: Element) => (e.matches(SHEET) ? `${href(e)} ${e.getAttribute("media")} ${e.hasAttribute("disabled")}` : e.outerHTML);
+	const half = (e: Element | null) => {
+		const p = e?.previousElementSibling;
+		return !!p && e!.matches(SHEET) && p.matches(SHEET) && href(e!) == p.getAttribute(LATER);
+	};
 	const parse = (text: string) => {
 		const inert = D.implementation.createHTMLDocument("");
 		const root = inert.createElement("html");
@@ -1073,20 +1096,42 @@ if (!first && KEY && regions(D)[0]) {
 			// Where the page is, read now: once the new sheets are in, reading it
 			// costs a style pass over the whole page. Every scroll after keeps it.
 			ys.set(cur, scrollY);
-			// Stylesheets go in ahead of the current ones, which keep the page on
-			// screen styled as it is, and must load before anything moves.
-			const want = sheets(doc);
-			const old = sheets(D).filter((l) => owned.has(l));
+			// Stylesheets go in where the new page's head puts them, inert (media
+			// "not all") so the page on screen keeps its look, and must load before
+			// anything moves.
+			const want = styles(doc);
+			const had = styles(D).filter((e) => owned.has(e) && !half(e));
+			const at = keptInPlace(
+				had.map(styleKey),
+				want.map(styleKey),
+				want.map((e) => (e.matches(SHEET) ? 2 : 1)),
+			);
+			const first = had.find((_, i) => at.includes(i)) || had[0];
 			const adds: HTMLLinkElement[] = [];
-			for (const l of want)
-				if (!old.some((o) => href(o) == href(l)))
-					for (const x of [href(l), l.getAttribute(LATER)])
-						if (x) {
-							const c = D.importNode(l);
-							c.setAttribute("href", x);
-							c.nonce = l.nonce;
-							adds.push(c);
-						}
+			const media = new Map<HTMLLinkElement, string | null>();
+			const units = want.map((l, i): Element[] => {
+				const e = had[at[i]!];
+				if (e) return half(e.nextElementSibling) ? [e, e.nextElementSibling!] : [e];
+				if (!l.matches(SHEET) || l.hasAttribute("disabled") || !href(l)) return [l];
+				return [href(l), l.getAttribute(LATER)].filter((x) => x).map((x) => {
+					const c = D.importNode(l as HTMLLinkElement);
+					c.setAttribute("href", x!);
+					c.nonce = l.nonce;
+					media.set(c, c.getAttribute("media"));
+					c.media = "not all";
+					adds.push(c);
+					return c;
+				});
+			});
+			const place = (all?: 1) =>
+				units.reduce<Element | undefined>((prev, u) => {
+					if (!u[0]!.isConnected) {
+						if (!all && !media.has(u[0] as HTMLLinkElement)) return prev;
+						prev ? prev.after(...u) : first ? first.before(...u) : D.head.append(...u);
+					}
+					const tail = u[u.length - 1]!;
+					return half(tail.nextElementSibling) ? tail.nextElementSibling! : tail;
+				}, undefined);
 			const fine =
 				!adds[0] ||
 				(await new Promise<unknown>((y) => {
@@ -1103,7 +1148,7 @@ if (!first && KEY && regions(D)[0]) {
 					const done = (l: HTMLLinkElement) => l.onload && ((l.onload = null), --left || end(1));
 					// The handlers go on before the links go in: a cached sheet may load at once.
 					for (const l of adds) (l.onload = () => done(l)), (l.onerror = () => end(0));
-					old[0] ? old[0].before(...adds) : D.head.append(...adds);
+					place();
 					// A sheet the memory cache held is parsed as it goes in, but its load
 					// event can wait for the next frame: rules that can be read (never
 					// while loading, nor across origins) are a loaded sheet, a frame early.
@@ -1117,9 +1162,6 @@ if (!first && KEY && regions(D)[0]) {
 				if (DEV && n == seq) why("a stylesheet did not load", u.href);
 				return n == seq ? full(u, h) : undefined;
 			}
-			/** Sheets that stay, by the href the server wrote: the new page's and their lazy halves. */
-			const keep = want.flatMap((l) => [href(l), l.getAttribute(LATER)]);
-
 			const swap = () => {
 				// Overtaken during the view transition's first frame (another visit,
 				// a Back): this one is over, and leaves nothing behind.
@@ -1142,17 +1184,20 @@ if (!first && KEY && regions(D)[0]) {
 				h ? put(undefined, f.href) : HI.pushState({ natsu: { id: cur, p: page } }, "", f.href);
 				away = 0;
 				rendered = bare(f);
+				for (const [c, m] of media) m == null ? c.removeAttribute("media") : c.setAttribute("media", m);
+				place(1);
+				const placed = new Set(units.flat());
 				// The head: what is in both stays, what went away goes, what is new comes in.
 				const incoming = new Map<string, Element>();
-				for (const e of doc.head.children) if (!e.matches("script," + SHEET)) incoming.set(e.outerHTML, e);
+				for (const e of doc.head.children) if (!e.matches("script,style," + SHEET)) incoming.set(e.outerHTML, e);
 				for (const e of owned) {
-					if (e.matches(SHEET) ? keep.includes(href(e)) : incoming.delete(e.outerHTML)) continue;
+					if (e.matches("style," + SHEET) ? placed.has(e) : incoming.delete(e.outerHTML)) continue;
 					// A lazy half that the page's own loader linked goes with its sheet.
-					D.head.querySelector(`link[href="${e.getAttribute(LATER)}"]`)?.remove();
+					for (const x of D.head.querySelectorAll(`link[href="${e.getAttribute(LATER)}"]`)) placed.has(x) || x.remove();
 					e.remove();
 					owned.delete(e);
 				}
-				for (const e of [...adds, ...incoming.values()]) owned.add(e);
+				for (const e of [...placed, ...incoming.values()]) owned.add(e);
 				D.head.append(...incoming.values());
 				// Focus inside a region going out: refresh() gives it back to its namesake.
 				const was = D.activeElement;
