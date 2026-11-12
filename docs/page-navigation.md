@@ -86,8 +86,10 @@ the browser.
 
 The server draws a refused form again with `form.values`: every text field
 posted, each cut to 4000 characters, except the secret ones. A field is
-secret when it is natsu's own CSRF field or when its name reads as a
-secret. Names are split
+secret when it is natsu's own CSRF field, when the route's page, layouts or
+partials draw it as `<input type="password">` or with `autocomplete`
+`current-password`, `new-password`, `one-time-code`, `cc-number` or `cc-csc`
+(a static `name` only), or when its name reads as a secret. Names are split
 into words on punctuation and camelCase (`newPassword`, `new_password` and
 `new-password` are `new password`), and a name is secret when a word holds
 `password`, `passwd`, `passphrase`, `passcode`, `secret`, `credential`,
@@ -105,8 +107,9 @@ action("account.save", run, { secretFields: ["recoveryPhrase"], echoFields: ["pi
 ```
 
 `secretFields` hides fields the rule misses; `echoFields` draws again a
-field the name rule hid. The CSRF field is never drawn again, whatever
-`echoFields` says, and nothing a visitor posts changes what is hidden. The runtime puts back what the visitor typed
+field the name rule hid. Neither the CSRF field nor a password input the page
+draws is ever drawn again, whatever `echoFields` says, and nothing a visitor
+posts changes what is hidden. The runtime puts back what the visitor typed
 on top of that, never a hidden, password, file or one-time-code field.
 
 A route that is not `navigable()`, or a path with no route, is refused

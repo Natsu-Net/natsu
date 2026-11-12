@@ -58,6 +58,22 @@ export interface CollectOptions {
 	onAction?: (name: string, loc: Loc) => void;
 	/** Called for every `@href="/path"` in the template itself (not in the partials it includes: each is checked in its own file). */
 	onLink?: (href: string, loc: Loc) => void;
+	onSecretInput?: (name: string) => void;
+}
+
+const SECRET_AUTOCOMPLETE = /(?:^|\s)(?:current-password|new-password|one-time-code|cc-number|cc-csc)(?:\s|$)/i;
+
+function staticAttr(list: readonly Attr[], name: string): string | undefined {
+	for (const attr of list) if (attr.t === "static" && attr.name.toLowerCase() === name) return attr.value;
+	return undefined;
+}
+
+export function secretInputName(tag: string, list: readonly Attr[]): string | undefined {
+	if (tag.toLowerCase() !== "input") return undefined;
+	const field = staticAttr(list, "name");
+	if (!field) return undefined;
+	const password = staticAttr(list, "type")?.trim().toLowerCase() === "password";
+	return password || SECRET_AUTOCOMPLETE.test(staticAttr(list, "autocomplete") ?? "") ? field : undefined;
 }
 
 /** The `{{path}}` holes of an `@href` value, as uwu draws them: each a plain dotted path from the current data. */
@@ -130,6 +146,11 @@ export function collectReads(nodes: readonly TplNode[], options: CollectOptions 
 		}
 	};
 
+	const secretInput = (tag: string, list: readonly Attr[]): void => {
+		const field = options.onSecretInput && secretInputName(tag, list);
+		if (field) options.onSecretInput!(field);
+	};
+
 	const walk = (list: readonly TplNode[]): void => {
 		for (const node of list) {
 			switch (node.t) {
@@ -184,10 +205,12 @@ export function collectReads(nodes: readonly TplNode[], options: CollectOptions 
 				}
 				case "element":
 					attrs(node.attrs, node.loc);
+					secretInput(node.tag, node.attrs);
 					walk(node.children);
 					break;
 				case "elementVoid":
 					attrs(node.attrs, node.loc);
+					secretInput(node.tag, node.attrs);
 					break;
 			}
 		}

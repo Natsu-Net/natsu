@@ -1,5 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { CSRF_FIELD, looksSecret, valuesOf } from "../src/pages/actions.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { CSRF_FIELD, Invalid, type ActionOptions, action, clearActions, looksSecret, valuesOf } from "../src/pages/actions.ts";
+import { compilePageFile } from "../src/pages/compile.ts";
+import { clearSources } from "../src/pages/data.ts";
+import { type PageSite, mountPages } from "../src/pages/mount.ts";
+import { Application } from "../src/server.ts";
+import { type RunningApp, reset, startApp } from "./helpers.ts";
 
 const SECRET_NAMES = [
 	"password",
@@ -267,5 +275,98 @@ describe("which field names a refused form keeps to itself", () => {
 
 	test("the framework's own CSRF field is never drawn again, whatever an app says", () => {
 		expect(valuesOf({ [CSRF_FIELD]: "t" }, { echo: [CSRF_FIELD] })).toEqual({});
+	});
+});
+
+describe("password inputs a page draws", () => {
+	test("are found by type or autocomplete, with a static name", () => {
+		const compiled = compilePageFile(
+			`<template><form>
+<input type="password" name="entry">
+<input type="PASSWORD" name="second">
+<input name="digits" autocomplete="one-time-code">
+<input name="pan" autocomplete="billing cc-number">
+<input name="email" autocomplete="email">
+<input type="password" name="{{field}}">
+<input type="text" name="plain">
+<textarea name="note"></textarea>
+</form></template>`,
+			"index.uwu",
+		);
+		expect(compiled.secretInputs).toEqual(["entry", "second", "digits", "pan"]);
+	});
+
+	test("a page with none carries no list", () => {
+		expect(compilePageFile(`<template><input name="a"></template>`, "index.uwu").secretInputs).toBeUndefined();
+	});
+});
+
+describe("a refused form drawn again", () => {
+	let dir: string;
+	let running: RunningApp | undefined;
+	let site: PageSite | undefined;
+
+	beforeEach(() => {
+		reset({ General: { logFormat: "", logLevel: "silent", url: "https://shop.test" } });
+		clearSources();
+		clearActions();
+		dir = mkdtempSync(join(tmpdir(), "natsu-secret-"));
+	});
+
+	afterEach(async () => {
+		site?.close();
+		site = undefined;
+		await running?.stop();
+		running = undefined;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const FIELDS = ["InviteCode", "RankCardBackground", "entry", "digits", "motto", "pin", "password", "hotpath"];
+
+	async function refuse(options: ActionOptions, fields: Record<string, string>) {
+		const files: Record<string, string> = {
+			"pages/index.uwu": `<page><action save="x.save"></page><template><form @submit="action:save">
+<input name="InviteCode"><input name="RankCardBackground"><input type="password" name="entry">{{> otp}}
+<input name="motto"><input name="pin"><input type="password" name="password"><input name="hotpath">
+</form><pre>{{#each shown}}{{this}};{{/each}}</pre></template>`,
+			"pages/_partials/otp.uwu": `<template><input name="digits" autocomplete="one-time-code"></template>`,
+		};
+		for (const [file, text] of Object.entries(files)) {
+			const full = join(dir, file);
+			mkdirSync(dirname(full), { recursive: true });
+			writeFileSync(full, text);
+		}
+		action("x.save", () => {
+			throw new Invalid({ InviteCode: "taken" });
+		}, options);
+		const app = new Application();
+		site = await mountPages({
+			dir,
+			app,
+			request: { shown: (_ctx, { form }) => FIELDS.filter((name) => name in form.values).map((name) => `${name}=${form.values[name]}`) },
+		});
+		running = await startApp(app);
+		const first = await running.fetch("/");
+		const cookie = first.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+		const token = /name="_csrf" value="([^"]+)"/.exec(await first.text())![1]!;
+		const answer = await running.fetch("/", {
+			method: "POST",
+			redirect: "manual",
+			body: new URLSearchParams({ _action: "save", _csrf: token, ...fields }),
+			headers: { cookie },
+		});
+		expect(answer.status).toBe(422);
+		return /<pre>(.*)<\/pre>/s.exec(await answer.text())![1]!.split(";").filter(Boolean);
+	}
+
+	const typed = Object.fromEntries(FIELDS.map((name) => [name, `v-${name}`]));
+
+	test("keeps ordinary fields and drops the secret ones, the page's password inputs included", async () => {
+		expect(await refuse({}, typed)).toEqual(["InviteCode=v-InviteCode", "RankCardBackground=v-RankCardBackground", "motto=v-motto", "hotpath=v-hotpath"]);
+	});
+
+	test("follows the action's own lists, and never draws a password input again", async () => {
+		const shown = await refuse({ secretFields: ["motto"], echoFields: ["pin", "entry", "digits"] }, typed);
+		expect(shown).toEqual(["InviteCode=v-InviteCode", "RankCardBackground=v-RankCardBackground", "pin=v-pin", "hotpath=v-hotpath"]);
 	});
 });

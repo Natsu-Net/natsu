@@ -183,6 +183,7 @@ interface RouteState extends Drawn {
 	noindex: boolean;
 	/** Short name to action. */
 	actions: Map<string, RouteAction>;
+	secretInputs: ReadonlySet<string>;
 	error?: Drawn;
 }
 
@@ -434,6 +435,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				readsFlash: routeReads.has("flash"),
 				noindex: "viewer" in page.reads || "session" in page.reads,
 				actions: actionsOf(page, layouts),
+				secretInputs: new Set([page, ...layouts].flatMap((file) => file.secretInputs ?? [])),
 				error,
 			});
 		}
@@ -731,7 +733,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 					form: {
 						action: short,
 						errors: result.errors,
-						values: valuesOf(input, { secret: entry.options.secretFields, echo: entry.options.echoFields }),
+						values: valuesOf(input, { secret: [...state.secretInputs, ...(entry.options.secretFields ?? [])], echo: entry.options.echoFields }),
 						message: result.message ?? "",
 					},
 				});
