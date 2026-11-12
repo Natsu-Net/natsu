@@ -20,9 +20,9 @@
  * The pages' stylesheets are cut from one source in source order, as Assets
  * cuts them. A chunk that lacks a rule the current page uses, but repeats an
  * earlier rule competing with it (`.hidden` against `.lg:grid`, or against
- * `.md:flex` for a region-only chunk), hides that element if it lands after
- * the old sheet; the runtime inserts it before, so the old sheet keeps
- * winning until the swap removes it.
+ * `.md:flex` for a region-only chunk), hides that element if it applies
+ * after the old sheet; the runtime links it inert (`media="not all"`) until
+ * the swap removes the old one, so the old sheet keeps winning until then.
  *
  * The last test measures: bytes on the wire for a full load and a part of
  * the same page, the time a full load and a soft visit take in the browser
@@ -285,6 +285,63 @@ describe("page switching in Chromium, against a natsu app", () => {
 		const sheets = await page.evaluate(() => [...document.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute("href")));
 		expect(sheets).toEqual([await sheetOf("/b")]);
 		expect(await page.evaluate(() => getComputedStyle(document.querySelector("main h1")!).color)).toBe("rgb(200, 0, 0)");
+		await page.context().close();
+	});
+
+	e2e("stylesheets end in the order a full load of the page has, however the visitor got there", async () => {
+		const shown = (page: any) =>
+			page.evaluate(() => ({
+				title: document.title,
+				sheets: [...document.querySelectorAll('link[rel="stylesheet"]')].map((l) => l.getAttribute("href")),
+				margin: document.getElementById("order") && getComputedStyle(document.getElementById("order")!).marginTop,
+			}));
+		const loaded: Record<string, unknown> = {};
+		for (const path of ["/a", "/s1", "/s12", "/s21"]) {
+			const page = await open(path);
+			loaded[path] = await shown(page);
+			await page.context().close();
+		}
+		expect([loaded["/s1"], loaded["/s12"], loaded["/s21"]].map((s: any) => s.margin)).toEqual(["11px", "22px", "11px"]);
+		const titles: Record<string, string> = { "/a": "A", "/s1": "S1", "/s12": "S12", "/s21": "S21" };
+		const page = await open("/a");
+		const visit = async (path: string) => {
+			await page.evaluate((p: string) => (window as any).natsu.visit(p), path);
+			await title(page, titles[path]!);
+			expect(await shown(page)).toEqual(loaded[path]);
+		};
+		for (const path of ["/s12", "/a", "/s12", "/s1", "/s21", "/s12", "/s21"]) await visit(path);
+		await page.goBack();
+		await title(page, "S12");
+		expect(await shown(page)).toEqual(loaded["/s12"]);
+		await page.goBack();
+		await title(page, "S21");
+		expect(await shown(page)).toEqual(loaded["/s21"]);
+		await page.goForward();
+		await title(page, "S12");
+		expect(await shown(page)).toEqual(loaded["/s12"]);
+		fixture.state.cssDelay = 300;
+		try {
+			await page.evaluate(() => {
+				const w = window as unknown as { __seen: Set<string>; __stop: boolean };
+				w.__seen = new Set();
+				const frame = () => {
+					const order = document.getElementById("order");
+					if (order) w.__seen.add(`${document.title} ${getComputedStyle(order).marginTop}`);
+					if (!w.__stop) requestAnimationFrame(frame);
+				};
+				frame();
+			});
+			await visit("/s21");
+			await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+			const seen: string[] = await page.evaluate(() => ((window as any).__stop = true) && [...(window as any).__seen]);
+			expect(seen.sort()).toEqual(["S12 22px", "S21 11px"]);
+		} finally {
+			fixture.state.cssDelay = 0;
+		}
+		expect(await loads(page)).toBe(1);
+		await page.evaluate(() => (window as any).natsu.visit("/s-broken"));
+		await title(page, "Broken");
+		expect(await loads(page)).toBe(2);
 		await page.context().close();
 	});
 
