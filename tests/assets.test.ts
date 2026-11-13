@@ -530,6 +530,15 @@ describe("minification", () => {
 		expect(report.sizes.site!.to).toBeLessThan(report.sizes.site!.from);
 		expect(small.url("site")).not.toBe(large.url("site"));
 	});
+
+	test("styles and scripts can each be minified alone", async () => {
+		writeFileSync(join(dir, "app.js"), "export const answer   =   42;\n");
+		const styles = await assets({ minify: { styles: true }, scripts: { app: join(dir, "app.js") } }).build();
+		const scripts = await assets({ minify: { scripts: true }, scripts: { app: join(dir, "app.js") } }).build();
+		expect(styles.sizes.site!.to).toBeLessThan(styles.sizes.site!.from);
+		expect(scripts.sizes.site!.to).toBe(scripts.sizes.site!.from);
+		expect(styles.sizes.app!.to).toBeGreaterThan(scripts.sizes.app!.to);
+	});
 });
 
 describe("what is left alone", () => {

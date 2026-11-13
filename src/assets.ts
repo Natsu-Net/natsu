@@ -62,9 +62,9 @@ export interface AssetsOptions {
 	publicPath?: string;
 	/**
 	 * Minify. Off in development by default, where a readable stack trace is
-	 * worth more than the bytes.
+	 * worth more than the bytes. `{ styles, scripts }` turns each on alone.
 	 */
-	minify?: boolean;
+	minify?: boolean | { styles?: boolean; scripts?: boolean };
 	/**
 	 * Module entry points, by name: the name is what `url()` takes.
 	 *
@@ -472,7 +472,7 @@ export class Assets {
 
 		// A slice of an already minified sheet is minified; shaking it is a
 		// third of the work of shaking the source and minifying the result.
-		const minify = (css: string) => (this.options.minify && !this.sourcesMinified ? minifyCSS(css).css : css);
+		const minify = (css: string) => (this.minifies("styles") && !this.sourcesMinified ? minifyCSS(css).css : css);
 		if (!this.options.lazyStyles) {
 			const body = minify(shakeCSS(source, profile, { safelist: this.safelist }).css);
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
@@ -638,6 +638,7 @@ export class Assets {
 	// --- building ------------------------------------------------------------
 
 	private async buildStyles(): Promise<void> {
+		const minify = this.minifies("styles");
 		for (const [name, files] of Object.entries(this.options.styles ?? {})) {
 			const parts: string[] = [];
 			for (const file of files) {
@@ -650,16 +651,22 @@ export class Assets {
 			const joined = parts.join("\n");
 			const source = this.classes.size > 0 ? renameCSSClasses(joined, this.classes) : joined;
 
-			const body = this.options.minify ? minifyCSS(source).css : source;
+			const body = minify ? minifyCSS(source).css : source;
 			// Pages are cut from the minified sheet, so no slice is minified again.
 			this.sources.set(name, body);
 			this.names.set(name, this.namesOf(body));
-			this.sourcesMinified = Boolean(this.options.minify);
+			this.sourcesMinified = minify;
 			const url = this.hold(`${name}.${hash(body)}.css`, body, "text/css; charset=utf-8");
 			this.pin(url);
 			this.entries.set(name, url);
 			this.report.sizes[name] = { from: joined.length, to: body.length };
 		}
+	}
+
+	/** Whether `minify` turns on minification for this kind of entry. */
+	private minifies(kind: "styles" | "scripts"): boolean {
+		const minify = this.options.minify;
+		return typeof minify === "object" ? Boolean(minify[kind]) : Boolean(minify);
 	}
 
 	/** Decide which classes can be renamed, and to what. */
@@ -733,7 +740,7 @@ export class Assets {
 			// What makes two entry points that import the same module ship it
 			// once: the shared part becomes a chunk they both import.
 			splitting: true,
-			minify: this.options.minify ?? false,
+			minify: this.minifies("scripts"),
 			naming: { entry: "[name].[hash].[ext]", chunk: "[name].[hash].[ext]", asset: "[name].[hash].[ext]" },
 		});
 
@@ -768,7 +775,7 @@ export class Assets {
 				target: "browser",
 				format: "iife",
 				splitting: false,
-				minify: this.options.minify ?? false,
+				minify: this.minifies("scripts"),
 			});
 			if (!built.success || !built.outputs[0]) {
 				for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
