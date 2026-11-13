@@ -881,7 +881,9 @@ export class Assets {
 	private async buildFamilies(name: string, parts: string[], minify: boolean): Promise<void> {
 		const options = this.familyOptions!;
 		const paths = options.samples ?? this.options.mangle?.markup;
-		const samples = paths ? (await readAll(paths)).map((text) => profileDocument(text).classes) : undefined;
+		// What the safelist names counts on every sample page, as it does on every page.
+		const safe = [...selectorNames(parts.join("\n")).classes].filter((name) => this.safe(name));
+		const samples = paths ? (await readAll(paths)).map((text) => new Set([...profileDocument(text).classes, ...safe])) : undefined;
 		const partition = partitionCSS(parts, { ...options, samples });
 		const renamed = (css: string) => (this.classes.size > 0 ? renameCSSClasses(css, this.classes) : css);
 		for (const chunk of partition.chunks) {
