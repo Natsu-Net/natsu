@@ -151,3 +151,41 @@ describe("families chunking", () => {
 		expect(css).not.toContain(".mu-card__part4");
 	});
 });
+
+describe("mount()", () => {
+	const MOUNT = join(import.meta.dir, "..", "src", "client", "mount.ts");
+	async function mounts() {
+		writeFileSync(join(dir, "app.js"), `import { mount } from ${JSON.stringify(MOUNT)};\nmount("[data-editor]", () => import("./editor.js"));\nconst which = location.hash;\nmount(which, () => import("./other.js"));\nif (window.later) import("./late.js");\n`);
+		writeFileSync(join(dir, "editor.js"), 'export function mount(el) { el.className = "pm-row__cell2"; }\n');
+		writeFileSync(join(dir, "other.js"), 'export function mount(el) { el.className = "mu-card__part5"; }\n');
+		writeFileSync(join(dir, "late.js"), "export const late = 1;\n");
+		new Router().get("/with", () => page('<div data-editor></div>', '<script type="module" src="/js/app.js"></script>'));
+		new Router().get("/without", () => page("<p>x</p>", '<script type="module" src="/js/app.js"></script>'));
+		return pipeline({ scripts: { app: join(dir, "app.js") } });
+	}
+	const names = (report: Awaited<ReturnType<typeof pipeline>>["report"], html: string) =>
+		sheets(html.replace(/ data-natsu-families='[^']*'/, "")).map((url) => report.families!.site!.chunks.find((chunk) => chunk.url === url)!.name);
+
+	test("a module loaded through mount counts only for pages its selector may match", async () => {
+		const { app, report } = await mounts();
+		expect(names(report, await (await get(app, "/with")).text())).toEqual(["core", "mu", "pm"]);
+		expect(names(report, await (await get(app, "/without")).text())).toEqual(["core", "mu"]);
+	});
+
+	test("the report lists each mount and what else the entry imports later", async () => {
+		const { report } = await mounts();
+		const app = report.mounts!.app!;
+		expect(app.sites.map((site) => [site.selector, site.families])).toEqual([["[data-editor]", ["site.pm"]]]);
+		expect(app.dynamic.length).toBe(2);
+	});
+
+	test("the core link carries the manifest the client reads, in link order", async () => {
+		const { app, report } = await mounts();
+		const html = await (await get(app, "/without")).text();
+		const urls = report.families!.site!.chunks.map((chunk) => chunk.url);
+		const manifest = /data-natsu-families='([^']*)'/.exec(html)![1]!;
+		expect(JSON.parse(manifest.replace(/&#39;/g, "'").replace(/&amp;/g, "&"))).toEqual({ c: urls, m: { "[data-editor]": [2] } });
+		expect(html.indexOf(urls[0]!)).toBeLessThan(html.indexOf("data-natsu-families"));
+		expect(sheets(html.replace(/ data-natsu-families='[^']*'/, ""))).toEqual([urls[0]!, urls[1]!]);
+	});
+});
