@@ -18,10 +18,14 @@
  * linked, each at its place in the sheet's link order, and loaded before its
  * `mount` runs, so what it draws is never shown unstyled, even on a page the
  * server did not expect it on. Assets finds `mount` calls whose selector and
- * specifier are plain string literals at build and hands each core
- * stylesheet link the manifest (`data-natsu-families`): the sheet's chunks in
- * link order, and per selector the families its module can need. A new link
- * carries the core link's nonce, so it applies under a nonce `style-src` too.
+ * specifier are plain string literals at build, and each core stylesheet link
+ * names a manifest (`data-natsu-families`, an immutable JSON file fetched once,
+ * alongside the module): the sheet's chunks in link order, and per selector
+ * the families its module's classes can need,
+ * each with what else the document must hold for that (a family for
+ * `.mu-card .btn` needs `.mu-card` on the page when the module only draws
+ * `.btn`). A new link carries the core link's nonce, so it applies under a
+ * nonce `style-src` too.
  *
  * Because a family links after others in a fixed order (see uwu-template's
  * `partitionCSS`), this also keeps that order: whenever the head changes, if
@@ -37,22 +41,40 @@ interface Runtime {
 }
 interface Manifest {
 	c: string[];
-	m: Record<string, number[]>;
+	/** Selector -> family (its place in `c`) -> lists of classes; the family is needed when the document has every class of one list. */
+	m: Record<string, Record<string, string[][]>>;
 }
 
 const D = document;
 const SHEET = "link[rel=stylesheet]";
 const MANIFEST = "link[data-natsu-families]";
 const COPY = "data-natsu-copy";
-const read = new Map<string, Manifest>();
+const read = new Map<string, Promise<Manifest | undefined>>();
+const known = new Map<string, Manifest>();
 
-/** Every family sheet on the page that has a manifest: its core link and the manifest. */
+/** A manifest by its URL, fetched once (an immutable file); undefined when it cannot be had. */
+const manifestAt = (url: string): Promise<Manifest | undefined> => {
+	let manifest = read.get(url);
+	if (!manifest)
+		read.set(
+			url,
+			(manifest = fetch(url)
+				.then((answer) => (answer.ok ? (answer.json() as Promise<Manifest>) : undefined))
+				.then((value) => (value && known.set(url, value), value))
+				.catch(() => undefined)),
+		);
+	return manifest;
+};
+
+/** Every family sheet on the page that names a manifest: its core link and the manifest's URL. */
+const cores = (): Array<[HTMLLinkElement, string]> =>
+	[...D.querySelectorAll<HTMLLinkElement>(MANIFEST)].map((link) => [link, link.getAttribute("data-natsu-families")!]);
+
+/** The family sheets whose manifests are in hand. */
 const sheets = (): Array<[HTMLLinkElement, Manifest]> =>
-	[...D.querySelectorAll<HTMLLinkElement>(MANIFEST)].map((link) => {
-		const text = link.getAttribute("data-natsu-families")!;
-		let manifest = read.get(text);
-		if (!manifest) read.set(text, (manifest = JSON.parse(text) as Manifest));
-		return [link, manifest];
+	cores().flatMap(([link, url]) => {
+		const manifest = known.get(url);
+		return manifest ? [[link, manifest] as [HTMLLinkElement, Manifest]] : [];
 	});
 
 /** A stylesheet link that applies now: not inert while a visit loads it, not disabled. */
@@ -68,11 +90,22 @@ const lasts = (manifest: Manifest): Map<number, HTMLLinkElement> => {
 	return out;
 };
 
-/** Link the chunks of every sheet the selector's module can need that the page does not have, and wait for them (four seconds at most). */
+/** Whether the document holds every class of one of the lists. */
+const holds = (lists: string[][]) => lists.some((list) => list.every((name) => D.getElementsByClassName(name).length > 0));
+
+/**
+ * Link the chunks of every sheet the selector's module can need on this page
+ * that it does not have, and wait for them (four seconds at most).
+ */
 const styled = (selector: string): Promise<unknown> =>
+	Promise.all(cores().map(([, url]) => manifestAt(url))).then(() => linkFor(selector));
+
+const linkFor = (selector: string): Promise<unknown> =>
 	Promise.all(
 		sheets().flatMap(([core, manifest]) =>
-			(manifest.m[selector] ?? []).flatMap((n) => {
+			Object.entries(manifest.m[selector] ?? {}).flatMap(([at, lists]) => {
+				const n = Number(at);
+				if (!holds(lists)) return [];
 				const have = lasts(manifest);
 				if (have.has(n)) return [];
 				let before: HTMLLinkElement | undefined;

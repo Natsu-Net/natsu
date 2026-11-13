@@ -22,14 +22,15 @@ afterEach(async () => {
 });
 
 const C = ["/_a/site.c.css", "/_a/site.a.css", "/_a/site.b.css", "/_a/site.d.css"];
-const MANIFEST = JSON.stringify({ c: C, m: { "[data-a]": [1], "[data-ab]": [1, 2] } });
+const MANIFEST = JSON.stringify({ c: C, m: { "[data-a]": { 1: [[]] }, "[data-ab]": { 1: [[]], 2: [[]] }, "[data-x]": { 3: [["host"]] } } });
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function open(head: string, body: string, runtime?: (selector: string, fn: (el: Element, signal: AbortSignal) => unknown) => void): W {
 	const window: W = new Window({ url: "https://shop.test/", settings: { disableCSSFileLoading: true, handleDisabledFileLoadingAsSuccess: true } } as never);
 	windows.push(window);
 	for (const name of ["Map", "Set", "WeakMap", "Promise", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "Math"]) if (window[name] === undefined) window[name] = (globalThis as W)[name];
-	window.document.write(`<!doctype html><html><head><link rel="stylesheet" href="${C[0]}" nonce="n0" data-natsu-families='${MANIFEST}'>${head}</head><body>${body}</body></html>`);
+	window.fetch = async (url: string) => (String(url).endsWith("/_a/site.mounts.json") ? new Response(MANIFEST, { headers: { "content-type": "application/json" } }) : new Response("", { status: 404 }));
+	window.document.write(`<!doctype html><html><head><link rel="stylesheet" href="${C[0]}" nonce="n0" data-natsu-families="/_a/site.mounts.json">${head}</head><body>${body}</body></html>`);
 	if (runtime) window.natsu = { mount: runtime };
 	new Function("window", "document", `with (window) {${CODE}}`)(window, window.document);
 	return window;
@@ -52,6 +53,17 @@ describe("mount", () => {
 		expect(imports).toBe(1);
 		expect(linkedFirst).toBe(true);
 		expect(w.document.querySelector(`link[href="${C[1]}"]`).getAttribute("nonce")).toBe("n0");
+	});
+
+	test("a family the module needs only inside other markup is linked only when the page has it", async () => {
+		const bare = open("", "<div data-x></div>");
+		bare.__mount("[data-x]", async () => ({ mount: () => {} }));
+		await tick(10);
+		expect(sheets(bare)).toEqual([C[0]]);
+		const hosted = open("", '<div class="host"><div data-x></div></div>');
+		hosted.__mount("[data-x]", async () => ({ mount: () => {} }));
+		await tick(10);
+		expect(sheets(hosted)).toEqual([C[0], C[3]]);
 	});
 
 	test("an element a script adds later is mounted, and ended when it goes", async () => {
@@ -93,8 +105,9 @@ describe("mount", () => {
 	});
 
 	test("a family whose last copy ends up before one linking earlier is linked again, in order", async () => {
-		const w = open(`<link rel="stylesheet" href="${C[1]}"><link rel="stylesheet" href="${C[3]}">`, "");
+		const w = open(`<link rel="stylesheet" href="${C[1]}"><link rel="stylesheet" href="${C[3]}">`, "<div data-none></div>");
 		w.__mount("[data-none]", async () => ({ mount: () => {} }));
+		await tick(10);
 		const b = w.document.createElement("link");
 		b.rel = "stylesheet";
 		b.href = C[2];

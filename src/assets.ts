@@ -52,7 +52,7 @@ import {
 	type ScriptClasses,
 	type SelectorNeeds,
 	chunksFor,
-	chunksWritten,
+	familiesNeedingOnly,
 	partitionCSS,
 	profileDocument,
 	scriptClasses,
@@ -292,7 +292,7 @@ export class Assets {
 	private readonly mountSites = new Map<string, MountSite[]>();
 	/** Bun's metafile for the module entries, which ties each output to what it imports and how. */
 	private metafile: Metafile | undefined;
-	/** A family sheet's core URL -> its mount manifest, as the attribute value the core link carries. */
+	/** A family sheet's core URL -> the URL of its mount manifest, which the core link names. */
 	private readonly manifests = new Map<string, string>();
 
 	constructor(options: AssetsOptions) {
@@ -425,9 +425,7 @@ export class Assets {
 		let picked = this.picks.get(key);
 		if (!picked) {
 			const present = families.classes.filter((name) => this.shapes.has(shape, name) || this.safe(name));
-			const chosen = new Set(chunksFor(families.partition, present, uses));
-			for (const site of matched) for (const n of site.families.get(name) ?? []) chosen.add(n);
-			picked = [...chosen].sort((a, b) => a - b);
+			picked = chunksFor(families.partition, present, [...uses, ...matched.map((site) => site.classes)]);
 			if (this.picks.size >= 4096) this.picks.delete(this.picks.keys().next().value!);
 			this.picks.set(key, picked);
 		}
@@ -499,8 +497,8 @@ export class Assets {
 		const manifest = this.manifests.get(core);
 		if (manifest) {
 			const end = page[close - 1] === "/" ? close - 1 : close;
-			page = `${page.slice(0, end)} data-natsu-families='${manifest}'${page.slice(end)}`;
-			close += ` data-natsu-families='${manifest}'`.length;
+			page = `${page.slice(0, end)} data-natsu-families="${manifest}"${page.slice(end)}`;
+			close += ` data-natsu-families="${manifest}"`.length;
 		}
 		if (this.familyOptions?.prefetch) {
 			for (let n = 1; n < urls.length; n++) if (!picked.includes(n)) links += `<link rel="prefetch" href="${urls[n]}" data-natsu-prefetch>`;
@@ -923,34 +921,37 @@ export class Assets {
 		const prefix = `${this.options.publicPath}/`;
 		const graph = this.metafile ? await scriptGraph(this.metafile) : undefined;
 		const textOf = (files: Iterable<string>) => [...files].map((file) => this.files.get(file)?.body ?? "").join("\n;\n");
-		for (const url of this.entries.values()) {
+		for (const [name, url] of this.entries) {
 			if (!url.startsWith(prefix) || !/\.m?js$/.test(url)) continue;
 			const entry = basename(url);
-			if (!graph?.edges.has(entry)) {
+			const source = graph?.entries.get(entry);
+			if (!graph || source === undefined) {
 				this.scriptUses.set(url, scriptClasses(textOf(reachable(entry, (file) => [...this.files.get(file)?.body.matchAll(IMPORTED) ?? []].map((m) => m[1]!).filter((next) => this.files.has(next))))));
 				continue;
 			}
 			const normal = (file: string) => (graph.edges.get(file) ?? []).filter((edge) => !edge.mount).map((edge) => edge.to);
-			this.scriptUses.set(url, scriptClasses(textOf(reachable(entry, normal))));
-			const all = reachable(entry, (file) => (graph.edges.get(file) ?? []).map((edge) => edge.to));
+			const sources = (files: Set<string>) => [...files].map((file) => graph.texts.get(file) ?? "").join("\n;\n");
+			const conservative = reachable(source, normal);
+			this.scriptUses.set(url, scriptClasses(sources(conservative)));
+			const all = reachable(source, (file) => (graph.edges.get(file) ?? []).map((edge) => edge.to));
 			const sites: MountSite[] = [];
 			for (const site of graph.sites) {
 				if (!all.has(site.from)) continue;
-				const classes = scriptClasses(textOf(reachable(site.chunk, normal)));
-				const byName = new Map<string, number[]>();
-				for (const [name, sheet] of this.families) byName.set(name, chunksWritten(sheet.partition, [classes]));
-				sites.push({ id: this.mountSites.size * 1000 + sites.length, selector: site.selector, needs: selectorNeeds(site.selector), chunk: site.chunk, families: byName });
+				const classes = scriptClasses(sources(reachable(site.module, normal)));
+				const rest = new Map<string, Map<number, string[][]>>();
+				for (const [sheet, families] of this.families) rest.set(sheet, familiesNeedingOnly(families.partition, [classes]));
+				sites.push({ id: this.mountSites.size * 1000 + sites.length, selector: site.selector, needs: selectorNeeds(site.selector), chunk: site.module, classes, rest });
 			}
 			this.mountSites.set(url, sites);
-			const conservative = new Set(reachable(entry, normal));
+			const dynamic = [...conservative].filter((file) => file !== source && [...conservative].some((from) => graph.edges.get(from)?.some((edge) => edge.to === file && edge.dynamic)));
 			this.report.mounts ??= {};
-			this.report.mounts[stemOf(entry)] = {
+			this.report.mounts[name] = {
 				sites: sites.map((site) => ({
 					selector: site.selector,
 					chunk: site.chunk,
-					families: [...site.families].flatMap(([name, list]) => list.map((n) => `${name}.${this.families.get(name)!.partition.chunks[n]!.name}`)),
+					families: [...site.rest].flatMap(([sheet, rest]) => [...rest].filter(([, lists]) => lists.some((list) => list.length === 0)).map(([n]) => `${sheet}.${this.families.get(sheet)!.partition.chunks[n]!.name}`)),
 				})),
-				dynamic: [...conservative].filter((file) => file !== entry && (graph.dynamic.has(file))),
+				dynamic,
 			};
 		}
 		for (const [path, file] of Object.entries(families.scripts ?? {})) {
@@ -960,17 +961,21 @@ export class Assets {
 				log.warn(`[<yellow>assets</yellow>] missing script <cyan>${file}</cyan>`);
 			}
 		}
-		for (const [, families] of this.families) {
-			const mounts: Record<string, number[]> = {};
+		for (const [name, families] of this.families) {
+			const mounts: Record<string, Record<number, string[][]>> = {};
 			for (const sites of this.mountSites.values()) {
 				for (const site of sites) {
-					const list = site.families.get([...this.families].find(([, f]) => f === families)![0]) ?? [];
-					if (list.length > 0) mounts[site.selector] = [...new Set([...(mounts[site.selector] ?? []), ...list])].sort((a, b) => a - b);
+					for (const [n, lists] of site.rest.get(name) ?? []) {
+						const own = (mounts[site.selector] ??= {});
+						own[n] = [...(own[n] ?? []), ...lists];
+					}
 				}
 			}
 			if (Object.keys(mounts).length === 0) continue;
-			const json = JSON.stringify({ c: families.urls, m: mounts }).replace(/&/g, "&amp;").replace(/'/g, "&#39;");
-			this.manifests.set(families.urls[0]!, json);
+			const json = JSON.stringify({ c: families.urls, m: mounts });
+			const url = this.hold(`${name}.mounts.${hash(json)}.json`, json, "application/json; charset=utf-8");
+			this.pin(url);
+			this.manifests.set(families.urls[0]!, url);
 		}
 	}
 
@@ -1267,7 +1272,7 @@ export class Assets {
 		// A name this pipeline gave carries the hash of its contents: a file
 		// that does not match it (cut short by a crash before writes were
 		// atomic) is not that chunk, and must never go out as immutable.
-		const named = /\.([0-9a-f]{10})\.(?:css|m?js)$/.exec(file)?.[1];
+		const named = /\.([0-9a-f]{10})\.(?:css|m?js|json)$/.exec(file)?.[1];
 		if (named !== undefined && hash(body) !== named) return undefined;
 		if (!this.files.has(file)) {
 			this.keep(file, body, type);
@@ -1328,63 +1333,64 @@ interface MountSite {
 	selector: string;
 	/** What a page must hold to match the selector; undefined when it cannot be read: every page may. */
 	needs: SelectorNeeds[] | undefined;
-	/** The output chunk the loader imports. */
+	/** The source module the loader imports. */
 	chunk: string;
-	/** Family sheet -> the families that chunk and what it imports can need. */
-	families: Map<string, number[]>;
+	/** What that chunk and what it imports can write. */
+	classes: ScriptClasses;
+	/** Family sheet -> family -> what else a page must hold for those classes to need it (see `familiesNeedingOnly`). */
+	rest: Map<string, Map<number, string[][]>>;
 }
 
 /** The part of Bun's metafile this reads. */
 interface Metafile {
-	inputs: Record<string, { imports: Array<{ path: string; kind: string; original?: string }> }>;
-	outputs: Record<string, { imports: Array<{ path: string; kind: string }>; inputs: Record<string, unknown> }>;
+	inputs: Record<string, { imports: Array<{ path: string; kind: string; original?: string; entryPoint?: string }> }>;
+	outputs: Record<string, { entryPoint?: string }>;
+}
+
+interface ScriptGraph {
+	/** Source -> what it imports: statically, by `import()`, and whether that `import()` is only ever a mount's loader. */
+	edges: Map<string, Array<{ to: string; dynamic: boolean; mount: boolean }>>;
+	sites: Array<{ selector: string; from: string; module: string }>;
+	texts: Map<string, string>;
+	/** Output file -> the source it was built from, for entries and dynamically imported modules. */
+	entries: Map<string, string>;
 }
 
 /**
- * The output graph of a module build: each output's imports, a dynamic one
- * marked `mount` when every source in that output that imports it does so
- * only through `mount("<selector>", () => import("<module>"))`; the mount call
- * sites found; and every output some edge imports dynamically.
+ * The source graph of a module build, from Bun's metafile: each source's
+ * static imports and dynamic ones, a dynamic one marked `mount` when every
+ * `import()` of it in that source is the loader of a `mount("<selector>",
+ * () => import("<module>"))` call; the mount sites found; the source each
+ * output was built from; and each source's text. Read per source rather than
+ * per output, because a shared output chunk holds modules a page may never
+ * load.
  */
-async function scriptGraph(metafile: Metafile): Promise<{ edges: Map<string, Array<{ to: string; mount: boolean }>>; sites: Array<{ selector: string; from: string; chunk: string }>; dynamic: Set<string> }> {
-	const file = (path: string) => basename(path);
-	const outputOf = new Map<string, string>();
-	for (const [output, info] of Object.entries(metafile.outputs)) for (const input of Object.keys(info.inputs)) outputOf.set(input, file(output));
-	const sites: Array<{ selector: string; from: string; chunk: string }> = [];
-	/** Output -> target -> whether every source's dynamic import of it is a mount. */
-	const mountOnly = new Map<string, Map<string, boolean>>();
+async function scriptGraph(metafile: Metafile): Promise<ScriptGraph> {
+	const edges = new Map<string, Array<{ to: string; dynamic: boolean; mount: boolean }>>();
+	const sites: ScriptGraph["sites"] = [];
+	const texts = new Map<string, string>();
 	for (const [input, info] of Object.entries(metafile.inputs)) {
-		const dynamic = info.imports.filter((entry) => entry.kind === "dynamic-import" && entry.original);
-		if (dynamic.length === 0) continue;
-		const from = outputOf.get(input);
-		if (!from) continue;
 		const source = await readFile(input, "utf8").catch(() => "");
-		const found = mountCalls(source);
-		const targets = mountOnly.get(from) ?? new Map<string, boolean>();
-		mountOnly.set(from, targets);
-		for (const entry of dynamic) {
-			const spec = entry.original!;
-			const to = file(entry.path);
-			const calls = found.filter((call) => call.spec === spec);
-			const every = calls.length > 0 && calls.length === countImports(source, spec);
-			targets.set(to, (targets.get(to) ?? true) && every);
-			if (every) for (const call of calls) sites.push({ selector: call.selector, from, chunk: to });
+		texts.set(input, source);
+		const found = info.imports.some((entry) => entry.kind === "dynamic-import") ? mountCalls(source) : [];
+		const list: Array<{ to: string; dynamic: boolean; mount: boolean }> = [];
+		for (const entry of info.imports) {
+			if (entry.kind !== "dynamic-import") {
+				list.push({ to: entry.path, dynamic: false, mount: false });
+				continue;
+			}
+			const to = entry.entryPoint;
+			if (!to) continue;
+			const calls = found.filter((call) => call.spec === entry.original);
+			const mount = calls.length > 0 && calls.length === countImports(source, entry.original ?? "");
+			list.push({ to, dynamic: true, mount });
+			if (mount) for (const call of calls) sites.push({ selector: call.selector, from: input, module: to });
 		}
+		edges.set(input, list);
 	}
-	const edges = new Map<string, Array<{ to: string; mount: boolean }>>();
-	const dynamic = new Set<string>();
-	for (const [output, info] of Object.entries(metafile.outputs)) {
-		const from = file(output);
-		const list = info.imports.map((entry) => {
-			const to = file(entry.path);
-			const isDynamic = entry.kind === "dynamic-import";
-			const mount = isDynamic && mountOnly.get(from)?.get(to) === true && !info.imports.some((other) => other.kind !== "dynamic-import" && file(other.path) === to);
-			if (isDynamic && !mount) dynamic.add(to);
-			return { to, mount };
-		});
-		edges.set(from, list);
-	}
-	return { edges, sites: sites.filter((site) => edges.get(site.from)?.some((edge) => edge.to === site.chunk && edge.mount)), dynamic };
+	const entries = new Map<string, string>();
+	for (const [output, info] of Object.entries(metafile.outputs)) if (info.entryPoint) entries.set(basename(output), info.entryPoint);
+	return { edges, sites, texts, entries };
 }
 
 /**
@@ -1566,6 +1572,7 @@ function fastCopy(body: string, encoding: keyof Encoded): Uint8Array {
 /** The type a chunk is served as, by its extension; undefined for anything else. */
 function typeOf(file: string): string | undefined {
 	if (file.endsWith(".css")) return "text/css; charset=utf-8";
+	if (file.endsWith(".json")) return "application/json; charset=utf-8";
 	if (file.endsWith(".js") || file.endsWith(".mjs")) return "text/javascript; charset=utf-8";
 	return undefined;
 }

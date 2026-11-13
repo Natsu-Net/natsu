@@ -164,7 +164,7 @@ describe("mount()", () => {
 		return pipeline({ scripts: { app: join(dir, "app.js") } });
 	}
 	const names = (report: Awaited<ReturnType<typeof pipeline>>["report"], html: string) =>
-		sheets(html.replace(/ data-natsu-families='[^']*'/, "")).map((url) => report.families!.site!.chunks.find((chunk) => chunk.url === url)!.name);
+		sheets(html.replace(/ data-natsu-families="[^"]*"/, "")).map((url) => report.families!.site!.chunks.find((chunk) => chunk.url === url)!.name);
 
 	test("a module loaded through mount counts only for pages its selector may match", async () => {
 		const { app, report } = await mounts();
@@ -179,13 +179,14 @@ describe("mount()", () => {
 		expect(app.dynamic.length).toBe(2);
 	});
 
-	test("the core link carries the manifest the client reads, in link order", async () => {
+	test("the core link names the manifest the client reads, an immutable file", async () => {
 		const { app, report } = await mounts();
 		const html = await (await get(app, "/without")).text();
 		const urls = report.families!.site!.chunks.map((chunk) => chunk.url);
-		const manifest = /data-natsu-families='([^']*)'/.exec(html)![1]!;
-		expect(JSON.parse(manifest.replace(/&#39;/g, "'").replace(/&amp;/g, "&"))).toEqual({ c: urls, m: { "[data-editor]": [2] } });
-		expect(html.indexOf(urls[0]!)).toBeLessThan(html.indexOf("data-natsu-families"));
-		expect(sheets(html.replace(/ data-natsu-families='[^']*'/, ""))).toEqual([urls[0]!, urls[1]!]);
+		const manifest = /data-natsu-families="([^"]*)"/.exec(html)![1]!;
+		const answer = await get(app, manifest);
+		expect(answer.headers.get("cache-control")).toContain("immutable");
+		expect(await answer.json()).toEqual({ c: urls, m: { "[data-editor]": { 2: [[]] } } });
+		expect(sheets(html.replace(/ data-natsu-families="[^"]*"/, ""))).toEqual([urls[0]!, urls[1]!]);
 	});
 });
