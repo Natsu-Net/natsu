@@ -248,6 +248,12 @@ export class PageShapes {
 		return Bun.hash(bits, Bun.hash(`${this.build}\n${sheet}\n${ids}`)).toString(36);
 	}
 
+	/** Whether a page of this shape carries the class `name`, one some sheet's rules name. */
+	public has(shape: PageShape, name: string): boolean {
+		const bit = this.index.get(name);
+		return bit !== undefined && ((shape.bits[bit >>> 5] ?? 0) & (1 << (bit & 31))) !== 0;
+	}
+
 	/** Values held, for tests. */
 	public get held(): number {
 		return this.written.size + this.renamed.size;

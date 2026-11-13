@@ -6,7 +6,9 @@
  * 1. **Chunking.** A site's stylesheet is written for the whole site, and
  *    every page pays for all of it. Given the markup a page actually
  *    rendered, `uwu-template`'s analyser drops the rules that cannot match,
- *    and what is left is that page's own chunk.
+ *    and what is left is that page's own chunk. With `chunking: "families"`
+ *    the sheet is instead cut once into a core and families that every page
+ *    shares (`docs/css-chunks.md`).
  * 2. **Minification.** JavaScript goes through `Bun.build`, CSS through a
  *    deliberately dull minifier that removes only what is provably not
  *    needed.
@@ -42,7 +44,20 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, brotliCompressSync, constants, gzip, gzipSync } from "node:zlib";
-import { type DocumentProfile, profileDocument, selectorNames, shakeCSS, splitCSS } from "uwu-template/assets";
+import {
+	type CSSPartition,
+	type DocumentProfile,
+	type FamilyOptions,
+	type PartitionReport,
+	type ScriptClasses,
+	chunksFor,
+	partitionCSS,
+	profileDocument,
+	scriptClasses,
+	selectorNames,
+	shakeCSS,
+	splitCSS,
+} from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
 import { addVary, negotiate } from "./compress.ts";
@@ -134,6 +149,15 @@ export interface AssetsOptions {
 	/** Skip the per-page narrowing and serve the whole stylesheet. */
 	wholeStylesheets?: boolean;
 	/**
+	 * How a stylesheet is cut for the pages that link it. `"page"`, the
+	 * default, gives each page the slice its markup can match: the least to
+	 * download for one page, and nothing shared, since two kinds of page
+	 * rarely match the same slice. `"families"` cuts each sheet once, at
+	 * build, into a core every page links and a few families of rules that
+	 * pages share, so a visitor fetches each one once (see `docs/css-chunks.md`).
+	 */
+	chunking?: "page" | "families" | FamilyChunking;
+	/**
 	 * How many page shapes keep their chunk in memory (default 1000). Past
 	 * that the oldest shape is forgotten and its chunk is served from
 	 * `outDir`; a page of that shape builds it again.
@@ -161,6 +185,24 @@ export interface AssetsOptions {
 	pwa?: PwaOptions;
 }
 
+/** The `"families"` chunking, with its settings. */
+export interface FamilyChunking extends FamilyOptions {
+	mode: "families";
+	/**
+	 * Scripts the pipeline does not build, by the path pages link them at
+	 * (`"/js/menu.js"`), mapped to their source file. A page that links one
+	 * gets every family whose classes it can write. The scripts the pipeline
+	 * builds are read on their own, with every chunk they import.
+	 */
+	scripts?: Record<string, string>;
+	/**
+	 * Link the families a page does not use as `rel="prefetch"`, which the
+	 * browser fetches when it is idle; never for a visitor whose browser asks
+	 * to save data. Off by default.
+	 */
+	prefetch?: boolean;
+}
+
 export interface AssetReport {
 	/** Entry name -> the URL of its chunk. */
 	urls: Record<string, string>;
@@ -170,6 +212,8 @@ export interface AssetReport {
 	shared: string[];
 	/** Classes renamed, and classes that had to keep their names. */
 	mangled?: { renamed: number; pinned: number };
+	/** Stylesheet name -> how it was cut, with `"families"` chunking. */
+	families?: Record<string, PartitionReport & { chunks: Array<{ name: string; url: string; bytes: number }> }>;
 }
 
 export class Assets {
@@ -218,6 +262,14 @@ export class Assets {
 	private readonly pwa: Pwa | undefined;
 	/** Reads a page's shape from the class attribute values it has seen before. */
 	private shapes = new PageShapes(new Map(), new Map());
+	/** Stylesheet name -> its families: the cut, each chunk's URL, every class a family needs. */
+	private readonly families = new Map<string, { partition: CSSPartition; urls: string[]; classes: string[] }>();
+	/** Script URL path -> the classes it can write, for `"families"` chunking. */
+	private readonly scriptUses = new Map<string, ScriptClasses>();
+	/** Inline script text -> the classes it can write, the latest few. */
+	private readonly inlineUses = new Map<string, ScriptClasses>();
+	/** A page's shape and scripts -> the chunks it links, the latest few thousand. */
+	private readonly picks = new Map<string, number[]>();
 
 	constructor(options: AssetsOptions) {
 		this.options = { publicPath: "/_a", ...options };
@@ -233,6 +285,9 @@ export class Assets {
 	public async build(): Promise<AssetReport> {
 		await mkdir(this.options.outDir, { recursive: true });
 		this.report = { urls: {}, sizes: {}, shared: [] };
+		this.families.clear();
+		this.scriptUses.clear();
+		this.picks.clear();
 		this.safelist = [...(this.options.safelist ?? [])];
 		await this.planClasses();
 		await this.buildStyles();
@@ -240,6 +295,7 @@ export class Assets {
 		await this.buildScripts();
 		await this.buildClassicScripts();
 		await this.buildFiles();
+		await this.learnScripts();
 		await this.buildPwa();
 		await this.buildNavigation();
 		this.finishPwa();
@@ -285,13 +341,17 @@ export class Assets {
 		const profiled = (): DocumentProfile =>
 			(profile ??= renaming ? renameAndProfile(html, this.classes).profile : profileDocument(page));
 		const resolved = new Map<string, string>();
+		/** A family sheet's core URL -> the sheet: its link is followed by its families' once the page is rewritten. */
+		const grouped = new Map<string, string>();
 		const resolve = (from: string): string => {
 			let url = resolved.get(from);
 			if (url === undefined) {
 				const name = this.options.rewrite?.[from] ?? "";
 				if (this.sources.has(name) && !this.options.wholeStylesheets) {
 					shape ??= this.shapes.read(page);
-					url = this.styleFor(name, shape, profiled);
+					const families = this.families.get(name);
+					url = families ? families.urls[0]! : this.styleFor(name, shape, profiled);
+					if (families) grouped.set(url, name);
 				} else {
 					url = this.url(name);
 				}
@@ -303,6 +363,7 @@ export class Assets {
 			const url = resolve(from);
 			return url && url !== from ? url : undefined;
 		});
+		for (const [core, name] of grouped) out = this.linkFamilies(out, core, this.pick(name, out, shape!));
 		for (const url of resolved.values()) {
 			const lazy = url ? this.lazy.get(url) : undefined;
 			if (!lazy) continue;
@@ -320,6 +381,113 @@ export class Assets {
 			out = `${out.slice(0, tagEnd)}${attribute}${out.slice(tagEnd, close + 1)}${lazyLoader(lazy.url, lazy.triggers, nonce)}${out.slice(close + 1)}`;
 		}
 		return out;
+	}
+
+	/**
+	 * The chunks of the family sheet `name` a page links: the core, then each
+	 * family one of whose selectors needs only classes the page carries, the
+	 * safelist names or its scripts can write. Remembered by the page's shape
+	 * and the scripts it links.
+	 */
+	private pick(name: string, page: string, shape: PageShape): number[] {
+		const families = this.families.get(name)!;
+		const { uses, key: scripts } = this.scriptsOf(page);
+		const key = `${this.shapes.key(name, shape)} ${scripts}`;
+		let picked = this.picks.get(key);
+		if (!picked) {
+			const present = families.classes.filter((name) => this.shapes.has(shape, name) || this.safe(name));
+			picked = chunksFor(families.partition, present, uses);
+			if (this.picks.size >= 4096) this.picks.delete(this.picks.keys().next().value!);
+			this.picks.set(key, picked);
+		}
+		return picked;
+	}
+
+	/** Whether the safelist names this class. */
+	private safe(name: string): boolean {
+		return this.safelist.some((entry) => (typeof entry === "string" ? name === entry || name.includes(entry) : entry.test(name)));
+	}
+
+	/**
+	 * What the scripts of a page can write: each `<script src>` the pipeline
+	 * knows, and each inline script. A script it does not know is not read.
+	 */
+	private scriptsOf(page: string): { uses: ScriptClasses[]; key: string } {
+		const uses: ScriptClasses[] = [];
+		let key = "";
+		SCRIPT_TAG.lastIndex = 0;
+		for (let m = SCRIPT_TAG.exec(page); m; m = SCRIPT_TAG.exec(page)) {
+			const attributes = m[1] ?? "";
+			const src = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attributes);
+			if (src) {
+				const path = (src[1] ?? src[2] ?? src[3] ?? "").replace(/^https?:\/\/[^/]+/i, "").split(/[?#]/)[0]!;
+				const use = this.scriptUses.get(path);
+				if (use) {
+					uses.push(use);
+					key += ` ${path}`;
+				}
+				continue;
+			}
+			const body = m[2] ?? "";
+			if (!body.trim() || /\stype\s*=\s*["']?(?:application\/(?:ld\+)?json|text\/(?:template|x-template|html))/i.test(attributes)) continue;
+			let use = this.inlineUses.get(body);
+			if (!use) {
+				use = scriptClasses(body);
+				if (this.inlineUses.size >= 256) this.inlineUses.delete(this.inlineUses.keys().next().value!);
+				this.inlineUses.set(body, use);
+			}
+			uses.push(use);
+			key += ` #${Bun.hash(body).toString(36)}`;
+		}
+		return { uses, key };
+	}
+
+	/**
+	 * The page with the stylesheet link to `core` followed by a copy of it for
+	 * each family chunk picked, in link order, and with `prefetch` on, a
+	 * prefetch link for each family it did not pick.
+	 */
+	private linkFamilies(page: string, core: string, picked: number[]): string {
+		const urls = [...this.families.values()].find((families) => families.urls[0] === core)?.urls;
+		if (!urls) return page;
+		let tag = "";
+		let close = -1;
+		for (let at = page.indexOf(core); at !== -1 && close === -1; at = page.indexOf(core, at + 1)) {
+			const end = page.indexOf(">", at);
+			const candidate = page.slice(page.lastIndexOf("<", at), end + 1);
+			if (end !== -1 && /^<link\b/i.test(candidate) && /\brel\s*=\s*["']?stylesheet\b/i.test(candidate)) {
+				close = end;
+				tag = candidate;
+			}
+		}
+		if (close === -1) return page;
+		let links = "";
+		for (const n of picked) if (n > 0) links += tag.replace(core, urls[n]!);
+		if (this.familyOptions?.prefetch) {
+			for (let n = 1; n < urls.length; n++) if (!picked.includes(n)) links += `<link rel="prefetch" href="${urls[n]}" data-natsu-prefetch>`;
+		}
+		return `${page.slice(0, close + 1)}${links}${page.slice(close + 1)}`;
+	}
+
+	/**
+	 * An island's answer with the family chunks its markup needs linked at its
+	 * start. The runtime fills the island with it, and a stylesheet link in
+	 * the body applies as it loads, after every sheet in the head. So the
+	 * answer links, from the first family it needs, every family after it in
+	 * link order: whichever of them the page has already, the copy that comes
+	 * last is in link order, which is the order the copies were made for. A
+	 * fragment needing no family is left as it is.
+	 */
+	private islandStyles(ctx: Context, fragment: string): string {
+		if (this.families.size === 0 || ctx.response.headers.get("natsu-island") !== "1") return fragment;
+		const shape = this.shapes.read(fragment);
+		let links = "";
+		for (const [name, families] of this.families) {
+			const from = this.pick(name, fragment, shape)[1];
+			if (from === undefined) continue;
+			for (let n = from; n < families.urls.length; n++) links += `<link rel="stylesheet" href="${families.urls[n]}">`;
+		}
+		return links + fragment;
 	}
 
 	/**
@@ -608,8 +776,10 @@ export class Assets {
 			// A navigation is answered whatever the body, including a page
 			// PageCache kept rewritten: the rewrite runs only for a page worth
 			// cutting, and only if it has not run already.
+			const saveData = this.familyOptions?.prefetch && ctx.request.headers.get("save-data")?.toLowerCase() === "on";
+			const lean = (html: string) => (saveData ? html.replace(PREFETCH_TAG, "") : html);
 			if (navigation && ctx.nav.requested) {
-				navigation.answer(ctx, (html) => (this.rewritten.has(ctx) ? html : this.rewrite(html)));
+				navigation.answer(ctx, (html) => lean(this.rewritten.has(ctx) ? html : this.rewrite(html)));
 				if (ctx.response.headers.get("natsu-part") === "1") this.pwa?.mark(ctx);
 				return;
 			}
@@ -626,11 +796,11 @@ export class Assets {
 			const loaders = nonce ? (page: string) => this.nonceLoaders(page, nonce) : undefined;
 			const kept = this.filled.get(ctx);
 			// Still the body PageCache gave (the same string, so this reads none of it)?
-			if (navigation && kept?.body === body) {
+			if (navigation && kept?.body === body && !saveData) {
 				ctx.response.body = navigation.fullFilled(ctx, body, kept.filled, loaders);
 				return;
 			}
-			const page = !this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body;
+			const page = this.islandStyles(ctx, lean(!this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body));
 			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
 		};
 	}
@@ -660,7 +830,79 @@ export class Assets {
 			this.pin(url);
 			this.entries.set(name, url);
 			this.report.sizes[name] = { from: joined.length, to: body.length };
+			if (this.familyOptions) this.buildFamilies(name, parts, minify);
 		}
+	}
+
+	/**
+	 * Cut a sheet into its core and families, once, from its files as they
+	 * are served (renamed, minified), so no family crosses from one file into
+	 * the next. Every chunk is pinned: any page may link it.
+	 */
+	private buildFamilies(name: string, parts: string[], minify: boolean): void {
+		const files = parts.map((part) => {
+			const renamed = this.classes.size > 0 ? renameCSSClasses(part, this.classes) : part;
+			return minify ? minifyCSS(renamed).css : renamed;
+		});
+		const partition = partitionCSS(files, this.familyOptions);
+		const urls = partition.chunks.map((chunk, n) => {
+			const file = n === 0 ? `${name}.${hash(chunk.css)}.css` : `${name}.${chunk.name.replace(/[^\w-]/g, "_")}.${hash(chunk.css)}.css`;
+			const url = this.hold(file, chunk.css, "text/css; charset=utf-8");
+			this.pin(url);
+			return url;
+		});
+		const classes = [...new Set(partition.chunks.flatMap((chunk) => [...chunk.classes]))];
+		this.families.set(name, { partition, urls, classes });
+		this.report.families ??= {};
+		this.report.families[name] = {
+			...partition.report,
+			chunks: partition.chunks.map((chunk, n) => ({ name: chunk.name, url: urls[n]!, bytes: chunk.css.length })),
+		};
+		log.info(`[<magenta>assets</magenta>] ${name}: core ${partition.chunks[0]!.css.length} B and ${partition.chunks.length - 1} families in ${partition.report.ms.toFixed(0)} ms`);
+	}
+
+	/**
+	 * With `"families"` chunking, read what each script can write: an entry
+	 * with every chunk it imports, statically or not (a page that loads the
+	 * entry may load any of them), a classic script or vendor file as it is,
+	 * and the scripts named in `chunking.scripts` from their source.
+	 */
+	private async learnScripts(): Promise<void> {
+		const families = this.familyOptions;
+		if (!families) return;
+		const prefix = `${this.options.publicPath}/`;
+		for (const url of this.entries.values()) {
+			if (!url.startsWith(prefix) || !/\.m?js$/.test(url)) continue;
+			const seen = new Set<string>([basename(url)]);
+			const queue = [basename(url)];
+			let text = "";
+			while (queue.length > 0) {
+				const body = this.files.get(queue.pop()!)?.body ?? "";
+				text += `${body}\n;\n`;
+				for (const m of body.matchAll(/["'](?:\.\/|\/[\w./-]*\/)?([\w.-]+\.m?js)["']/g)) {
+					const file = m[1]!;
+					if (!seen.has(file) && this.files.has(file)) {
+						seen.add(file);
+						queue.push(file);
+					}
+				}
+			}
+			this.scriptUses.set(url, scriptClasses(text));
+		}
+		for (const [path, file] of Object.entries(families.scripts ?? {})) {
+			try {
+				this.scriptUses.set(path.split(/[?#]/)[0]!, scriptClasses(await readFile(file, "utf8")));
+			} catch {
+				log.warn(`[<yellow>assets</yellow>] missing script <cyan>${file}</cyan>`);
+			}
+		}
+	}
+
+	/** The `"families"` chunking's settings, when it is on. */
+	private get familyOptions(): FamilyChunking | undefined {
+		const chunking = this.options.chunking;
+		if (chunking === "families") return { mode: "families" };
+		return typeof chunking === "object" && chunking.mode === "families" ? chunking : undefined;
 	}
 
 	/** Whether `minify` turns on minification for this kind of entry. */
@@ -972,7 +1214,8 @@ export class Assets {
 		const name = later ? stem.slice(0, -"-later".length) : stem;
 		const url = this.entries.get(name);
 		if (!url || !this.sources.has(name)) return undefined;
-		if (later) return { body: "", type: "text/css; charset=utf-8" };
+		// A family chunk (`site.mu.<hash>.css`) is in the whole sheet too.
+		if (later || basename(file).split(".").length === 4) return { body: "", type: "text/css; charset=utf-8" };
 		return this.files.get(basename(url));
 	}
 }
@@ -998,6 +1241,11 @@ const LOADER_HEAD = LAZY_LOADER_HEAD;
 const LOADER_MIDDLE = ',c=n=>n.nodeType==1&&(n.matches(S)||!!n.querySelector(S)),o=new MutationObserver(m=>{for(const r of m)if(r.type=="attributes"?c(r.target):[...r.addedNodes].some(c))return g()}),g=()=>{if(d)return;d=1;o.disconnect();for(const e of E)removeEventListener(e,g,!0);const l=document.createElement("link");l.rel="stylesheet";l.href=';
 /** Its text after the URL. */
 const LOADER_TAIL = ';a.after(l)};S&&o.observe(document.documentElement,{subtree:!0,childList:!0,attributes:!0,attributeFilter:["class","id"]});for(const e of E)addEventListener(e,g,{capture:!0,passive:!0})})()</script>';
+/** Every script tag: its attributes and its text. */
+const SCRIPT_TAG = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+/** The prefetch links `"families"` chunking writes. */
+const PREFETCH_TAG = /<link rel="prefetch" href="[^"]*" data-natsu-prefetch>/g;
+
 /** A lazy loader as `rewrite` writes it, before any answer's nonce. */
 const LOADER_START = `<script>${LOADER_HEAD}`;
 
