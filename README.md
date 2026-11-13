@@ -30,6 +30,7 @@ An app depends on it with `"natsu": "file:../natsu"`.
 - [DESIGN.md](DESIGN.md): architecture and the move off Deno
 - [docs/page-navigation.md](docs/page-navigation.md): client navigation
 - [docs/pwa.md](docs/pwa.md): installable app, offline and update toast
+- [docs/css-chunks.md](docs/css-chunks.md): per-page CSS slices or shared families
 - `example/` and `example-pages/`: runnable apps
 
 ## v1
