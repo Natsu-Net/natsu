@@ -46,9 +46,13 @@ interface Manifest {
 }
 
 const D = document;
+declare const NATSU_FIRST_LOAD: boolean | undefined;
+declare const NATSU_CHUNKS: boolean | undefined;
+const FIRST = typeof NATSU_FIRST_LOAD == "undefined" || NATSU_FIRST_LOAD;
+const HINTS = typeof NATSU_CHUNKS == "undefined" || NATSU_CHUNKS;
 const CRITICAL = "data-natsu-critical";
-const SHEET = `link[rel=stylesheet],style[${CRITICAL}]`;
-const MANIFEST = `link[data-natsu-families],style[${CRITICAL}][data-natsu-families]`;
+const SHEET = FIRST ? `link[rel=stylesheet],style[${CRITICAL}]` : "link[rel=stylesheet]";
+const MANIFEST = FIRST ? `link[data-natsu-families],style[${CRITICAL}][data-natsu-families]` : "link[data-natsu-families]";
 const CHUNKS = 'meta[name="natsu-chunks"]';
 const COPY = "data-natsu-copy";
 const read = new Map<string, Promise<Manifest | undefined>>();
@@ -86,7 +90,7 @@ const live = (link: HTMLLinkElement) => link.media != "not all" && !link.disable
 const lasts = (manifest: Manifest): Map<number, HTMLLinkElement> => {
 	const out = new Map<number, HTMLLinkElement>();
 	for (const link of D.querySelectorAll<HTMLLinkElement>(SHEET)) {
-		const at = manifest.c.indexOf((link.getAttribute(CRITICAL) ?? link.getAttribute("href"))!);
+		const at = manifest.c.indexOf((FIRST ? (link.getAttribute(CRITICAL) ?? link.getAttribute("href")) : link.getAttribute("href"))!);
 		if (at >= 0 && live(link)) out.set(at, link);
 	}
 	return out;
@@ -151,7 +155,7 @@ const order = (): void => {
 		let tail = [...have.values()].reduce((a, b) => (position(a) > position(b) ? a : b)) as Element;
 		for (const rank of ranks.slice(from)) {
 			const old = have.get(rank)!;
-			const copy = old.cloneNode(old.hasAttribute(CRITICAL)) as HTMLLinkElement;
+			const copy = (FIRST ? old.cloneNode(old.hasAttribute(CRITICAL)) : old.cloneNode()) as HTMLLinkElement;
 			copy.setAttribute(COPY, "");
 			copy.removeAttribute("data-natsu-families");
 			tail.after(copy);
@@ -161,13 +165,13 @@ const order = (): void => {
 	}
 };
 
-let hinted = false;
 let watching = false;
 /** Keep the order whenever a stylesheet link comes, goes, or starts or stops applying. */
 const watch = () => {
 	if (watching) return;
 	watching = true;
-	const touches = (nodes: NodeList) => [...nodes].some((node) => node.nodeName == "LINK" || (node.nodeName == "STYLE" && (node as Element).hasAttribute(CRITICAL)));
+	const touches = (nodes: NodeList) =>
+		[...nodes].some((node) => (FIRST ? node.nodeName == "LINK" || (node.nodeName == "STYLE" && (node as Element).hasAttribute(CRITICAL)) : node.nodeName == "LINK"));
 	new MutationObserver((records) => {
 		if (records.some((record) => record.type == "attributes" || touches(record.addedNodes) || touches(record.removedNodes))) order();
 	}).observe(D.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["media", "disabled", "href"] });
@@ -210,7 +214,7 @@ export function mount<E extends Element = Element>(selector: string, load: () =>
 	watch();
 	const runtime = (window as { natsu?: Runtime }).natsu;
 	const boot = () => {
-		if (!hinted && D.querySelector(CHUNKS)) {
+		if (HINTS && !hinted && D.querySelector(CHUNKS)) {
 			hinted = true;
 			import("./idle.ts").then((idle) => idle.idlePrefetch()).catch(() => {});
 		}
@@ -238,3 +242,4 @@ const sweep = () => {
 		entry[1]();
 	}
 };
+let hinted = false;

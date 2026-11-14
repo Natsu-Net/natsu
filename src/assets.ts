@@ -1373,6 +1373,10 @@ export class Assets {
 		return typeof chunking === "object" && chunking.mode === "families" ? chunking : undefined;
 	}
 
+	private get runtimeFlags(): Record<string, string> {
+		return { NATSU_FIRST_LOAD: String(Boolean(this.options.firstLoad)), NATSU_CHUNKS: String(Boolean(this.options.prefetchChunks)) };
+	}
+
 	/** Whether `minify` turns on minification for this kind of entry. */
 	private minifies(kind: "styles" | "scripts"): boolean {
 		const minify = this.options.minify;
@@ -1469,6 +1473,7 @@ export class Assets {
 			// once: the shared part becomes a chunk they both import.
 			splitting: true,
 			minify: this.minifies("scripts"),
+			define: this.runtimeFlags,
 			naming: { entry: "[name].[hash].[ext]", chunk: "[name].[hash].[ext]", asset: "[name].[hash].[ext]" },
 			metafile: Boolean(this.familyOptions || this.options.prefetchChunks || this.options.firstLoad?.preload),
 		} as Parameters<typeof Bun.build>[0]);
@@ -1536,6 +1541,7 @@ export class Assets {
 				format: "iife",
 				splitting: false,
 				minify: this.minifies("scripts"),
+				define: this.runtimeFlags,
 			});
 			if (!built.success || !built.outputs[0]) {
 				for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
@@ -1587,6 +1593,7 @@ export class Assets {
 			minify: !dev,
 			define: {
 				NATSU_DEV: dev ? "true" : "false",
+				...this.runtimeFlags,
 				"process.env.NODE_ENV": JSON.stringify(dev ? "development" : "production"),
 			},
 		});

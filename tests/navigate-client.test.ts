@@ -39,7 +39,7 @@ const ORIGIN = "https://shop.test";
 
 /** The runtime as it ships: one classic script, minified. */
 async function build(dev: boolean): Promise<string> {
-	const out = await Bun.build({ entrypoints: [ENTRY], format: "iife", minify: true, define: { NATSU_DEV: String(dev) } });
+	const out = await Bun.build({ entrypoints: [ENTRY], format: "iife", minify: true, define: { NATSU_DEV: String(dev), NATSU_FIRST_LOAD: "true", NATSU_CHUNKS: "true" } });
 	if (!out.success) throw new AggregateError(out.logs, "navigate.ts did not build");
 	return out.outputs[0]!.text();
 }
