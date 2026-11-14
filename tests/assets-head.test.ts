@@ -140,3 +140,32 @@ describe("insertHeadTags", () => {
 		expect(out).toContain('<title>two</title><meta property="og:title" content="Page two"></head>');
 	});
 });
+
+describe("insertHeadTags and raw text", () => {
+	const tag = `<link rel="canonical" href="/a">`;
+
+	test("a head close inside a script, style, title or comment is not the head's end", () => {
+		for (const raw of [
+			`<script>var s = "</head>";</script>`,
+			`<script type="application/ld+json">{"a":"</head>"}</script>`,
+			`<style>a::after{content:"</head>"}</style>`,
+			`<!-- </head> -->`,
+			`<title>a </head> b</title>`,
+		]) {
+			const html = `<html><head>${raw}<meta charset="utf-8"></head><body></body></html>`;
+			expect(insertHeadTags(html, tag)).toBe(`<html><head>${raw}<meta charset="utf-8">${tag}</head><body></body></html>`);
+		}
+	});
+
+	test("raw text that never closes leaves the page as it is", () => {
+		const html = `<html><head><script>var s = "</head>";`;
+		expect(insertHeadTags(html, tag)).toBe(html);
+	});
+
+	test("a long run of opening angle brackets stays linear", () => {
+		const html = `<html><head>${"<script".repeat(50_000)}${"<".repeat(50_000)}</head>`;
+		const started = performance.now();
+		insertHeadTags(html, tag);
+		expect(performance.now() - started).toBeLessThan(1000);
+	});
+});

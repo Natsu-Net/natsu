@@ -131,9 +131,32 @@ function referenced(present: string, tag: HeadTag["tag"], url: string): boolean 
 	return false;
 }
 
+const HEAD_CLOSE = /<\/head\s*>/iy;
+const RAW_OPEN = /<(script|style|title|textarea)(?=[\s/>])/iy;
+
 function headEnd(html: string): number | undefined {
-	const match = /<\/head\s*>/i.exec(html);
-	return match ? match.index : undefined;
+	for (let at = html.indexOf("<"); at !== -1; at = html.indexOf("<", at)) {
+		if (html.startsWith("<!--", at)) {
+			const end = html.indexOf("-->", at + 4);
+			if (end === -1) return undefined;
+			at = end + 3;
+			continue;
+		}
+		HEAD_CLOSE.lastIndex = at;
+		if (HEAD_CLOSE.test(html)) return at;
+		RAW_OPEN.lastIndex = at;
+		const raw = RAW_OPEN.exec(html);
+		if (!raw) {
+			at++;
+			continue;
+		}
+		const close = new RegExp(`</${raw[1]}(?=[\\s/>])`, "gi");
+		close.lastIndex = at + raw[0].length;
+		const end = close.exec(html);
+		if (!end) return undefined;
+		at = end.index + end[0].length;
+	}
+	return undefined;
 }
 
 export function renderHeadTags(tags: HeadTag[], options: HeadRenderOptions = {}): string {
