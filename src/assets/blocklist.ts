@@ -1,5 +1,16 @@
 import type { AssetRule, BlockMatcher } from "./contract.ts";
 
+const AUTHORITY = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?(?:[\\/]{2}[^\\/?#]*)?/;
+
+function canonical(ref: string): string {
+	const text = ref
+		.replace(/[\t\n\r]/g, "")
+		.trim()
+		.replace(/&(?:amp|#0*38|#x0*26);/gi, "&");
+	const head = AUTHORITY.exec(text)![0];
+	return head.toLowerCase().replace(/\\/g, "/") + text.slice(head.length);
+}
+
 export function blockMatcher(rules: AssetRule[] | undefined): BlockMatcher {
 	if (rules === undefined || rules.length === 0) return () => false;
 	const exact = new Set<string>();
@@ -7,8 +18,14 @@ export function blockMatcher(rules: AssetRule[] | undefined): BlockMatcher {
 	const patterns: RegExp[] = [];
 	for (const rule of rules) {
 		if (typeof rule === "string") {
-			if (rule.endsWith("*")) prefixes.push(rule.slice(0, -1));
-			else exact.add(rule);
+			const plain = canonical(rule);
+			if (rule.endsWith("*")) {
+				prefixes.push(rule.slice(0, -1));
+				if (plain !== rule && plain.endsWith("*")) prefixes.push(plain.slice(0, -1));
+			} else {
+				exact.add(rule);
+				exact.add(plain);
+			}
 		} else if (rule instanceof RegExp) {
 			patterns.push(rule);
 		} else {
@@ -20,8 +37,7 @@ export function blockMatcher(rules: AssetRule[] | undefined): BlockMatcher {
 		for (const prefix of prefixes) if (ref.startsWith(prefix)) return true;
 		return false;
 	};
-	return (ref: string): boolean => {
-		if (typeof ref !== "string") return false;
+	const blocks = (ref: string): boolean => {
 		if (matches(ref)) return true;
 		if (ref.startsWith("//") && matches(`https:${ref}`)) return true;
 		for (const pattern of patterns) {
@@ -31,5 +47,11 @@ export function blockMatcher(rules: AssetRule[] | undefined): BlockMatcher {
 			if (hit) return true;
 		}
 		return false;
+	};
+	return (ref: string): boolean => {
+		if (typeof ref !== "string") return false;
+		if (blocks(ref)) return true;
+		const plain = canonical(ref);
+		return plain !== ref && blocks(plain);
 	};
 }

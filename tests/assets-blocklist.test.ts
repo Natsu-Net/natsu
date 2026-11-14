@@ -33,12 +33,13 @@ describe("blockMatcher", () => {
 		expect(blockMatcher(["//ads.example/*"])("//ads.example/tag.js")).toBe(true);
 	});
 
-	test("matching never decodes or normalises", () => {
+	test("scheme and host are read without case, the path is never decoded", () => {
 		const blocked = blockMatcher(["https://ads.example/tag.js"]);
-		expect(blocked("https://ADS.example/tag.js")).toBe(false);
+		expect(blocked("https://ADS.example/tag.js")).toBe(true);
+		expect(blocked(" https://ads.example/tag.js")).toBe(true);
 		expect(blocked("https://ads.example/%74ag.js")).toBe(false);
 		expect(blocked("https://ads.example/./tag.js")).toBe(false);
-		expect(blocked(" https://ads.example/tag.js")).toBe(false);
+		expect(blocked("https://ads.example/TAG.js")).toBe(false);
 	});
 
 	test("a RegExp is tested against the ref as written", () => {
@@ -62,5 +63,26 @@ describe("blockMatcher", () => {
 
 	test("a rule of another type is refused when the matcher is built", () => {
 		expect(() => blockMatcher([42 as unknown as string])).toThrow("block rule");
+	});
+
+	test("a ref the browser reads as the same URL is blocked however it is spelled", () => {
+		const blocked = blockMatcher(["https://ads.example.com/*", "https://t.example.com/p.js?a=1&b=2"]);
+		expect(blocked("HTTPS://ADS.EXAMPLE.COM/x.js")).toBe(true);
+		expect(blocked("Https://Ads.Example.Com/x.js")).toBe(true);
+		expect(blocked("//ADS.example.com/x.js")).toBe(true);
+		expect(blocked("https://ads.exa\tmple.com/x.js")).toBe(true);
+		expect(blocked("ht\ntps://ads.example.com/x.js")).toBe(true);
+		expect(blocked("https:\\\\ads.example.com/x.js")).toBe(true);
+		expect(blocked("https://t.example.com/p.js?a=1&amp;b=2")).toBe(true);
+		expect(blocked("https://t.example.com/p.js?a=1&#38;b=2")).toBe(true);
+		expect(blocked("https://ads.example.com.evil.test/x.js")).toBe(false);
+		expect(blocked("https://ads.example.com/X.js")).toBe(true);
+		expect(blocked("https://t.example.com/P.js?a=1&b=2")).toBe(false);
+	});
+
+	test("a rule written with capitals in its host still matches", () => {
+		const blocked = blockMatcher(["https://Ads.Example.com/*", /^https:\/\/cdn\.example\.com\//]);
+		expect(blocked("https://ads.example.com/x.js")).toBe(true);
+		expect(blocked("https://CDN.example.com/x.js")).toBe(true);
 	});
 });

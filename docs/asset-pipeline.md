@@ -30,7 +30,7 @@ Keep the options in a module (`assets.config.ts`) so the app and the build comma
 
 ## Blocklist
 
-`block` is a list of exact strings, prefixes ending in `*`, or regular expressions, matched against the path as the template writes it. A blocked tag goes out byte for byte: it is not discovered, not fetched, not read, not rewritten and its classes are not renamed. Use it for third-party tags that must load from their own origin.
+`block` is a list of exact strings, prefixes ending in `*`, or regular expressions, matched against the path as the template writes it. A string rule also matches a spelling the browser reads as the same address: capitals in the scheme or host, `&amp;` for `&`, tabs and line breaks, backslashes before the host. The path and query stay literal, so percent-encoding and `./` are not folded; use a regular expression for those. A blocked tag goes out byte for byte: it is not discovered, not fetched, not read, not rewritten and its classes are not renamed. Use it for third-party tags that must load from their own origin.
 
 ## Remote files
 
