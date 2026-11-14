@@ -1535,14 +1535,19 @@ export class Assets {
 	private async bundleClassicScripts(): Promise<ClassicBundle[]> {
 		const out: ClassicBundle[] = [];
 		for (const [name, file] of Object.entries(this.options.classicScripts ?? {})) {
-			const built = await Bun.build({
+			const options = {
 				entrypoints: [file],
 				target: "browser",
 				format: "iife",
 				splitting: false,
 				minify: this.minifies("scripts"),
 				define: this.runtimeFlags,
-			});
+				metafile: true,
+			} as Parameters<typeof Bun.build>[0];
+			let built = await Bun.build(options);
+			if (built.success && isCommonJsEntry((built as { metafile?: Metafile }).metafile, file)) {
+				built = await Bun.build({ ...options, plugins: [classicScope(file)] });
+			}
 			if (!built.success || !built.outputs[0]) {
 				for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
 				continue;
@@ -1821,6 +1826,36 @@ interface MountSite {
 
 /** The part of Bun's metafile this reads. */
 type Metafile = BundleMeta;
+
+/**
+ * Whether Bun read a classic entry as CommonJS, which it does for a file
+ * that names `module` or `exports` and has no import or export. Bun wraps
+ * such an entry in a function nothing calls, so the script would never run.
+ */
+function isCommonJsEntry(metafile: Metafile | undefined, file: string): boolean {
+	const inputs = (metafile as { inputs?: Record<string, { format?: string }> } | undefined)?.inputs ?? {};
+	const entry = resolvePath(file);
+	return Object.entries(inputs).some(([path, input]) => input.format === "cjs" && resolvePath(path) === entry);
+}
+
+/**
+ * Loads a classic entry inside a function whose `module` and `exports` are
+ * undefined, as they are for a `<script src>`: a `typeof module` guard takes
+ * its browser branch and the code runs.
+ */
+function classicScope(file: string): Bun.BunPlugin {
+	const entry = resolvePath(file);
+	return {
+		name: "natsu-classic-scope",
+		setup(build) {
+			build.onLoad({ filter: /\.[cm]?[jt]sx?$/ }, async (args) => {
+				if (resolvePath(args.path) !== entry) return undefined as never;
+				const loader = (/\.[cm]?([jt]sx?)$/.exec(entry)?.[1] ?? "js") as "js" | "jsx" | "ts" | "tsx";
+				return { contents: `(function (module, exports) {\n${await readFile(entry, "utf8")}\n}).call(globalThis);`, loader };
+			});
+		},
+	};
+}
 
 interface ModuleBundle {
 	outputs: Array<{ file: string; text: string; entry: boolean }>;
