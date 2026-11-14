@@ -31,6 +31,7 @@ An app depends on it with `"natsu": "file:../natsu"`.
 - [docs/page-navigation.md](docs/page-navigation.md): client navigation
 - [docs/pwa.md](docs/pwa.md): installable app, offline and update toast
 - [docs/css-chunks.md](docs/css-chunks.md): per-page CSS slices or shared families
+- [docs/asset-pipeline.md](docs/asset-pipeline.md): discovery, blocklist, pinned remote files, prebuilt assets
 - `example/` and `example-pages/`: runnable apps
 
 ## v1
