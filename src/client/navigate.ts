@@ -635,7 +635,7 @@ if (!first && KEY && regions(D)[0]) {
 	} catch {}
 
 	/** Head elements the server sent: the only ones a merge may remove. */
-	const owned = new Set([...D.head.children].filter((e) => !e.matches("script")));
+	const owned = new Set([...D.head.children].filter((e) => !e.matches("script,[data-natsu-warm],link[data-natsu-prefetch]")));
 	let parsed = new Set<Node>(D.body.childNodes);
 	const sync = (to: Element, from: Element) => {
 		for (const { name } of [...to.attributes]) from.hasAttribute(name) || name == LOADING || to.removeAttribute(name);
@@ -970,7 +970,7 @@ if (!first && KEY && regions(D)[0]) {
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const styles = (doc: { head: Element }) => [...doc.head.querySelectorAll<HTMLElement>("style," + SHEET)];
-	const styleKey = (e: Element) => (e.matches(SHEET) ? `${href(e)} ${e.getAttribute("media")} ${e.hasAttribute("disabled")}` : e.outerHTML);
+	const styleKey = (e: Element) => (href(e) ? `${href(e)} ${e.getAttribute("media")} ${e.hasAttribute("disabled")}` : e.outerHTML);
 	const half = (e: Element | null) => {
 		const p = e?.previousElementSibling;
 		return !!p && e!.matches(SHEET) && p.matches(SHEET) && href(e!) == p.getAttribute(LATER);
@@ -986,7 +986,7 @@ if (!first && KEY && regions(D)[0]) {
 		}
 		return { root, head: root.querySelector("head")!, body: root.querySelector("body")! };
 	};
-	const href = (l: Element) => l.getAttribute("href");
+	const href = (l: Element) => l.getAttribute("href") || l.getAttribute("data-natsu-critical");
 
 	const visit = async (url: string | URL, o: Opts = {}): Promise<void> => {
 		const u = new URL(url, L.href);

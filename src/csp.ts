@@ -4,6 +4,8 @@
  * runtime): each needs the nonce the policy lets scripts run by.
  */
 
+import type { StylePolicy } from "./assets/contract.ts";
+
 /** A nonce source as CSP3 writes it: `'nonce-` and a base64 or base64url value, nothing to escape in an attribute. */
 const NONCE_SOURCE = /^'nonce-([A-Za-z0-9+/_-]+={0,2})'$/i;
 
@@ -34,4 +36,50 @@ export function scriptNonce(header: string | null): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+const HASH_SOURCE = /^'sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}'$/i;
+
+interface StyleDirective {
+	restricted: boolean;
+	nonces: string[];
+}
+
+function styleDirectives(header: string): StyleDirective[] {
+	const found: StyleDirective[] = [];
+	for (const policy of header.split(",")) {
+		const directives = new Map<string, string[]>();
+		for (const directive of policy.split(";")) {
+			const [name, ...sources] = directive.trim().split(/[\t\n\f\r ]+/);
+			const key = name?.toLowerCase();
+			if (key && !directives.has(key)) directives.set(key, sources);
+		}
+		const sources = directives.get("style-src-elem") ?? directives.get("style-src") ?? directives.get("default-src");
+		if (!sources) continue;
+		const nonces: string[] = [];
+		let hashed = false;
+		let inline = false;
+		for (const source of sources) {
+			const nonce = NONCE_SOURCE.exec(source)?.[1];
+			if (nonce !== undefined) nonces.push(nonce);
+			else if (HASH_SOURCE.test(source)) hashed = true;
+			else if (source.toLowerCase() === "'unsafe-inline'") inline = true;
+		}
+		if (nonces.length === 0 && !hashed && inline) continue;
+		found.push({ restricted: true, nonces });
+	}
+	return found;
+}
+
+export function stylePolicy(header: string | null | undefined): StylePolicy {
+	if (!header) return { allowed: true };
+	const directives = styleDirectives(header);
+	const first = directives[0];
+	if (!first) return { allowed: true };
+	const nonce = first.nonces.find((candidate) => directives.every((directive) => directive.nonces.includes(candidate)));
+	return nonce === undefined ? { allowed: false } : { allowed: true, nonce };
+}
+
+export function styleNonce(header: string | null | undefined): string | undefined {
+	return stylePolicy(header).nonce;
 }
