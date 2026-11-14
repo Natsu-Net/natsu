@@ -76,6 +76,25 @@ export type { CompiledRoutes, PrefixMiddleware, RouteEntry, RouteMethod, RouteRe
 export type { ControllerFactory, ControllerNamespaceApi, ControllerOptions } from "./src/controller.ts";
 export type { RejectReason, StaticOptions } from "./src/static.ts";
 export type { AssetReport, AssetsOptions } from "./src/assets.ts";
+export { headTags } from "./src/assets/head.ts";
+export { blockMatcher } from "./src/assets/blocklist.ts";
+export { runCli as runAssetsCli } from "./src/assets/cli.ts";
+export { styleNonce, stylePolicy } from "./src/csp.ts";
+export type {
+	AssetRule,
+	DiscoverOptions,
+	DiscoverOverride,
+	DiscoveredRef,
+	FirstLoadOptions,
+	HeadAttributes,
+	HeadTag,
+	HeadTags,
+	PrebuildResult,
+	PrebuiltOptions,
+	PrefetchChunksOptions,
+	RemoteOptions,
+	StylePolicy,
+} from "./src/assets/contract.ts";
 export type { CompressOptions } from "./src/compress.ts";
 export type { CachedPage, PageCacheOptions, PageRender } from "./src/page-cache.ts";
 export type { Nav, NavigateOptions } from "./src/navigate.ts";

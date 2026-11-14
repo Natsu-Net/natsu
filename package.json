@@ -7,6 +7,9 @@
 	"module": "index.ts",
 	"main": "index.ts",
 	"types": "index.ts",
+	"bin": {
+		"natsu-assets": "bin/natsu-assets.ts"
+	},
 	"scripts": {
 		"test": "bun test",
 		"test:e2e": "bun test ./tests/navigate.e2e.ts ./tests/pwa.e2e.ts ./tests/mount.e2e.ts",

@@ -32,6 +32,7 @@
  */
 
 import { type InvalidateListener, MAX_TAGS, isTag, onInvalidate } from "./invalidate.ts";
+import type { HeadTag } from "./assets/contract.ts";
 import { log } from "./logger.ts";
 
 export interface PageCacheOptions {
@@ -72,6 +73,7 @@ export interface PageCacheOptions {
 export interface CachedPage {
 	body: string;
 	status: number;
+	headTags?: HeadTag[];
 	/** Headers that go out with the page, the same for every visitor. */
 	headers?: Record<string, string>;
 	/** Set on an answer whose page went through `prepare`. */

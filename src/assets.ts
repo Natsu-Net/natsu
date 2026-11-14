@@ -40,7 +40,7 @@
  */
 
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, brotliCompressSync, constants, gzip, gzipSync } from "node:zlib";
@@ -63,11 +63,39 @@ import {
 } from "uwu-template/assets";
 import { cssClasses, planClassNames, renameAndProfile, renameCSSClasses } from "uwu-template/assets/mangle";
 import { minifyCSS } from "uwu-template/assets/minify";
+import { rewriteScriptClasses } from "uwu-template/assets/script-classes";
+import { mediaType, rewriteCssUrls } from "./assets/binary.ts";
+import { blockMatcher } from "./assets/blocklist.ts";
+import { buildChunkGraph, chunkManifest, chunksMeta } from "./assets/chunks.ts";
+import type {
+	AssetBody,
+	AssetRule,
+	BlockMatcher,
+	BundleMeta,
+	ChunkGraph,
+	DiscoveredRef,
+	DiscoverOptions,
+	Discovery,
+	FirstLoadOptions,
+	HeldAsset,
+	JsonValue,
+	PrebuildResult,
+	PrebuiltOptions,
+	PrefetchChunksOptions,
+	RemoteOptions,
+	RemoteRef,
+} from "./assets/contract.ts";
+import { criticalPass, warmSignal } from "./assets/critical.ts";
+import { discoverAssets } from "./assets/discover.ts";
+import { headTagsOf, insertHeadTags, renderHeadTags } from "./assets/head.ts";
+import { loadPrebuilt, optionsFingerprint, writePrebuilt } from "./assets/prebuilt.ts";
+import { modulePreloads } from "./assets/preload.ts";
+import { resolveRemote, withoutIntegrity } from "./assets/remote.ts";
 import { addVary, negotiate } from "./compress.ts";
 import { config } from "./config.ts";
 import type { Context, Middleware } from "./context.ts";
 import { log } from "./logger.ts";
-import { scriptNonce } from "./csp.ts";
+import { scriptNonce, stylePolicy } from "./csp.ts";
 import { LAZY_LOADER_HEAD, type NavigateOptions, Navigation, RUNTIME_ENTRY, isDocument } from "./navigate.ts";
 import { type CachedPage, type Filled, filledOf } from "./page-cache.ts";
 import { PWA_ENTRY, Pwa, type PwaOptions } from "./pwa.ts";
@@ -123,9 +151,11 @@ export interface AssetsOptions {
 	 * `uwu-template/assets/mangle` for the rules.
 	 */
 	mangle?: {
-		scripts: string[];
-		markup: string[];
+		scripts?: string[];
+		markup?: string[];
 		keep?: Array<string | RegExp>;
+		literals?: boolean;
+		readable?: boolean;
 	};
 	/**
 	 * Load only what the page's markup can match up front. The rules that
@@ -186,6 +216,12 @@ export interface AssetsOptions {
 	 */
 	navigate?: boolean | NavigateOptions;
 	pwa?: PwaOptions;
+	discover?: DiscoverOptions;
+	block?: AssetRule[];
+	remote?: boolean | RemoteOptions;
+	prebuilt?: boolean | PrebuiltOptions;
+	firstLoad?: FirstLoadOptions;
+	prefetchChunks?: boolean | PrefetchChunksOptions;
 }
 
 /** The `"families"` chunking, with its settings. */
@@ -222,7 +258,7 @@ export interface AssetReport {
 	/** Shared script chunks `Bun.build` split out. */
 	shared: string[];
 	/** Classes renamed, and classes that had to keep their names. */
-	mangled?: { renamed: number; pinned: number };
+	mangled?: { renamed: number; pinned: number; literals?: number };
 	/** Stylesheet name -> how it was cut, with `"families"` chunking. */
 	families?: Record<string, PartitionReport & { chunks: Array<{ name: string; url: string; bytes: number }> }>;
 	/**
@@ -232,14 +268,32 @@ export interface AssetReport {
 	 * that loads the entry.
 	 */
 	mounts?: Record<string, { sites: Array<{ selector: string; chunk: string; families: string[] }>; dynamic: string[] }>;
+	skipped?: DiscoveredRef[];
+	remote?: { fetched: number; pinned: string[] };
+	chunks?: string;
+	prebuilt?: boolean;
 }
 
 export class Assets {
-	private readonly options: Required<Pick<AssetsOptions, "outDir" | "publicPath">> & AssetsOptions;
+	private options: Required<Pick<AssetsOptions, "outDir" | "publicPath">> & AssetsOptions;
+	private readonly given: AssetsOptions;
+	private readonly isBlocked: BlockMatcher;
+	private readonly blocking: boolean;
+	private readonly remoteUrls = new Set<string>();
+	private remoteRefs: RemoteRef[] = [];
+	private remoteScripts: string[] = [];
+	private remoteStyles: string[] = [];
+	private discovery: Discovery | undefined;
+	private readonly fileUrls = new Map<string, { url: string; size: number; linked: boolean }>();
+	private chunkGraph: ChunkGraph | undefined;
+	private chunksTag = "";
+	private readonly heldMark = hash(`${Math.random()}${performance.now()}`);
+	private buildId = "";
+	private literalEdits = false;
 	/** Entry name -> public URL. */
 	private readonly entries = new Map<string, string>();
 	/** Chunk file name -> contents, so the middleware can serve from memory. */
-	private readonly files = new Map<string, { body: string; type: string }>();
+	private readonly files = new Map<string, HeldAsset>();
 	/** Chunk file name -> its brotli and gzip bytes, once compressed off the request path. */
 	private readonly encoded = new Map<string, Encoded>();
 	/** Chunk file name -> its compression while still running. */
@@ -296,7 +350,10 @@ export class Assets {
 	private readonly manifests = new Map<string, string>();
 
 	constructor(options: AssetsOptions) {
+		this.given = options;
 		this.options = { publicPath: "/_a", ...options };
+		this.isBlocked = blockMatcher(options.block);
+		this.blocking = Boolean(options.block && options.block.length > 0);
 		const navigate = options.navigate;
 		if (navigate) this.navigation = new Navigation(navigate === true ? {} : navigate);
 		if (options.pwa) {
@@ -308,6 +365,140 @@ export class Assets {
 	/** Build every entry. Call once at boot. */
 	public async build(): Promise<AssetReport> {
 		await mkdir(this.options.outDir, { recursive: true });
+		if (this.given.prebuilt && (await this.restore())) return this.report;
+		return this.buildAll(false);
+	}
+
+	public async prebuild(options?: { pin?: boolean }): Promise<PrebuildResult> {
+		await mkdir(this.options.outDir, { recursive: true });
+		await this.buildAll(options?.pin === true);
+		await this.settled();
+		const prebuilt = typeof this.given.prebuilt === "object" ? this.given.prebuilt : {};
+		const files: Array<{ file: string; body: AssetBody; type: string; br?: Uint8Array; gzip?: Uint8Array }> = [];
+		let bytes = 0;
+		for (const [file, held] of this.files) {
+			const copies = this.encoded.get(file);
+			if (copies?.br) await writeFile(join(this.options.outDir, `${file}.br`), copies.br);
+			if (copies?.gzip) await writeFile(join(this.options.outDir, `${file}.gz`), copies.gzip);
+			bytes += typeof held.body === "string" ? Buffer.byteLength(held.body) : held.body.byteLength;
+			files.push({ file, body: held.body, type: held.type, ...(copies?.br && { br: copies.br }), ...(copies?.gzip && { gzip: copies.gzip }) });
+		}
+		await writePrebuilt(this.options.outDir, {
+			natsu: await natsuVersion(),
+			fingerprint: optionsFingerprint(this.given),
+			buildId: this.buildId,
+			entries: this.manifest(),
+			files,
+			state: this.saveState(),
+			...(this.discovery && { discovery: this.discovery }),
+			...(prebuilt.manifest !== undefined && { manifest: prebuilt.manifest }),
+		});
+		return {
+			manifest: prebuilt.manifest ?? join(this.options.outDir, PREBUILT_MANIFEST),
+			files: files.length,
+			bytes,
+			...(this.report.remote && { remote: this.report.remote }),
+			...(this.report.skipped && { skipped: this.report.skipped }),
+		};
+	}
+
+	private saveState(): JsonValue {
+		return pack({
+			styles: [...this.sources.keys()],
+			sourcesMinified: this.sourcesMinified,
+			classes: this.classes,
+			families: this.families,
+			scriptUses: this.scriptUses,
+			mountSites: this.mountSites,
+			manifests: this.manifests,
+			rewrite: this.options.rewrite ?? {},
+			remoteUrls: this.remoteUrls,
+			chunkGraph: this.chunkGraph ?? null,
+			chunksTag: this.chunksTag,
+			literalEdits: this.literalEdits,
+			report: this.report,
+		});
+	}
+
+	private async restore(): Promise<boolean> {
+		const prebuilt = typeof this.given.prebuilt === "object" ? this.given.prebuilt : {};
+		const refuse = (why: string): boolean => {
+			if (prebuilt.strict) throw new Error(`natsu/assets: prebuilt assets refused: ${why}`);
+			log.warn(`[<yellow>assets</yellow>] prebuilt assets not used (${why}), building`);
+			return false;
+		};
+		const loaded = await loadPrebuilt(this.options.outDir, {
+			natsu: await natsuVersion(),
+			fingerprint: optionsFingerprint(this.given),
+			typeOf,
+			...(prebuilt.manifest !== undefined && { manifest: prebuilt.manifest }),
+		});
+		if (!loaded.ok) return refuse(`${loaded.reason}: ${loaded.detail}`);
+		let state: SavedState;
+		try {
+			state = unpack(loaded.manifest.state) as SavedState;
+			if (!(state.classes instanceof Map) || !(state.families instanceof Map) || !Array.isArray(state.styles)) throw new Error("state");
+			for (const name of state.styles) {
+				const held = loaded.files.get(basename(loaded.manifest.entries[name] ?? ""));
+				if (typeof held?.body !== "string") throw new Error(name);
+			}
+		} catch {
+			return refuse("shape: the serving state cannot be read");
+		}
+		this.options = { publicPath: "/_a", ...this.given, rewrite: state.rewrite };
+		this.pattern = undefined;
+		this.fromPrefix = undefined;
+		for (const [file, held] of loaded.files) {
+			this.files.set(file, { body: held.body, type: held.type });
+			this.pinned.add(file);
+			if (held.br || held.gzip) this.encoded.set(file, { ...(held.br && { br: held.br }), ...(held.gzip && { gzip: held.gzip }) });
+		}
+		this.entries.clear();
+		for (const [name, url] of Object.entries(loaded.manifest.entries)) this.entries.set(name, url);
+		this.classes = state.classes;
+		this.safelist = this.classes.size > 0 ? this.translate(this.options.safelist ?? []) : [...(this.options.safelist ?? [])];
+		this.sourcesMinified = state.sourcesMinified === true;
+		this.sources.clear();
+		this.names.clear();
+		for (const name of state.styles) {
+			const body = this.files.get(basename(this.entries.get(name)!))!.body as string;
+			this.sources.set(name, body);
+			this.names.set(name, this.namesOf(body));
+		}
+		this.shapes = new PageShapes(this.names, this.classes);
+		restoreMap(this.families, state.families);
+		restoreMap(this.scriptUses, state.scriptUses);
+		restoreMap(this.mountSites, state.mountSites);
+		restoreMap(this.manifests, state.manifests);
+		this.picks.clear();
+		this.remoteUrls.clear();
+		for (const url of state.remoteUrls ?? []) this.remoteUrls.add(url);
+		this.chunkGraph = state.chunkGraph ?? undefined;
+		this.chunksTag = typeof state.chunksTag === "string" ? state.chunksTag : "";
+		this.literalEdits = state.literalEdits === true;
+		this.buildId = loaded.manifest.buildId;
+		if (this.navigation) {
+			this.navigation.runtime = this.url(RUNTIME_ENTRY);
+			this.navigation.buildId = loaded.manifest.buildId;
+		}
+		this.finishPwa();
+		this.report = { ...state.report, urls: Object.fromEntries(this.entries), prebuilt: true };
+		return true;
+	}
+
+	private async buildAll(pin: boolean): Promise<AssetReport> {
+		this.options = { publicPath: "/_a", ...this.given };
+		this.pattern = undefined;
+		this.fromPrefix = undefined;
+		this.remoteUrls.clear();
+		this.remoteRefs = [];
+		this.remoteScripts = [];
+		this.remoteStyles = [];
+		this.discovery = undefined;
+		this.fileUrls.clear();
+		this.chunkGraph = undefined;
+		this.chunksTag = "";
+		this.literalEdits = false;
 		this.report = { urls: {}, sizes: {}, shared: [] };
 		this.families.clear();
 		this.scriptUses.clear();
@@ -316,15 +507,23 @@ export class Assets {
 		this.manifests.clear();
 		this.metafile = undefined;
 		this.safelist = [...(this.options.safelist ?? [])];
-		await this.planClasses();
+		await this.discover();
+		await this.fetchRemote(pin);
+		const literals = Boolean(this.options.mangle?.literals);
+		const modules = literals ? await this.bundleScripts() : undefined;
+		const classics = literals ? await this.bundleClassicScripts() : undefined;
+		await this.planClasses([...(modules?.outputs ?? []), ...(classics ?? [])].map((output) => output.text));
+		await this.loadFiles();
 		await this.buildStyles();
 		this.shapes = new PageShapes(this.names, this.classes);
-		await this.buildScripts();
-		await this.buildClassicScripts();
-		await this.buildFiles();
+		await this.buildScripts(modules);
+		await this.buildClassicScripts(classics);
+		this.buildFiles();
 		await this.learnScripts();
+		await this.buildChunks();
 		await this.buildPwa();
 		await this.buildNavigation();
+		this.buildId = this.navigation?.buildId || Bun.hash(JSON.stringify(this.manifest())).toString(36);
 		this.finishPwa();
 		this.report.urls = Object.fromEntries(this.entries);
 		return this.report;
@@ -351,8 +550,89 @@ export class Assets {
 		return this.rewritePage(html, undefined);
 	}
 
-	/** `rewrite`, with the nonce this answer's CSP allows inline scripts by, if any. */
 	private rewritePage(html: string, nonce: string | undefined): string {
+		const held = this.blocking && this.classes.size > 0 ? this.holdBlocked(html) : undefined;
+		let page = this.rewriteCore(held ? held.html : html, nonce);
+		if (held) page = page.replace(held.pattern, (_, index: string) => held.tags[Number(index)] ?? "");
+		return this.chunksTag && !page.includes(CHUNKS_META) ? insertHeadTags(page, this.chunksTag) : page;
+	}
+
+	private holdBlocked(html: string): { html: string; tags: string[]; pattern: RegExp } | undefined {
+		const tags: string[] = [];
+		const mark = `natsu-held-${this.heldMark}-`;
+		const out = html.replace(BLOCKABLE_TAG, (tag) => {
+			const ref = BLOCKABLE_REF.exec(tag);
+			const target = ref?.[1] ?? ref?.[2] ?? ref?.[3];
+			if (target === undefined || !this.isBlocked(target)) return tag;
+			tags.push(tag);
+			return `<!--${mark}${tags.length - 1}-->`;
+		});
+		return tags.length > 0 ? { html: out, tags, pattern: new RegExp(`<!--${mark}(\\d+)-->`, "g") } : undefined;
+	}
+
+	private dropIntegrity(page: string): string {
+		let out = page;
+		for (const url of this.remoteUrls) {
+			for (let at = out.indexOf(url); at !== -1; at = out.indexOf(url, at + url.length)) {
+				const start = out.lastIndexOf("<", at);
+				const end = out.indexOf(">", at);
+				if (start === -1 || end === -1) break;
+				const tag = out.slice(start, end + 1);
+				const cleaned = withoutIntegrity(tag);
+				if (cleaned === tag) continue;
+				out = `${out.slice(0, start)}${cleaned}${out.slice(end + 1)}`;
+				at -= tag.length - cleaned.length;
+			}
+		}
+		return out;
+	}
+
+	private firstLoad(ctx: Context): void {
+		const options = this.options.firstLoad;
+		const page = ctx.response.body;
+		if (!options || (!options.inline && !options.preload) || typeof page !== "string") return;
+		if (ctx.response.headers.get("natsu-island") === "1") return;
+		const secure = ctx.url.protocol === "https:" || (ctx.trustProxy && (ctx.request.headers.get("x-forwarded-proto") ?? "").split(",")[0]!.trim().toLowerCase() === "https");
+		const signal = warmSignal(ctx.request.headers.get("cookie"), options.cookie ?? "natsu-a", this.buildId, secure);
+		if (signal.warm && !signal.setCookie && !WARM_NAME.test(this.buildId)) return;
+		addVary(ctx.response.headers, "Cookie");
+		if (signal.warm || !signal.setCookie) return;
+		const policy = ctx.response.headers.get("content-security-policy");
+		let out = page;
+		if (options.inline) {
+			const maxBytes = typeof options.inline === "object" ? (options.inline.maxBytes ?? 14_000) : 14_000;
+			const pass = criticalPass({
+				publicPath: this.options.publicPath,
+				maxBytes,
+				body: (url) => {
+					const held = this.files.get(basename(url));
+					return typeof held?.body === "string" ? held.body : undefined;
+				},
+				style: stylePolicy(policy),
+				warm: false,
+			});
+			out = pass.apply(out);
+		}
+		if (options.preload && this.chunkGraph) {
+			const scripts: string[] = [];
+			const prefix = `${this.options.publicPath}/`;
+			SCRIPT_TAG.lastIndex = 0;
+			for (let m = SCRIPT_TAG.exec(out); m; m = SCRIPT_TAG.exec(out)) {
+				const src = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(m[1] ?? "");
+				const url = src?.[1] ?? src?.[2] ?? "";
+				if (url.startsWith(prefix)) scripts.push(url);
+			}
+			const hints = modulePreloads(scripts, this.chunkGraph, out, scriptNonce(policy));
+			if (hints) out = insertHeadTags(out, hints);
+		}
+		ctx.response.headers.append("set-cookie", signal.setCookie);
+		const control = ctx.response.headers.get("cache-control");
+		if (!control || !/\b(?:private|no-store)\b/i.test(control)) ctx.response.headers.set("cache-control", "private, no-cache");
+		ctx.response.body = out;
+	}
+
+	/** `rewrite`, with the nonce this answer's CSP allows inline scripts by, if any. */
+	private rewriteCore(html: string, nonce: string | undefined): string {
 		// Renaming walks the whole page and reads its shape on the way. Without
 		// a rename the shape is read only when a stylesheet is narrowed for it:
 		// a page linking scripts alone, or `wholeStylesheets`, skips the walk.
@@ -386,10 +666,14 @@ export class Assets {
 			}
 			return url;
 		};
+		let remote = false;
 		let out = this.replaceFroms(page, pattern, (from) => {
+			if (this.blocking && this.isBlocked(from)) return undefined;
 			const url = resolve(from);
+			if (url && this.remoteUrls.has(url)) remote = true;
 			return url && url !== from ? url : undefined;
 		});
+		if (remote) out = this.dropIntegrity(out);
 		for (const [core, name] of grouped) out = this.linkFamilies(out, core, this.pick(name, out, shape!));
 		for (const url of resolved.values()) {
 			const lazy = url ? this.lazy.get(url) : undefined;
@@ -759,7 +1043,7 @@ export class Assets {
 					// Not this chunk, so not immutable: a few minutes, then ask again.
 					ctx.response.headers.set("content-type", stand.type);
 					ctx.response.headers.set("cache-control", "public, max-age=300");
-					ctx.response.body = stand.body;
+					ctx.response.body = stand.body as string | Uint8Array<ArrayBuffer>;
 					return;
 				}
 				// A chunk read back from disk keeps its place while pages ask for it.
@@ -773,9 +1057,10 @@ export class Assets {
 				// can be as long as the spec allows. A file from disk that could
 				// not be checked against its name gets a few minutes instead.
 				let cacheControl = this.unverified.has(file) ? "public, max-age=300" : "public, max-age=31536000, immutable";
+				const packed = mediaType(file)?.compress === false;
 				// Both answers vary, so a cache never hands brotli to a client that asked for none.
-				addVary(ctx.response.headers, "Accept-Encoding");
-				const encoding = negotiate(ctx.request.headers.get("accept-encoding"));
+				if (!packed) addVary(ctx.response.headers, "Accept-Encoding");
+				const encoding = packed ? undefined : negotiate(ctx.request.headers.get("accept-encoding"));
 				let bytes = encoding ? this.encoded.get(file)?.[encoding] : undefined;
 				if (encoding && !bytes) {
 					// The top-quality copies are still being made. Waiting for
@@ -793,7 +1078,7 @@ export class Assets {
 					ctx.response.body = bytes as Uint8Array<ArrayBuffer>;
 					return;
 				}
-				ctx.response.body = held.body;
+				ctx.response.body = held.body as string | Uint8Array<ArrayBuffer>;
 				return;
 			}
 
@@ -815,8 +1100,15 @@ export class Assets {
 			// cutting, and only if it has not run already.
 			const saveData = this.familyOptions?.prefetch && ctx.request.headers.get("save-data")?.toLowerCase() === "on";
 			const lean = (html: string) => (saveData ? html.replace(PREFETCH_TAG, "") : html);
+			const tags = headTagsOf(ctx);
+			const head = tags.length > 0
+				? (html: string) => insertHeadTags(html, renderHeadTags(tags, { nonce: cspNonce(ctx), present: html }))
+				: undefined;
 			if (navigation && ctx.nav.requested) {
-				navigation.answer(ctx, (html) => lean(this.rewritten.has(ctx) ? html : this.rewrite(html)));
+				navigation.answer(ctx, (html) => {
+					const out = lean(this.rewritten.has(ctx) ? html : this.rewrite(html));
+					return head ? head(out) : out;
+				});
 				if (ctx.response.headers.get("natsu-part") === "1") this.pwa?.mark(ctx);
 				return;
 			}
@@ -833,12 +1125,15 @@ export class Assets {
 			const loaders = nonce ? (page: string) => this.nonceLoaders(page, nonce) : undefined;
 			const kept = this.filled.get(ctx);
 			// Still the body PageCache gave (the same string, so this reads none of it)?
-			if (navigation && kept?.body === body && !saveData) {
+			if (navigation && kept?.body === body && !saveData && !head) {
 				ctx.response.body = navigation.fullFilled(ctx, body, kept.filled, loaders);
+				this.firstLoad(ctx);
 				return;
 			}
-			const page = this.islandStyles(ctx, lean(!this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body));
+			const drawn = this.islandStyles(ctx, lean(!this.rewritten.has(ctx) ? this.rewritePage(body, nonce) : loaders ? loaders(body) : body));
+			const page = head ? head(drawn) : drawn;
 			ctx.response.body = navigation ? navigation.full(ctx, page) : page;
+			this.firstLoad(ctx);
 		};
 	}
 
@@ -846,11 +1141,13 @@ export class Assets {
 
 	private async buildStyles(): Promise<void> {
 		const minify = this.minifies("styles");
+		const linked = [...this.fileUrls.values()].some((file) => file.linked);
 		for (const [name, files] of Object.entries(this.options.styles ?? {})) {
 			const parts: string[] = [];
 			for (const file of files) {
 				try {
-					parts.push(await readFile(file, "utf8"));
+					const text = await readFile(file, "utf8");
+					parts.push(linked ? this.linkCssFiles(text, name) : text);
 				} catch {
 					log.warn(`[<yellow>assets</yellow>] missing stylesheet <cyan>${file}</cyan>`);
 				}
@@ -878,9 +1175,83 @@ export class Assets {
 	 * nothing about which belong together). Each chunk is then renamed and
 	 * minified as the whole sheet is, and pinned: any page may link it.
 	 */
+	private linkCssFiles(css: string, name: string): string {
+		const rewrite = this.options.rewrite ?? {};
+		const base = Object.keys(rewrite).find((from) => rewrite[from] === name);
+		return rewriteCssUrls(css, {
+			resolve: (target) => {
+				const entry = Object.hasOwn(rewrite, target) ? rewrite[target] : undefined;
+				const held = entry === undefined ? undefined : this.fileUrls.get(entry);
+				return held?.linked ? held.url : undefined;
+			},
+			...(base !== undefined && { base }),
+		});
+	}
+
+	private async discover(): Promise<void> {
+		const discover = this.given.discover;
+		if (!discover) return;
+		const given = this.given;
+		const found = await discoverAssets({
+			...discover,
+			explicit: {
+				...(given.scripts && { scripts: given.scripts }),
+				...(given.classicScripts && { classicScripts: given.classicScripts }),
+				...(given.files && { files: given.files }),
+				...(given.styles && { styles: given.styles }),
+				...(given.rewrite && { rewrite: given.rewrite }),
+			},
+			isBlocked: this.isBlocked,
+			remote: Boolean(given.remote),
+		});
+		this.discovery = found;
+		this.options.scripts = { ...found.scripts, ...given.scripts };
+		this.options.classicScripts = { ...found.classicScripts, ...given.classicScripts };
+		this.options.files = { ...found.files, ...given.files };
+		this.options.styles = { ...found.styles, ...given.styles };
+		this.options.rewrite = { ...found.rewrite, ...given.rewrite };
+		this.remoteRefs = found.remote;
+		if (found.skipped.length > 0) this.report.skipped = found.skipped;
+	}
+
+	private async fetchRemote(pin: boolean): Promise<void> {
+		const remote = this.given.remote;
+		const refs = this.remoteRefs.filter((ref) => !this.isBlocked(ref.ref) && !this.isBlocked(ref.url));
+		if (!remote || refs.length === 0) return;
+		const policy = remote === true ? {} : remote;
+		const result = await resolveRemote(refs, { ...policy, pin: pin || policy.pin === true, outDir: this.options.outDir });
+		const rewrite = { ...this.options.rewrite };
+		for (const asset of result.assets) {
+			const url = this.hold(asset.file, asset.body, asset.type);
+			this.pin(url);
+			const name = asset.file.slice(0, asset.file.indexOf("."));
+			this.entries.set(name, url);
+			this.remoteUrls.add(url);
+			this.report.sizes[name] = { from: asset.body.length, to: asset.body.length };
+			if (!Object.hasOwn(this.given.rewrite ?? {}, asset.ref)) rewrite[asset.ref] = name;
+			if (asset.kind === "script") this.remoteScripts.push(asset.body);
+			else this.remoteStyles.push(asset.body);
+		}
+		this.options.rewrite = rewrite;
+		this.report.remote = { fetched: result.fetched, pinned: result.pinned };
+	}
+
+	private async buildChunks(): Promise<void> {
+		const prefetch = this.options.prefetchChunks;
+		if (!this.metafile || (!prefetch && !this.options.firstLoad?.preload)) return;
+		const graph = await scriptGraph(this.metafile);
+		this.chunkGraph = buildChunkGraph({ meta: this.metafile, sites: graph.sites, publicPath: this.options.publicPath });
+		if (!prefetch || Object.keys(this.chunkGraph.mounts).length === 0) return;
+		const json = JSON.stringify(chunkManifest(this.chunkGraph));
+		const url = this.hold(`chunks.${hash(json)}.json`, json, "application/json; charset=utf-8");
+		this.pin(url);
+		this.chunksTag = chunksMeta(url, typeof prefetch === "object" ? prefetch.max : undefined);
+		this.report.chunks = url;
+	}
+
 	private async buildFamilies(name: string, parts: string[], minify: boolean): Promise<void> {
 		const options = this.familyOptions!;
-		const paths = options.samples ?? this.options.mangle?.markup;
+		const paths = options.samples ?? this.markupPaths;
 		// What the safelist names counts on every sample page, as it does on every page.
 		const safe = [...selectorNames(parts.join("\n")).classes].filter((name) => this.safe(name));
 		const samples = paths ? (await readAll(paths)).map((text) => new Set([...profileDocument(text).classes, ...safe])) : undefined;
@@ -922,17 +1293,29 @@ export class Assets {
 		if (!families) return;
 		const prefix = `${this.options.publicPath}/`;
 		const graph = this.metafile ? await scriptGraph(this.metafile) : undefined;
-		const textOf = (files: Iterable<string>) => [...files].map((file) => this.files.get(file)?.body ?? "").join("\n;\n");
+		const bodyOf = (file: string): string => {
+			const body = this.files.get(file)?.body;
+			return typeof body === "string" ? body : "";
+		};
+		const textOf = (files: Iterable<string>) => [...files].map(bodyOf).join("\n;\n");
+		const renamed = new Map<string, string>();
+		const sourceOf = (file: string): string => {
+			const text = graph?.texts.get(file) ?? "";
+			if (!this.literalEdits) return text;
+			let out = renamed.get(file);
+			if (out === undefined) renamed.set(file, (out = rewriteScriptClasses(text, this.classes).code));
+			return out;
+		};
 		for (const [name, url] of this.entries) {
 			if (!url.startsWith(prefix) || !/\.m?js$/.test(url)) continue;
 			const entry = basename(url);
 			const source = graph?.entries.get(entry);
 			if (!graph || source === undefined) {
-				this.scriptUses.set(url, scriptClasses(textOf(reachable(entry, (file) => [...this.files.get(file)?.body.matchAll(IMPORTED) ?? []].map((m) => m[1]!).filter((next) => this.files.has(next))))));
+				this.scriptUses.set(url, scriptClasses(textOf(reachable(entry, (file) => [...bodyOf(file).matchAll(IMPORTED)].map((m) => m[1]!).filter((next) => this.files.has(next))))));
 				continue;
 			}
 			const normal = (file: string) => (graph.edges.get(file) ?? []).filter((edge) => !edge.mount).map((edge) => edge.to);
-			const sources = (files: Set<string>) => [...files].map((file) => graph.texts.get(file) ?? "").join("\n;\n");
+			const sources = (files: Set<string>) => [...files].map(sourceOf).join("\n;\n");
 			const conservative = reachable(source, normal);
 			this.scriptUses.set(url, scriptClasses(sources(conservative)));
 			const all = reachable(source, (file) => (graph.edges.get(file) ?? []).map((edge) => edge.to));
@@ -945,7 +1328,7 @@ export class Assets {
 				sites.push({ id: this.mountSites.size * 1000 + sites.length, selector: site.selector, needs: selectorNeeds(site.selector), chunk: site.module, classes, rest });
 			}
 			this.mountSites.set(url, sites);
-			const dynamic = [...conservative].filter((file) => file !== source && [...conservative].some((from) => graph.edges.get(from)?.some((edge) => edge.to === file && edge.dynamic)));
+			const dynamic = [...conservative].filter((file) => file !== source && resolvePath(file) !== OWN_IDLE && [...conservative].some((from) => graph.edges.get(from)?.some((edge) => edge.to === file && edge.dynamic)));
 			this.report.mounts ??= {};
 			this.report.mounts[name] = {
 				sites: sites.map((site) => ({
@@ -995,7 +1378,11 @@ export class Assets {
 	}
 
 	/** Decide which classes can be renamed, and to what. */
-	private async planClasses(): Promise<void> {
+	private get markupPaths(): string[] | undefined {
+		return this.options.mangle?.markup ?? (this.options.mangle ? this.given.discover?.templates : undefined);
+	}
+
+	private async planClasses(rewritable: string[] = []): Promise<void> {
 		this.classes = new Map();
 		const mangle = this.options.mangle;
 		if (!mangle) return;
@@ -1004,8 +1391,14 @@ export class Assets {
 		for (const files of Object.values(this.options.styles ?? {})) {
 			for (const file of files) css.push(await readFile(file, "utf8").catch(() => ""));
 		}
-		const scripts = await readAll(mangle.scripts);
-		const markup = await readAll(mangle.markup);
+		const scripts = await readAll(mangle.scripts ?? []);
+		const markup = await readAll(this.markupPaths ?? []);
+		scripts.push(...this.remoteScripts);
+		if (mangle.literals) {
+			for (const file of Object.values(this.options.files ?? {})) {
+				if (/\.m?js$/.test(file)) scripts.push(await readFile(file, "utf8").catch(() => ""));
+			}
+		}
 		// A page's own <script> is a script, whatever file it sits in.
 		for (const page of markup) {
 			for (const m of page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
@@ -1022,7 +1415,15 @@ export class Assets {
 			for (const m of page.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) keep.push(...cssClasses(m[1] ?? "").keys());
 		}
 
-		const plan = planClassNames({ css, scripts, markup, keep });
+		for (const style of this.remoteStyles) keep.push(...cssClasses(style).keys());
+		const plan = planClassNames({
+			css,
+			scripts,
+			markup,
+			keep,
+			...(rewritable.length > 0 && { rewritable }),
+			...(mangle.readable && { readable: true }),
+		});
 		this.classes = plan.map;
 		this.report.mangled = { renamed: plan.map.size, pinned: plan.pinned.size };
 		this.safelist = this.translate(this.options.safelist ?? []);
@@ -1054,9 +1455,9 @@ export class Assets {
 		return out;
 	}
 
-	private async buildScripts(): Promise<void> {
+	private async bundleScripts(): Promise<ModuleBundle | null> {
 		const scripts = Object.entries(this.options.scripts ?? {});
-		if (scripts.length === 0) return;
+		if (scripts.length === 0) return null;
 
 		const built = await Bun.build({
 			entrypoints: scripts.map(([, file]) => file),
@@ -1067,24 +1468,53 @@ export class Assets {
 			splitting: true,
 			minify: this.minifies("scripts"),
 			naming: { entry: "[name].[hash].[ext]", chunk: "[name].[hash].[ext]", asset: "[name].[hash].[ext]" },
-			metafile: Boolean(this.familyOptions),
+			metafile: Boolean(this.familyOptions || this.options.prefetchChunks || this.options.firstLoad?.preload),
 		} as Parameters<typeof Bun.build>[0]);
 
 		if (!built.success) {
 			for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
-			return;
+			return null;
 		}
-		this.metafile = (built as { metafile?: Metafile }).metafile;
+		const outputs: ModuleBundle["outputs"] = [];
+		for (const output of built.outputs) outputs.push({ file: basename(output.path), text: await output.text(), entry: output.kind === "entry-point" });
+		return { outputs, metafile: (built as { metafile?: Metafile }).metafile };
+	}
+
+	private renameLiterals(bundle: ModuleBundle): ModuleBundle {
+		const rewritten = bundle.outputs.map((output) => rewriteScriptClasses(output.text, this.classes));
+		const edits = rewritten.reduce((sum, result) => sum + result.edits, 0);
+		if (edits === 0) return bundle;
+		this.literalEdits = true;
+		if (this.report.mangled) this.report.mangled.literals = (this.report.mangled.literals ?? 0) + edits;
+		const salt = hash(JSON.stringify([...this.classes])).slice(0, 8);
+		const names = bundle.outputs.map((output): [string, string] => [output.file, output.file.replace(/(\.m?js)$/, `_${salt}$1`)]);
+		const swap = (text: string): string => {
+			let out = text;
+			for (const [from, to] of names) if (from !== to) out = out.split(from).join(to);
+			return out;
+		};
+		return {
+			outputs: bundle.outputs.map((output, n) => ({ ...output, file: names[n]![1], text: swap(rewritten[n]!.code) })),
+			metafile: bundle.metafile ? (JSON.parse(swap(JSON.stringify(bundle.metafile))) as Metafile) : undefined,
+		};
+	}
+
+	private async buildScripts(given?: ModuleBundle | null): Promise<void> {
+		const scripts = Object.entries(this.options.scripts ?? {});
+		const found = given === undefined ? await this.bundleScripts() : given;
+		if (!found) return;
+		const bundle = this.options.mangle?.literals && this.classes.size > 0 ? this.renameLiterals(found) : found;
+		this.metafile = bundle.metafile;
 
 		// `[name]` in the naming pattern is the entry file's basename without
 		// its extension, which is what ties an output back to the name the
 		// caller asked for.
 		const byStem = new Map(scripts.map(([name, file]) => [stemOf(file), name]));
-		for (const output of built.outputs) {
-			const file = basename(output.path);
-			const body = await output.text();
+		for (const output of bundle.outputs) {
+			const file = output.file;
+			const body = output.text;
 			const url = this.hold(file, body, "text/javascript; charset=utf-8");
-			if (output.kind !== "entry-point") {
+			if (!output.entry) {
 				this.report.shared.push(url);
 				continue;
 			}
@@ -1095,7 +1525,8 @@ export class Assets {
 		}
 	}
 
-	private async buildClassicScripts(): Promise<void> {
+	private async bundleClassicScripts(): Promise<ClassicBundle[]> {
+		const out: ClassicBundle[] = [];
 		for (const [name, file] of Object.entries(this.options.classicScripts ?? {})) {
 			const built = await Bun.build({
 				entrypoints: [file],
@@ -1108,7 +1539,23 @@ export class Assets {
 				for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
 				continue;
 			}
-			const body = await built.outputs[0].text();
+			out.push({ name, file, text: await built.outputs[0].text() });
+		}
+		return out;
+	}
+
+	private async buildClassicScripts(given?: ClassicBundle[]): Promise<void> {
+		const literals = Boolean(this.options.mangle?.literals) && this.classes.size > 0;
+		for (const { name, file, text } of given ?? (await this.bundleClassicScripts())) {
+			let body = text;
+			if (literals) {
+				const result = rewriteScriptClasses(text, this.classes);
+				body = result.code;
+				if (result.edits > 0) {
+					this.literalEdits = true;
+					if (this.report.mangled) this.report.mangled.literals = (this.report.mangled.literals ?? 0) + result.edits;
+				}
+			}
 			const url = this.hold(`${name}.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
 			this.pin(url);
 			this.entries.set(name, url);
@@ -1179,21 +1626,30 @@ export class Assets {
 		pwa.build(navigation.buildId, [...this.entries.values()].filter((url) => url.endsWith(".js")));
 	}
 
-	private async buildFiles(): Promise<void> {
+	private async loadFiles(): Promise<void> {
 		for (const [name, file] of Object.entries(this.options.files ?? {})) {
-			let body: string;
+			const media = mediaType(file);
+			let body: AssetBody;
 			try {
-				body = await readFile(file, "utf8");
+				body = media?.binary ? new Uint8Array(await readFile(file)) : await readFile(file, "utf8");
 			} catch {
 				log.warn(`[<yellow>assets</yellow>] missing file <cyan>${file}</cyan>`);
 				continue;
 			}
 			const ext = file.slice(file.lastIndexOf("."));
-			const type = ext === ".css" ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8";
+			const type = media?.type ?? (ext === ".css" ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8");
 			const url = this.hold(`${name}.${hash(body)}${ext}`, body, type);
 			this.pin(url);
-			this.entries.set(name, url);
-			this.report.sizes[name] = { from: body.length, to: body.length };
+			this.fileUrls.set(name, { url, size: body.length, linked: media !== undefined && !/\.(?:css|m?js)$/i.test(ext) });
+		}
+	}
+
+	private buildFiles(): void {
+		for (const name of Object.keys(this.options.files ?? {})) {
+			const held = this.fileUrls.get(name);
+			if (!held) continue;
+			this.entries.set(name, held.url);
+			this.report.sizes[name] = { from: held.size, to: held.size };
 		}
 	}
 
@@ -1202,7 +1658,7 @@ export class Assets {
 	 * brotli and gzip copies are made on libuv's thread pool, so the request
 	 * that built a chunk never waits for its compression.
 	 */
-	private hold(file: string, body: string, type: string): string {
+	private hold(file: string, body: AssetBody, type: string): string {
 		if (!this.files.has(file)) {
 			this.keep(file, body, type);
 			this.write(file, body);
@@ -1211,8 +1667,9 @@ export class Assets {
 	}
 
 	/** Keep a chunk in memory and start its compressed copies. */
-	private keep(file: string, body: string, type: string): void {
+	private keep(file: string, body: AssetBody, type: string): void {
 		this.files.set(file, { body, type });
+		if (mediaType(file)?.compress === false) return;
 		const copies = precompress(body).then(
 			(made) => {
 				if (this.encoding.get(file) !== copies) return undefined;
@@ -1234,7 +1691,7 @@ export class Assets {
 	 * or none of it. On disk is how a restarted process or another one serves
 	 * a chunk it did not build; this process serves from memory either way.
 	 */
-	private write(file: string, body: string): void {
+	private write(file: string, body: AssetBody): void {
 		const target = join(this.options.outDir, file);
 		const temporary = `${target}.${process.pid}.${(++writeCount).toString(36)}.tmp`;
 		const done = writeFile(temporary, body)
@@ -1262,20 +1719,21 @@ export class Assets {
 	 * process sharing `outDir` wrote: a page rendered before a restart still
 	 * links it.
 	 */
-	private async fromDisk(file: string): Promise<{ body: string; type: string } | undefined> {
+	private async fromDisk(file: string): Promise<HeldAsset | undefined> {
 		const type = typeOf(file);
-		if (!type || !/^[\w.-]+$/.test(file)) return undefined;
-		let body: string;
+		if (!type || !/^[\w.-]+$/.test(file) || this.reserved(file)) return undefined;
+		let body: AssetBody;
 		try {
-			body = await readFile(join(this.options.outDir, file), "utf8");
+			body = mediaType(file)?.binary ? new Uint8Array(await readFile(join(this.options.outDir, file))) : await readFile(join(this.options.outDir, file), "utf8");
 		} catch {
 			return undefined;
 		}
 		// A name this pipeline gave carries the hash of its contents: a file
 		// that does not match it (cut short by a crash before writes were
 		// atomic) is not that chunk, and must never go out as immutable.
-		const named = /\.([0-9a-f]{10})\.(?:css|m?js|json)$/.exec(file)?.[1];
+		const named = /\.([0-9a-f]{10})\.[a-z0-9]+$/.exec(file)?.[1];
 		if (named !== undefined && hash(body) !== named) return undefined;
+		if (named === undefined && !/\.(?:css|m?js|json)$/.test(file)) return undefined;
 		if (!this.files.has(file)) {
 			this.keep(file, body, type);
 			if (named === undefined) this.unverified.add(file);
@@ -1290,7 +1748,16 @@ export class Assets {
 	 * lazy half, whose rules the whole sheet already carries. A page that
 	 * outlived the process that rendered it stays styled.
 	 */
-	private standIn(file: string): { body: string; type: string } | undefined {
+	private reserved(file: string): boolean {
+		const prebuilt = this.given.prebuilt;
+		const remote = this.given.remote;
+		return file === PREBUILT_MANIFEST ||
+			file === REMOTE_LOCK ||
+			(typeof prebuilt === "object" && prebuilt.manifest !== undefined && file === basename(prebuilt.manifest)) ||
+			(typeof remote === "object" && remote.lockfile !== undefined && file === basename(remote.lockfile));
+	}
+
+	private standIn(file: string): HeldAsset | undefined {
 		// Renamed classes differ from one build to the next, so a page from
 		// another build would get another build's names: no stand-in then.
 		if (!file.endsWith(".css") || this.classes.size > 0) return undefined;
@@ -1344,9 +1811,84 @@ interface MountSite {
 }
 
 /** The part of Bun's metafile this reads. */
-interface Metafile {
-	inputs: Record<string, { imports: Array<{ path: string; kind: string; original?: string; entryPoint?: string }> }>;
-	outputs: Record<string, { entryPoint?: string }>;
+type Metafile = BundleMeta;
+
+interface ModuleBundle {
+	outputs: Array<{ file: string; text: string; entry: boolean }>;
+	metafile: Metafile | undefined;
+}
+
+interface ClassicBundle {
+	name: string;
+	file: string;
+	text: string;
+}
+
+interface SavedState {
+	styles: string[];
+	sourcesMinified: boolean;
+	classes: Map<string, string>;
+	families: Map<string, { partition: CSSPartition; urls: string[]; classes: string[] }>;
+	scriptUses: Map<string, ScriptClasses>;
+	mountSites: Map<string, MountSite[]>;
+	manifests: Map<string, string>;
+	rewrite: Record<string, string>;
+	remoteUrls: Set<string>;
+	chunkGraph: ChunkGraph | null;
+	chunksTag: string;
+	literalEdits: boolean;
+	report: AssetReport;
+}
+
+const PREBUILT_MANIFEST = "natsu-assets.json";
+const REMOTE_LOCK = "natsu-assets.lock.json";
+const CHUNKS_META = '<meta name="natsu-chunks"';
+const BLOCKABLE_TAG = /<(?:script|link)\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+const BLOCKABLE_REF = /\s(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
+const WARM_NAME = /^[\w.-]{1,64}$/;
+const OWN_IDLE = fileURLToPath(new URL("./client/idle.ts", import.meta.url));
+
+let version: Promise<string> | undefined;
+
+function natsuVersion(): Promise<string> {
+	return (version ??= readFile(new URL("../package.json", import.meta.url), "utf8").then(
+		(text) => String((JSON.parse(text) as { version?: unknown }).version ?? "0"),
+		() => "0",
+	));
+}
+
+function pack(value: unknown): JsonValue {
+	if (value instanceof Map) return { $map: [...value].map(([key, item]): JsonValue => [pack(key), pack(item)]) };
+	if (value instanceof Set) return { $set: [...value].map(pack) };
+	if (Array.isArray(value)) return value.map(pack);
+	if (value !== null && typeof value === "object") {
+		const out: Record<string, JsonValue> = {};
+		for (const [key, item] of Object.entries(value)) if (item !== undefined && typeof item !== "function") out[key] = pack(item);
+		return out;
+	}
+	if (typeof value === "string" || typeof value === "boolean") return value;
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	return null;
+}
+
+function unpack(value: JsonValue): unknown {
+	if (Array.isArray(value)) return value.map(unpack);
+	if (value === null || typeof value !== "object") return value;
+	const keys = Object.keys(value);
+	if (keys.length === 1 && keys[0] === "$map" && Array.isArray(value.$map)) {
+		const out = new Map<unknown, unknown>();
+		for (const pair of value.$map) if (Array.isArray(pair) && pair.length === 2) out.set(unpack(pair[0]!), unpack(pair[1]!));
+		return out;
+	}
+	if (keys.length === 1 && keys[0] === "$set" && Array.isArray(value.$set)) return new Set(value.$set.map(unpack));
+	const out: Record<string, unknown> = {};
+	for (const key of keys) if (key !== "__proto__") out[key] = unpack(value[key]!);
+	return out;
+}
+
+function restoreMap<K, V>(target: Map<K, V>, source: unknown): void {
+	target.clear();
+	if (source instanceof Map) for (const [key, item] of source as Map<K, V>) target.set(key, item);
 }
 
 interface ScriptGraph {
@@ -1541,8 +2083,8 @@ type Encoded = { br?: Uint8Array; gzip?: Uint8Array };
 let writeCount = 0;
 
 /** A chunk's brotli (top quality) and gzip copies, made on the thread pool. */
-async function precompress(body: string): Promise<{ br: Uint8Array; gzip: Uint8Array }> {
-	const bytes = new TextEncoder().encode(body);
+async function precompress(body: AssetBody): Promise<{ br: Uint8Array; gzip: Uint8Array }> {
+	const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
 	const [br, gz] = await Promise.all([
 		brotli(bytes, {
 			params: {
@@ -1557,8 +2099,8 @@ async function precompress(body: string): Promise<{ br: Uint8Array; gzip: Uint8A
 }
 
 /** A chunk compressed at a level that costs well under a millisecond, for while its top-quality copy is made. */
-function fastCopy(body: string, encoding: keyof Encoded): Uint8Array {
-	const bytes = new TextEncoder().encode(body);
+function fastCopy(body: AssetBody, encoding: keyof Encoded): Uint8Array {
+	const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
 	if (encoding === "gzip") return new Uint8Array(gzipSync(bytes, { level: 6 }));
 	return new Uint8Array(
 		brotliCompressSync(bytes, {
@@ -1573,13 +2115,10 @@ function fastCopy(body: string, encoding: keyof Encoded): Uint8Array {
 
 /** The type a chunk is served as, by its extension; undefined for anything else. */
 function typeOf(file: string): string | undefined {
-	if (file.endsWith(".css")) return "text/css; charset=utf-8";
-	if (file.endsWith(".json")) return "application/json; charset=utf-8";
-	if (file.endsWith(".js") || file.endsWith(".mjs")) return "text/javascript; charset=utf-8";
-	return undefined;
+	return mediaType(file)?.type;
 }
 
 /** Short content hash. Long enough that a collision is not a real worry. */
-function hash(body: string): string {
+function hash(body: AssetBody): string {
 	return new Bun.CryptoHasher("sha256").update(body).digest("hex").slice(0, 10);
 }
