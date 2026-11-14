@@ -515,7 +515,13 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 		return nonceSwapScripts(out, nonce);
 	};
 
-	const canonical = (ctx: Context): string => publicUrl().replace(/\/+$/, "") + ctx.path;
+	/** The page's own address: what `<page canonical>` names, else this path in this request's language. */
+	const canonical = (ctx: Context, named: string): string => {
+		const origin = publicUrl().replace(/\/+$/, "");
+		if (/^https?:\/\//i.test(named)) return named;
+		if (named.startsWith("/") && !named.startsWith("//")) return origin + named;
+		return origin + ctx.localize(ctx.path);
+	};
 
 	/** Every action form gets the visitor's token (or PageCache's mark for it) beside its `_action`. */
 	const withToken = (html: string, token: string | undefined): string =>
@@ -530,7 +536,7 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 			const meta: PageMeta = {
 				title: fillText(block?.title, values),
 				description: fillText(block?.description, values),
-				canonical: canonical(ctx),
+				canonical: canonical(ctx, fillText(block?.canonical, values)),
 				robots: state.noindex ? "noindex" : "",
 			};
 			const started = Bun.nanoseconds();
@@ -627,7 +633,8 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 				(!state.readsViewer || (await viewerOf(ctx)) == null);
 			if (cacheable) {
 				const seconds = state.cache as number;
-				const key = ctx.path + ctx.search;
+				// Keyed by the address as asked, prefix included: /fr/about and /about are two pages.
+				const key = ctx.localize(ctx.path) + ctx.search;
 				const kept = await cacheFor(seconds).serve(
 					key,
 					names.map((name) => secrets[name]!),

@@ -3434,6 +3434,39 @@ describe("live data", () => {
 		expect(p.calls).toEqual([]);
 	});
 
+	test("a canceled natsu:invalidate also keeps the page after a reconnect and after a stale notice", async () => {
+		FakeSocket.last = undefined;
+		const heard: { tag: string; missed?: boolean }[] = [];
+		const p = open({
+			html: page({ head: live("todos|SIG") }),
+			before: (w) => {
+				w.WebSocket = FakeSocket;
+				w.document.addEventListener("natsu:invalidate", (e: Event) => {
+					heard.push((e as CustomEvent<{ tag: string; missed?: boolean }>).detail);
+					e.preventDefault();
+				});
+			},
+			routes: { "/a": () => answer(part({ head: live("todos|SIG"), main: "<h1>A again</h1>" })) },
+		});
+		const first = FakeSocket.last!;
+		first.open();
+		first.onclose!();
+		await tick(2300);
+		const ws = FakeSocket.last!;
+		expect(ws).not.toBe(first);
+		ws.open();
+		await tick(60);
+		await settle();
+		ws.onmessage!({ data: JSON.stringify({ t: "stale" }) });
+		await tick(60);
+		await settle();
+		expect(heard).toEqual([
+			{ tag: "", missed: true },
+			{ tag: "", missed: true },
+		]);
+		expect(p.calls).toEqual([]);
+	});
+
 	test("a live island is watched beside the page, and an invalidated tag of its own fetches it alone", async () => {
 		FakeSocket.last = undefined;
 		let n = 0;

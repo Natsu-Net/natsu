@@ -68,6 +68,12 @@ export interface ActionDecl {
 export interface PageBlock {
 	title?: TextTemplate;
 	description?: TextTemplate;
+	/**
+	 * The page's canonical address, a same-site path or a URL (filled like the
+	 * title). Without it the canonical is the public URL plus this request's path,
+	 * with its language prefix.
+	 */
+	canonical?: TextTemplate;
 	/** "off", or seconds a signed-out visitor's page is kept. */
 	cache?: "off" | number;
 	/** "none", or a layout file under `pages/` (`_bare` for `pages/_bare.uwu`). */
@@ -87,7 +93,7 @@ const IDENT = /^[A-Za-z_$][\w$]*$/;
 const PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$\d][\w$]*)*$/;
 const SOURCE_NAME = /^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)*$/;
 const SERVICE_CALL = /^([A-Za-z_][\w-]*):([A-Za-z]+)\s+(.+)$/;
-const PAGE_ATTRIBUTES = new Set(["title", "description", "cache", "layout", "navigate"]);
+const PAGE_ATTRIBUTES = new Set(["title", "description", "canonical", "cache", "layout", "navigate"]);
 const FLAGS = new Set(["required", "when", "fallback"]);
 /** An action's short name, as uwu accepts it after `action:`. */
 const ACTION_SHORT = /^[A-Za-z_$][\w$.:-]*$/;
@@ -234,13 +240,14 @@ export function splitPageBlock(source: string, file: string): Split {
 function applyPageAttribute(block: PageBlock, attr: Tag["attrs"][number], source: string, file: string): void {
 	const line = lineAt(source, attr.offset);
 	if (!PAGE_ATTRIBUTES.has(attr.name)) {
-		throw new PageCompileError(file, line, `<page> has no '${attr.name}' attribute (title, description, cache, layout, navigate)`);
+		throw new PageCompileError(file, line, `<page> has no '${attr.name}' attribute (title, description, canonical, cache, layout, navigate)`);
 	}
 	if (attr.value === true) throw new PageCompileError(file, line, `<page ${attr.name}> needs a value`);
 	const value = attr.value;
 	switch (attr.name) {
 		case "title":
 		case "description":
+		case "canonical":
 			block[attr.name] = parseText(value, file, line, attr.name);
 			return;
 		case "cache":

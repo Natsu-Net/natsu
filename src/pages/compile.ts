@@ -252,7 +252,7 @@ function compileOne(source: string, file: string, options: { partials?: Readonly
 	// The block reads too: title holes, data arguments, service paths.
 	if (block) {
 		const at = { line: block.line, col: 1 };
-		for (const path of [...textPaths(block.title), ...textPaths(block.description)]) addRead(reads, path, at);
+		for (const path of [...textPaths(block.title), ...textPaths(block.description), ...textPaths(block.canonical)]) addRead(reads, path, at);
 		for (const decl of block.data) {
 			const where = { line: decl.line, col: 1 };
 			if (decl.from.t === "source") {
