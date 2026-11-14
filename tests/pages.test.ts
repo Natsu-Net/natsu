@@ -626,6 +626,24 @@ describe("head tags", () => {
 		expect(html).toContain(`<footer>Shoe &quot;Max&quot; &lt;2&gt; | Shop|Runs fast</footer>`);
 	});
 
+	test("the canonical keeps the language prefix; <page canonical> names another address", async () => {
+		source("entry", () => ({ english: "/news/launch" }));
+		const { get } = await serve(
+			{
+				"_layout.uwu": LAYOUT,
+				"about.uwu": `<template><h1>About</h1><a href="/contact">c</a></template>`,
+				"news/[slug].uwu": `<page canonical="{{entry.english}}"></page><template><h1>News</h1></template>`,
+			},
+			{},
+			(app) => app.localePrefixes({ prefixes: ["fr"] }),
+		);
+		const french = await (await get("/fr/about")).text();
+		expect(french).toContain(`<link rel="canonical" href="https://shop.test/fr/about">`);
+		expect(french).toContain(`<a href="/fr/contact">`);
+		expect(await (await get("/about")).text()).toContain(`<link rel="canonical" href="https://shop.test/about">`);
+		expect(await (await get("/fr/news/launch")).text()).toContain(`<link rel="canonical" href="https://shop.test/news/launch">`);
+	});
+
 	test("a page that reads viewer or session says noindex; a layout that does, does not", async () => {
 		const { get } = await serve({
 			"_layout.uwu": `<template><head>{{{page.head}}}</head>{{#if viewer}}hi{{/if}}{{> @child}}</template>`,

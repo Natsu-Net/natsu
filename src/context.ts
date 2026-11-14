@@ -12,6 +12,7 @@ import type { Server } from "bun";
 import { isIP } from "node:net";
 import { Cache, defaultCache } from "./cache.ts";
 import { type Nav, inertNav } from "./navigate.ts";
+import { type LocaleRouting, localizeTarget } from "./locale.ts";
 import type { SpanTimings } from "./telemetry.ts";
 import type { Session, SessionManager } from "./session/session.ts";
 import { type StateClass, grantRoom, resolveState, revokeRoom } from "./state.ts";
@@ -197,6 +198,14 @@ export class Context {
 	public route: string | undefined;
 	/** Phase wall-times, filled in by the built-ins; see `src/telemetry.ts`. */
 	public readonly timings: SpanTimings = {};
+	/**
+	 * The language prefix this request came in under (`fr` for `/fr/servers`),
+	 * or undefined for a bare URL. The request itself, `url` and `path` are
+	 * already without it; see `app.localePrefixes()`.
+	 */
+	public locale: string | undefined;
+	/** Set with `locale`: what `localize` needs to know which paths stay bare. */
+	public localeRouting: LocaleRouting | undefined;
 
 	/** Set by the session middleware; `session` creates one on demand. */
 	public sessions: SessionManager | undefined;
@@ -214,6 +223,16 @@ export class Context {
 		this.request = request;
 		this.server = server;
 		this.params = params ?? (EMPTY_PARAMS as Record<string, string>);
+	}
+
+	/**
+	 * `target` as a link for this visitor: a same-site path gets this
+	 * request's language prefix (`/servers` becomes `/fr/servers`), anything
+	 * else is returned as it is. Links in HTML answers and redirects are
+	 * rewritten anyway; this is for URLs built elsewhere (JSON, scripts, mail).
+	 */
+	public localize(target: string): string {
+		return this.locale && this.localeRouting ? localizeTarget(this.localeRouting, this.locale, target) : target;
 	}
 
 	public get method(): string {
