@@ -207,7 +207,10 @@
  *    happen, and on Back or Forward the page loads for real),
  *    `natsu:before-swap`, and `natsu:load`, once per page shown (at boot
  *    too) with `detail: { url, regions }`; `natsu:invalidate` (cancelable:
- *    the live refresh it announces does not happen) with `detail: { tag }`
+ *    the live refresh it announces does not happen) with `detail: { tag }`;
+ *    `tag` is "" and `missed` is true when the refresh is for what a dropped
+ *    socket or an expired page missed, not for one tag (a page being edited
+ *    cancels it, and the visitor's work stays)
  *  - attributes: `data-natsu-reload` on a link, form or ancestor for a real
  *    load, and on `<html>` for every visit from this document;
  *    `data-natsu-prefetch` for when links below it are fetched ahead
@@ -576,13 +579,15 @@ const watchLive = (refresh: () => unknown) => {
 		s.onopen = () => {
 			wait = 1e3;
 			say();
-			// Back after a drop: whatever changed meanwhile was not heard.
-			back && refresh();
+			// Back after a drop: whatever changed meanwhile was not heard. The same
+			// cancelable event as an invalidation (no tag: it is not one tag that
+			// changed), so a page being edited can hold the redraw.
+			back && fire("invalidate", { tag: "", missed: true }) && refresh();
 		};
 		s.onmessage = (e) => {
 			try {
 				const m = JSON.parse(e.data);
-				if (m.t == "stale") Date.now() - aged > 3e4 && ((aged = Date.now()), acting || refresh());
+				if (m.t == "stale") Date.now() - aged > 3e4 && ((aged = Date.now()), acting || (fire("invalidate", { tag: "", missed: true }) && refresh()));
 				if (m.t == "invalidate")
 					if (mine && tagsOf(mine).includes(m.tag)) acting || (clearTimeout(t), (t = setTimeout(() => fire("invalidate", { tag: m.tag }) && refresh(), 30)));
 					else
