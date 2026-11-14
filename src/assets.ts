@@ -578,6 +578,7 @@ export class Assets {
 				const end = out.indexOf(">", at);
 				if (start === -1 || end === -1) break;
 				const tag = out.slice(start, end + 1);
+				if (!/^<(?:script|link)[\s/]/i.test(tag)) continue;
 				const cleaned = withoutIntegrity(tag);
 				if (cleaned === tag) continue;
 				out = `${out.slice(0, start)}${cleaned}${out.slice(end + 1)}`;

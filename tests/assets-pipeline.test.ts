@@ -267,3 +267,16 @@ describe("asset pipeline end to end", () => {
 		expect(text).not.toContain("<style");
 	});
 });
+
+describe("integrity removal on a held remote file", () => {
+	test("only a script or link tag loses its integrity", () => {
+		const assets = new Assets({ outDir: out });
+		const url = "/_a/r-lib.0123456789.js";
+		(assets as unknown as { remoteUrls: Set<string> }).remoteUrls.add(url);
+		const inline = `<script>if (a<b) load("${url}", { integrity = "sha384-x", crossorigin = "anonymous" }); c>d</script>`;
+		const tag = `<script src="${url}" integrity="sha384-x" crossorigin="anonymous"></script>`;
+		const done = (assets as unknown as { dropIntegrity(page: string): string }).dropIntegrity(`<head>${inline}${tag}</head>`);
+		expect(done).toContain(inline);
+		expect(done).toContain(`<script src="${url}"></script>`);
+	});
+});
