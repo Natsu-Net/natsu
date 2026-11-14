@@ -46,8 +46,10 @@ interface Manifest {
 }
 
 const D = document;
-const SHEET = "link[rel=stylesheet]";
-const MANIFEST = "link[data-natsu-families]";
+const CRITICAL = "data-natsu-critical";
+const SHEET = `link[rel=stylesheet],style[${CRITICAL}]`;
+const MANIFEST = `link[data-natsu-families],style[${CRITICAL}][data-natsu-families]`;
+const CHUNKS = 'meta[name="natsu-chunks"]';
 const COPY = "data-natsu-copy";
 const read = new Map<string, Promise<Manifest | undefined>>();
 const known = new Map<string, Manifest>();
@@ -84,7 +86,7 @@ const live = (link: HTMLLinkElement) => link.media != "not all" && !link.disable
 const lasts = (manifest: Manifest): Map<number, HTMLLinkElement> => {
 	const out = new Map<number, HTMLLinkElement>();
 	for (const link of D.querySelectorAll<HTMLLinkElement>(SHEET)) {
-		const at = manifest.c.indexOf(link.getAttribute("href")!);
+		const at = manifest.c.indexOf((link.getAttribute(CRITICAL) ?? link.getAttribute("href"))!);
 		if (at >= 0 && live(link)) out.set(at, link);
 	}
 	return out;
@@ -149,7 +151,7 @@ const order = (): void => {
 		let tail = [...have.values()].reduce((a, b) => (position(a) > position(b) ? a : b)) as Element;
 		for (const rank of ranks.slice(from)) {
 			const old = have.get(rank)!;
-			const copy = old.cloneNode() as HTMLLinkElement;
+			const copy = old.cloneNode(old.hasAttribute(CRITICAL)) as HTMLLinkElement;
 			copy.setAttribute(COPY, "");
 			copy.removeAttribute("data-natsu-families");
 			tail.after(copy);
@@ -159,12 +161,13 @@ const order = (): void => {
 	}
 };
 
+let hinted = false;
 let watching = false;
 /** Keep the order whenever a stylesheet link comes, goes, or starts or stops applying. */
 const watch = () => {
 	if (watching) return;
 	watching = true;
-	const touches = (nodes: NodeList) => [...nodes].some((node) => node.nodeName == "LINK");
+	const touches = (nodes: NodeList) => [...nodes].some((node) => node.nodeName == "LINK" || (node.nodeName == "STYLE" && (node as Element).hasAttribute(CRITICAL)));
 	new MutationObserver((records) => {
 		if (records.some((record) => record.type == "attributes" || touches(record.addedNodes) || touches(record.removedNodes))) order();
 	}).observe(D.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["media", "disabled", "href"] });
@@ -207,6 +210,10 @@ export function mount<E extends Element = Element>(selector: string, load: () =>
 	watch();
 	const runtime = (window as { natsu?: Runtime }).natsu;
 	const boot = () => {
+		if (!hinted && D.querySelector(CHUNKS)) {
+			hinted = true;
+			import("./idle.ts").then((idle) => idle.idlePrefetch()).catch(() => {});
+		}
 		if (runtime) runtime.mount(selector, own);
 		else scan(D.documentElement);
 		new MutationObserver((records) => {
