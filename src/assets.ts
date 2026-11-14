@@ -1277,6 +1277,7 @@ export class Assets {
 			chunks: partition.chunks.map((chunk, n) => ({ name: chunk.name, url: urls[n]!, bytes: chunk.css.length })),
 		};
 		log.info(`[<magenta>assets</magenta>] ${name}: core ${partition.chunks[0]!.css.length} B and ${partition.chunks.length - 1} families in ${partition.report.ms.toFixed(0)} ms`);
+		if (partition.chunks.length === 1) log.warn(`[<yellow>assets</yellow>] <cyan>${name}</cyan> has no families: every page links the whole sheet, so page chunking would send less. Narrow the safelist or set chunking to "page".`);
 	}
 
 	/**
