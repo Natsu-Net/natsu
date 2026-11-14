@@ -17,6 +17,7 @@ import { Router, type RouteEntry } from "./router.ts";
 import { type Session, SessionManager, sessionMiddleware } from "./session/session.ts";
 import { StaticFiles } from "./static.ts";
 import { isIslandRequest, refuseBeforeHandler, refuseWithoutRoute } from "./navigate.ts";
+import { type LocalePrefixOptions, type LocaleRouting, isExcluded, localeRouting, localizeHtml, localizeTarget, splitLocale, strippedRequest } from "./locale.ts";
 import { SOCKET_PATH, type LiveHooks, configureLive, liveWebSocketHandler, sameOriginSocket, setLiveHooks, setLiveServer, socketCountFor, upgradeLive } from "./live.ts";
 
 export type ErrorHandler = (error: Error, ctx: Context) => void | Promise<void>;
@@ -87,6 +88,7 @@ export class Application {
 	private errorHandler: ErrorHandler | undefined;
 	private upgradeGuardHandler: UpgradeGuard | undefined;
 	private notFoundHandler: Handler | undefined;
+	private locales: LocaleRouting | undefined;
 	private readonly cwd: string;
 
 	constructor(options: ApplicationOptions = {}) {
@@ -138,6 +140,22 @@ export class Application {
 		return this;
 	}
 
+	/**
+	 * Serve every route again under each language prefix: `/fr/servers` runs
+	 * the `/servers` route with `ctx.locale = "fr"` and a request that no
+	 * longer carries the prefix, and links and redirects in its answer keep the
+	 * prefix (see `src/locale.ts`). Call it before `start()`; pass undefined to
+	 * turn it off.
+	 */
+	public localePrefixes(options: LocalePrefixOptions | undefined): this {
+		this.locales = options ? localeRouting(options) : undefined;
+		return this;
+	}
+
+	public get localeRouting(): LocaleRouting | undefined {
+		return this.locales;
+	}
+
 	// --- request path ------------------------------------------------------
 
 	/**
@@ -148,7 +166,22 @@ export class Application {
 	 * pattern would have captured.
 	 */
 	public async handle(request: Request, server?: NatsuServer, params?: Record<string, string>): Promise<Response> {
+		const localized = this.localizedRequest(request);
+		if (localized) return this.run(localized.request, server, this.terminalFor(this.lookup(localized.request)), params, localized.locale);
 		return this.run(request, server, this.terminalFor(this.lookup(request)), params);
+	}
+
+	/** The request without its language prefix, when it has one this app serves. */
+	private localizedRequest(request: Request): { request: Request; locale: string } | null {
+		if (!this.locales) return null;
+		let pathname: string;
+		try {
+			pathname = new URL(request.url).pathname;
+		} catch {
+			return null;
+		}
+		const split = splitLocale(this.locales, pathname);
+		return split ? { request: strippedRequest(request, split.path), locale: split.locale } : null;
 	}
 
 	private lookup(request: Request): RouteEntry | undefined {
@@ -179,6 +212,9 @@ export class Application {
 			} catch (error) {
 				await this.handleError(error, ctx);
 			}
+			// Inside the chain, so the links are rewritten before a middleware
+			// such as compression turns the page into bytes.
+			if (ctx.locale) localizeBody(ctx);
 		};
 	}
 
@@ -187,10 +223,15 @@ export class Application {
 		server: NatsuServer | undefined,
 		terminal: Terminal,
 		params?: Record<string, string>,
+		locale?: string,
 	): Promise<Response> {
 		const ctx = new Context(request, server, params);
 		ctx.trustProxy = this.config.General.proxy;
 		ctx.proxyHops = this.config.General.proxyHops;
+		if (locale && this.locales) {
+			ctx.locale = locale;
+			ctx.localeRouting = this.locales;
+		}
 
 		try {
 			this.chain ??= compose([...this.builtins(), ...this.userMiddleware]);
@@ -198,6 +239,9 @@ export class Application {
 		} catch (error) {
 			await this.handleError(error, ctx);
 		}
+		// Again outside every middleware: a redirect or a page one of them
+		// answered by itself (a body still text) keeps the language too.
+		if (ctx.locale) localizeAnswer(ctx);
 
 		return ctx.toResponse();
 	}
@@ -320,9 +364,19 @@ export class Application {
 	/** Compile the route table into the shape `Bun.serve` wants. */
 	public buildRoutes(): Record<string, (request: BunRequest, server: NatsuServer) => Promise<Response>> {
 		const routes: Record<string, (request: BunRequest, server: NatsuServer) => Promise<Response>> = {};
+		const locales = this.locales;
 		for (const [path, entry] of Router.routes().entries) {
 			const terminal = this.terminalFor(entry);
 			routes[path] = (request, server) => this.run(request, server, terminal, request.params as Record<string, string>);
+			if (!locales || isExcluded(locales, path)) continue;
+			for (const locale of locales.prefixes) {
+				const serve = (request: BunRequest, server: NatsuServer) =>
+					this.run(strippedRequest(request, path === "/" ? "/" : stripPrefix(request.url, locale)), server, terminal, request.params as Record<string, string>, locale);
+				if (path === "/") {
+					routes[`/${locale}`] = serve;
+					routes[`/${locale}/`] = serve;
+				} else routes[`/${locale}${path}`] = serve;
+			}
 		}
 		return routes;
 	}
@@ -395,6 +449,8 @@ export class Application {
 						return undefined as unknown as Response;
 					}
 				}
+				const localized = this.localizedRequest(request);
+				if (localized) return this.run(localized.request, server, terminal, undefined, localized.locale);
 				return this.run(request, server, terminal);
 			},
 			error: (error: Error) => {
@@ -506,6 +562,35 @@ export class Application {
 		await this.stop(force);
 		await this.sessions?.close();
 		this.sessions = undefined;
+	}
+}
+
+/** The path of `url` without its leading `/<locale>`. */
+function stripPrefix(url: string, locale: string): string {
+	const path = new URL(url).pathname;
+	const rest = path.slice(locale.length + 1);
+	return rest === "" ? "/" : rest;
+}
+
+function isHtml(ctx: Context): boolean {
+	if (typeof ctx.response.body !== "string") return false;
+	const type = ctx.response.headersInitialized ? ctx.response.headers.get("content-type") : null;
+	if (type) return /^text\/html\b/i.test(type);
+	return /^\s*</.test(ctx.response.body);
+}
+
+function localizeBody(ctx: Context): void {
+	if (!ctx.locale || !ctx.localeRouting || !isHtml(ctx)) return;
+	ctx.response.body = localizeHtml(ctx.localeRouting, ctx.locale, ctx.response.body as string);
+}
+
+function localizeAnswer(ctx: Context): void {
+	if (!ctx.locale || !ctx.localeRouting) return;
+	localizeBody(ctx);
+	if (!ctx.response.headersInitialized) return;
+	for (const name of ["location", "natsu-location"]) {
+		const target = ctx.response.headers.get(name);
+		if (target) ctx.response.headers.set(name, localizeTarget(ctx.localeRouting, ctx.locale, target));
 	}
 }
 
