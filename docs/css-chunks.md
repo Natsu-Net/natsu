@@ -209,3 +209,24 @@ for one visit to one page. Both serve the same immutable, hashed chunks and
 fall back the same way when a chunk a page links is gone after a deploy: a
 core asked for under an old name gets the whole sheet for a few minutes, a
 family the empty sheet.
+
+## Segments
+
+`chunking: { mode: "families", cut: "segments" }` cuts each sheet into
+**segments**: stretches of the sheet in source order (uwu-template's
+`segmentCSS`). A rule joins the segment of its block only when no rule it
+would jump over competes with it, so a page that links any subset of segments,
+in order, computes what the whole sheet computes, with no copies. Rules
+without a class go to the core or to a segment every page links.
+Neighbouring segments are merged when the sample pages show that saves bytes
+and requests, and until no sample page links more than `maxLinks` (default 8)
+segments of a sheet. With `cut: "segments"`, samples are page files with
+the partials they include (`{{> name}}`) and the `_*.uwu` layouts around
+them.
+
+`link: "markup"` links only the segments a page's markup needs: scripts, the
+safelist and mounts are not read for it, and an island's answer links
+nothing. Instead each page gets a small script that links a missing segment,
+in its place, as soon as an element whose classes need it is in the document
+(the manifest lists, per segment, the classes that need it). What a script
+draws loads the segment it needs then, once, and the next page keeps it.

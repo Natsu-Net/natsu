@@ -190,3 +190,56 @@ describe("mount()", () => {
 		expect(sheets(html.replace(/ data-natsu-families="[^"]*"/, ""))).toEqual([urls[0]!, urls[1]!]);
 	});
 });
+
+describe("segments linked by markup", () => {
+	const segments = (extra: Partial<AssetsOptions> = {}) =>
+		pipeline({ chunking: { mode: "families", cut: "segments", link: "markup", minBytes: 0, requestBytes: 0, maxLinks: 99 }, ...extra });
+	const named = (report: Awaited<ReturnType<typeof pipeline>>["report"], html: string) =>
+		sheets(html.replace(/ data-natsu-families="[^"]*"/, "")).map((url) => report.families!.site!.chunks.find((chunk) => chunk.url === url)!.name);
+
+	test("cuts the sheet into segments in source order and reports them", async () => {
+		const { report } = await segments();
+		expect(report.families!.site!.chunks.map((chunk) => chunk.name)).toEqual(["core", "btn", "muted", "mu", "pm"]);
+	});
+
+	test("a page links only what its markup needs, whatever its scripts could write", async () => {
+		writeFileSync(join(dir, "app.js"), 'el.classList.add("pm-row__cell2");\n');
+		new Router().get("/music", () => page('<div class="mu-card__part3 btn">x</div>', '<script type="module" src="/js/app.js"></script>'));
+		const { app, report } = await segments({ scripts: { app: join(dir, "app.js") } });
+		expect(named(report, await (await get(app, "/music")).text())).toEqual(["core", "btn", "mu"]);
+	});
+
+	test("the manifest says which classes need each segment, for the client to link on sight", async () => {
+		new Router().get("/plain", () => page("<p>x</p>"));
+		const { app, report } = await segments();
+		const html = await (await get(app, "/plain")).text();
+		const manifest = await (await get(app, /data-natsu-families="([^"]*)"/.exec(html)![1]!)).json();
+		const chunks = report.families!.site!.chunks;
+		expect(manifest.c).toEqual(chunks.map((chunk) => chunk.url));
+		expect(manifest.r[3].length).toBe(30);
+		expect(manifest.r[3][0].length).toBe(1);
+		expect(named(report, html)).toEqual(["core"]);
+		const watcher = /<script src="(\/_a\/natsu-styles\.[0-9a-f]+\.js)" defer><\/script>/.exec(html)?.[1];
+		expect(watcher).toBeTruthy();
+		expect((await get(app, watcher!)).headers.get("cache-control")).toContain("immutable");
+	});
+
+	test("an island's answer links nothing: the client links what it needs", async () => {
+		new Router().get("/bell", island(() => '<p class="mu-card__part3">3 new</p>'));
+		const { app } = await segments();
+		expect(await (await get(app, "/bell", { "natsu-island": "1" })).text()).toBe('<p class="mu-card__part3">3 new</p>');
+	});
+});
+
+describe("segments with page navigation", () => {
+	test("the watcher's script carries each answer's nonce, like the runtime's", async () => {
+		new Router().get("/nav", (ctx) => {
+			ctx.response.headers.set("content-security-policy", "script-src 'nonce-abc123' 'strict-dynamic'; object-src 'none'");
+			return page('<main id="main" data-natsu-region><p class="btn">x</p></main>');
+		});
+		const { app } = await pipeline({ navigate: true, chunking: { mode: "families", cut: "segments", link: "markup", minBytes: 0, requestBytes: 0 } });
+		const html = await (await get(app, "/nav")).text();
+		expect(html).toMatch(/<script src="\/_a\/natsu-styles\.[0-9a-f]+\.js" nonce="abc123" defer><\/script>/);
+		expect(html.match(/natsu-styles\./g)!.length).toBe(1);
+	});
+});
