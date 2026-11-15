@@ -236,6 +236,25 @@ describe("script formats", () => {
 	});
 });
 
+describe("classic scripts with a CommonJS export guard", () => {
+	test("a script ending in `module.exports` still runs when loaded by a bare <script>", async () => {
+		// The guard lets a test `require` the file; Bun then takes it for CommonJS.
+		writeFileSync(
+			join(dir, "guarded.js"),
+			'(() => {\n\twindow.ran = (window.ran ?? 0) + 1;\n\tif (typeof module !== "undefined") module.exports = { ran: true };\n})();\n',
+		);
+		for (const minify of [false, true]) {
+			const pipeline = new Assets({ outDir: out, classicScripts: { guarded: join(dir, "guarded.js") }, minify });
+			await pipeline.build();
+			const body = await read(pipeline, pipeline.url("guarded"));
+
+			const window: { ran?: number } = {};
+			new Function("window", body)(window);
+			expect(window.ran).toBe(1);
+		}
+	});
+});
+
 describe("deduplication", () => {
 	test("two pages that need the same rules share one chunk", async () => {
 		const pipeline = assets();

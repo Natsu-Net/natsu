@@ -40,7 +40,7 @@
  */
 
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, brotliCompressSync, constants, gzip, gzipSync } from "node:zlib";
@@ -1097,8 +1097,14 @@ export class Assets {
 
 	private async buildClassicScripts(): Promise<void> {
 		for (const [name, file] of Object.entries(this.options.classicScripts ?? {})) {
+			// A script that ends with a `module.exports` guard (so tests can `require` it) is
+			// taken for CommonJS, and Bun wraps a CommonJS *entry* without ever calling it:
+			// the script would load and do nothing. Imported from a synthetic ES module
+			// entry, it is called.
+			const entry = join(dirname(file), `.classic-entry-${name}.js`);
 			const built = await Bun.build({
-				entrypoints: [file],
+				entrypoints: [entry],
+				files: { [entry]: `import ${JSON.stringify(file)};\n` },
 				target: "browser",
 				format: "iife",
 				splitting: false,
