@@ -1827,22 +1827,12 @@ interface MountSite {
 /** The part of Bun's metafile this reads. */
 type Metafile = BundleMeta;
 
-/**
- * Whether Bun read a classic entry as CommonJS, which it does for a file
- * that names `module` or `exports` and has no import or export. Bun wraps
- * such an entry in a function nothing calls, so the script would never run.
- */
 function isCommonJsEntry(metafile: Metafile | undefined, file: string): boolean {
 	const inputs = (metafile as { inputs?: Record<string, { format?: string }> } | undefined)?.inputs ?? {};
 	const entry = resolvePath(file);
 	return Object.entries(inputs).some(([path, input]) => input.format === "cjs" && resolvePath(path) === entry);
 }
 
-/**
- * Loads a classic entry inside a function whose `module` and `exports` are
- * undefined, as they are for a `<script src>`: a `typeof module` guard takes
- * its browser branch and the code runs.
- */
 function classicScope(file: string): Bun.BunPlugin {
 	const entry = resolvePath(file);
 	return {
