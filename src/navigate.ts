@@ -438,6 +438,7 @@ export class Navigation {
 	public buildId = "";
 	/** The runtime's URL, set by `Assets.build()`; "" until then. */
 	public runtime = "";
+	public scripts: string[] = [];
 	public pwa: { head: string; script: (nonce: string | undefined) => string } | undefined;
 	private readonly documentHeaders: string[];
 	private readonly inject: boolean;
@@ -655,6 +656,7 @@ export class Navigation {
 		if (this.inject && this.runtime) {
 			const nonce = scriptNonce(csp);
 			tags += `<script src="${this.runtime}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
+			for (const src of this.scripts) tags += `<script src="${src}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`;
 			if (this.pwa) tags += this.pwa.script(nonce);
 		}
 		if (this.pwa) tags += this.pwa.head;

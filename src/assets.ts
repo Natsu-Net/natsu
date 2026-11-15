@@ -55,6 +55,7 @@ import {
 	familiesNeedingOnly,
 	partitionCSS,
 	profileDocument,
+	segmentCSS,
 	scriptClasses,
 	selectorNames,
 	selectorNeeds,
@@ -248,6 +249,9 @@ export interface FamilyChunking extends Omit<FamilyOptions, "samples"> {
 	 * to save data. Off by default.
 	 */
 	prefetch?: boolean;
+	cut?: "families" | "segments";
+	maxLinks?: number;
+	link?: "scripts" | "markup";
 }
 
 export interface AssetReport {
@@ -523,6 +527,7 @@ export class Assets {
 		await this.buildChunks();
 		await this.buildPwa();
 		await this.buildNavigation();
+		await this.buildWatcher();
 		this.buildId = this.navigation?.buildId || Bun.hash(JSON.stringify(this.manifest())).toString(36);
 		this.finishPwa();
 		this.report.urls = Object.fromEntries(this.entries);
@@ -676,6 +681,7 @@ export class Assets {
 		});
 		if (remote) out = this.dropIntegrity(out);
 		for (const [core, name] of grouped) out = this.linkFamilies(out, core, this.pick(name, out, shape!));
+		if (grouped.size > 0 && this.watcher && !this.navigation && !out.includes(this.watcher)) out = insertHeadTags(out, `<script src="${this.watcher}"${nonce ? ` nonce="${nonce}"` : ""} defer></script>`);
 		for (const url of resolved.values()) {
 			const lazy = url ? this.lazy.get(url) : undefined;
 			if (!lazy) continue;
@@ -704,6 +710,16 @@ export class Assets {
 	 */
 	private pick(name: string, page: string, shape: PageShape): number[] {
 		const families = this.families.get(name)!;
+		if (this.familyOptions?.link === "markup") {
+			const key = this.shapes.key(name, shape);
+			let picked = this.picks.get(key);
+			if (!picked) {
+				picked = chunksFor(families.partition, families.classes.filter((name) => this.shapes.has(shape, name)));
+				if (this.picks.size >= 4096) this.picks.delete(this.picks.keys().next().value!);
+				this.picks.set(key, picked);
+			}
+			return picked;
+		}
 		const { uses, key: scripts, sites } = this.scriptsOf(page);
 		const matched = sites.filter((site) => mayMatch(page, site.needs));
 		const key = `${this.shapes.key(name, shape)} ${scripts} ${matched.map((site) => site.id).join(",")}`;
@@ -801,7 +817,7 @@ export class Assets {
 	 * fragment needing no family is left as it is.
 	 */
 	private islandStyles(ctx: Context, fragment: string): string {
-		if (this.families.size === 0 || ctx.response.headers.get("natsu-island") !== "1") return fragment;
+		if (this.families.size === 0 || ctx.response.headers.get("natsu-island") !== "1" || this.familyOptions?.link === "markup") return fragment;
 		const shape = this.shapes.read(fragment);
 		let links = "";
 		for (const [name, families] of this.families) {
@@ -1254,9 +1270,17 @@ export class Assets {
 		const options = this.familyOptions!;
 		const paths = options.samples ?? this.markupPaths;
 		// What the safelist names counts on every sample page, as it does on every page.
-		const safe = [...selectorNames(parts.join("\n")).classes].filter((name) => this.safe(name));
-		const samples = paths ? (await readAll(paths)).map((text) => new Set([...profileDocument(text).classes, ...safe])) : undefined;
-		const partition = partitionCSS(parts, { ...options, samples });
+		const safe = options.link === "markup" ? [] : [...selectorNames(parts.join("\n")).classes].filter((name) => this.safe(name));
+		const texts = paths ? (options.cut === "segments" ? await pageSamples(paths) : await readAll(paths)) : undefined;
+		const samples = texts?.map((text) => new Set([...profileDocument(text).classes, ...safe]));
+		const partition = options.cut === "segments"
+			? segmentCSS(parts, {
+				...(samples && { samples }),
+				...(options.maxLinks !== undefined && { maxLinks: options.maxLinks }),
+				...(options.minBytes !== undefined && { minBytes: options.minBytes }),
+				...(options.requestBytes !== undefined && { requestBytes: options.requestBytes }),
+			})
+			: partitionCSS(parts, { ...options, samples });
 		const renamed = (css: string) => (this.classes.size > 0 ? renameCSSClasses(css, this.classes) : css);
 		for (const chunk of partition.chunks) {
 			chunk.css = minify ? minifyCSS(renamed(chunk.css)).css : renamed(chunk.css);
@@ -1276,7 +1300,7 @@ export class Assets {
 			...partition.report,
 			chunks: partition.chunks.map((chunk, n) => ({ name: chunk.name, url: urls[n]!, bytes: chunk.css.length })),
 		};
-		log.info(`[<magenta>assets</magenta>] ${name}: core ${partition.chunks[0]!.css.length} B and ${partition.chunks.length - 1} families in ${partition.report.ms.toFixed(0)} ms`);
+		log.info(`[<magenta>assets</magenta>] ${name}: core ${partition.chunks[0]!.css.length} B and ${partition.chunks.length - 1} ${options.cut === "segments" ? "segments" : "families"} in ${partition.report.ms.toFixed(0)} ms`);
 		if (partition.chunks.length === 1) log.warn(`[<yellow>assets</yellow>] <cyan>${name}</cyan> has no families: every page links the whole sheet, so page chunking would send less. Narrow the safelist or set chunking to "page".`);
 	}
 
@@ -1358,8 +1382,9 @@ export class Assets {
 					}
 				}
 			}
-			if (Object.keys(mounts).length === 0) continue;
-			const json = JSON.stringify({ c: families.urls, m: mounts });
+			const markup = this.familyOptions?.link === "markup";
+			if (Object.keys(mounts).length === 0 && !markup) continue;
+			const json = JSON.stringify({ c: families.urls, m: mounts, ...(markup && { r: chunkNeeds(families.partition) }) });
 			const url = this.hold(`${name}.mounts.${hash(json)}.json`, json, "application/json; charset=utf-8");
 			this.pin(url);
 			this.manifests.set(families.urls[0]!, url);
@@ -1374,7 +1399,10 @@ export class Assets {
 	}
 
 	private get runtimeFlags(): Record<string, string> {
-		return { NATSU_FIRST_LOAD: String(Boolean(this.options.firstLoad)), NATSU_CHUNKS: String(Boolean(this.options.prefetchChunks)) };
+		return {
+			NATSU_FIRST_LOAD: String(Boolean(this.options.firstLoad)),
+			NATSU_CHUNKS: String(Boolean(this.options.prefetchChunks)),
+		};
 	}
 
 	/** Whether `minify` turns on minification for this kind of entry. */
@@ -1585,6 +1613,25 @@ export class Assets {
 	 * `NATSU_DEV` define the runtime reads); otherwise minified, whatever
 	 * `minify` says, because every visitor downloads it.
 	 */
+	private watcher = "";
+
+	private async buildWatcher(): Promise<void> {
+		this.watcher = "";
+		if (this.familyOptions?.link !== "markup") return;
+		const file = fileURLToPath(new URL("./client/styles-boot.ts", import.meta.url));
+		const dev = config.General.development;
+		const built = await Bun.build({ entrypoints: [file], target: "browser", format: "iife", splitting: false, minify: !dev });
+		if (!built.success || !built.outputs[0]) {
+			for (const message of built.logs) log.error(`[<red>assets</red>] ${String(message)}`);
+			return;
+		}
+		const body = await built.outputs[0].text();
+		const url = this.hold(`natsu-styles.${hash(body)}.js`, body, "text/javascript; charset=utf-8");
+		this.pin(url);
+		this.watcher = url;
+		if (this.navigation) this.navigation.scripts = [url];
+	}
+
 	private async buildNavigation(): Promise<void> {
 		const navigation = this.navigation;
 		if (!navigation) return;
@@ -2078,7 +2125,11 @@ function cspNonce(ctx: Context): string | undefined {
  * starts with `!` leaves that path out.
  */
 async function readAll(paths: string[]): Promise<string[]> {
-	const out: string[] = [];
+	return [...(await readFiles(paths)).values()];
+}
+
+async function readFiles(paths: string[]): Promise<Map<string, string>> {
+	const out = new Map<string, string>();
 	const skip = paths.filter((p) => p.startsWith("!")).map((p) => p.slice(1).replace(/\/$/, ""));
 	const visit = async (path: string): Promise<void> => {
 		if (skip.some((s) => path === s || path.startsWith(`${s}/`))) return;
@@ -2088,10 +2139,40 @@ async function readAll(paths: string[]): Promise<string[]> {
 			for (const entry of await readdir(path)) await visit(join(path, entry));
 			return;
 		}
-		if (/\.(m?js|ts|uwu|html?)$/.test(path)) out.push(await readFile(path, "utf8"));
+		if (/\.(m?js|ts|uwu|html?)$/.test(path)) out.set(path, await readFile(path, "utf8"));
 	};
 	for (const path of paths) if (!path.startsWith("!")) await visit(path);
 	return out;
+}
+
+const INCLUDE = /\{\{>\s*([\w./-]+)/g;
+
+async function pageSamples(paths: string[]): Promise<string[]> {
+	const files = await readFiles(paths);
+	const byName = new Map<string, string>();
+	for (const path of files.keys()) {
+		const name = path.replace(/\.uwu$/, "");
+		for (let at = name.indexOf("/"); at !== -1; at = name.indexOf("/", at + 1)) if (!byName.has(name.slice(at + 1))) byName.set(name.slice(at + 1), path);
+	}
+	const expand = (path: string, seen: Set<string>): string => {
+		if (seen.has(path)) return "";
+		seen.add(path);
+		const text = files.get(path) ?? "";
+		let out = text;
+		for (const match of text.matchAll(INCLUDE)) {
+			const target = byName.get(match[1]!) ?? byName.get(`partials/${match[1]!}`);
+			if (target) out += expand(target, seen);
+		}
+		return out;
+	};
+	const layouts = [...files.keys()].filter((path) => /\/_[^/]*\.uwu$/.test(path));
+	const partial = (path: string) => /\/partials\//.test(path);
+	const pages = [...files.keys()].filter((path) => path.endsWith(".uwu") && !partial(path) && !layouts.includes(path));
+	if (pages.length === 0) return [...files.values()];
+	return pages.map((page) => {
+		const around = layouts.filter((layout) => page.startsWith(layout.slice(0, layout.lastIndexOf("/") + 1)));
+		return [page, ...around].map((path) => expand(path, new Set())).join("\n");
+	});
 }
 
 /** `site.js` and `site.a1b2c3d4.js` both -> `site` */
@@ -2155,4 +2236,16 @@ function typeOf(file: string): string | undefined {
 /** Short content hash. Long enough that a collision is not a real worry. */
 function hash(body: AssetBody): string {
 	return new Bun.CryptoHasher("sha256").update(body).digest("hex").slice(0, 10);
+}
+
+function chunkNeeds(partition: CSSPartition): Record<number, string[][]> {
+	const out: Record<number, string[][]> = {};
+	partition.chunks.forEach((chunk, n) => {
+		if (n === 0) return;
+		const lists = [...new Map(chunk.requires.map((list) => [[...list].sort().join(" "), [...list].sort()])).values()].sort((a, b) => a.length - b.length);
+		const kept: string[][] = [];
+		for (const list of lists) if (!kept.some((small) => small.every((name) => list.includes(name)))) kept.push(list);
+		out[n] = kept;
+	});
+	return out;
 }
