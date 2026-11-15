@@ -39,7 +39,7 @@ const ORIGIN = "https://shop.test";
 
 /** The runtime as it ships: one classic script, minified. */
 async function build(dev: boolean): Promise<string> {
-	const out = await Bun.build({ entrypoints: [ENTRY], format: "iife", minify: true, define: { NATSU_DEV: String(dev) } });
+	const out = await Bun.build({ entrypoints: [ENTRY], format: "iife", minify: true, define: { NATSU_DEV: String(dev), NATSU_FIRST_LOAD: "true", NATSU_CHUNKS: "true" } });
 	if (!out.success) throw new AggregateError(out.logs, "navigate.ts did not build");
 	return out.outputs[0]!.text();
 }
@@ -3514,6 +3514,119 @@ describe("live data", () => {
 		FakeSocket.last = undefined;
 		open({ html: page(), before: (w) => (w.WebSocket = FakeSocket) });
 		expect(FakeSocket.last).toBeUndefined();
+	});
+});
+
+describe("critical styles, hints and chunks already held", () => {
+	const LINK = `<link rel="stylesheet" href="/_a/site.a.css">`;
+	const CRITICAL = `<style data-natsu-critical="/_a/site.a.css" nonce="N0NCE">.a{}</style>`;
+	const WARM = `<link rel="preload" as="style" href="/_a/site.a.css" data-natsu-warm>`;
+	const cold = (o: PageInit = {}) => page(o).replace(LINK, CRITICAL + WARM);
+	const styles = (p: Opened) => [...p.document.head.querySelectorAll('link[rel="stylesheet"],style[data-natsu-critical]')].map((e: W) => (e.matches("style") ? "inline " + e.getAttribute("data-natsu-critical") : e.getAttribute("href")));
+	const count = (p: Opened, sel: string) => p.document.head.querySelectorAll(sel).length;
+
+	test("a sheet the document holds inline is in place: not linked again, the style kept, across visits", async () => {
+		const p = open({ html: cold(), routes: { "/b": () => answer(part()), "/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>" })) } });
+		const style = p.document.querySelector("style[data-natsu-critical]");
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(styles(p)).toEqual(["inline /_a/site.a.css"]);
+		expect(p.document.querySelector("style[data-natsu-critical]")).toBe(style);
+		p.click("#to-c");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page C");
+		expect(styles(p)).toEqual(["inline /_a/site.a.css"]);
+		expect(p.loads).toEqual([]);
+	});
+
+	test("a sheet the next page adds goes in where its head puts it, around the inline one, and only it is waited for", async () => {
+		const p = open({
+			html: cold(),
+			routes: {
+				"/b": () => answer(part({ head: `<link rel="stylesheet" href="/_a/site.b.css">` })),
+				"/c": () => answer(part({ title: "C", main: "<h1>Page C</h1>", sheet: "/_a/site.c.css", head: LINK })),
+			},
+			holdCss: ["/_a/site.b.css"],
+		});
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page A");
+		expect(styles(p)).toEqual(["inline /_a/site.a.css", "/_a/site.b.css"]);
+		p.release("/_a/site.b.css");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(styles(p)).toEqual(["inline /_a/site.a.css", "/_a/site.b.css"]);
+		p.click("#to-c");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page C");
+		expect(styles(p)).toEqual(["/_a/site.c.css", "inline /_a/site.a.css"]);
+	});
+
+	test("an inline sheet the next page does not list goes at the swap, as a link would", async () => {
+		const p = open({ html: cold(), routes: { "/b": () => answer(part({ sheet: "/_a/site.b.css" })) } });
+		p.click("#to-b");
+		await settle();
+		expect(text(p, "main h1")).toBe("Page B");
+		expect(styles(p)).toEqual(["/_a/site.b.css"]);
+	});
+
+	test("an inline sheet with a media the next page's link also has is the same sheet; another media is not", async () => {
+		const screen = cold().replace(`<style data-natsu-critical="/_a/site.a.css"`, `<style media="screen" data-natsu-critical="/_a/site.a.css"`);
+		const same = open({ html: screen, routes: { "/b": () => answer({ ...part(), body: part().body.replace(LINK, `<link rel="stylesheet" href="/_a/site.a.css" media="screen">`) }) } });
+		same.click("#to-b");
+		await settle();
+		expect(styles(same)).toEqual(["inline /_a/site.a.css"]);
+		const other = open({ html: screen, routes: { "/b": () => answer(part()) } });
+		other.click("#to-b");
+		await settle();
+		expect(text(other, "main h1")).toBe("Page B");
+		expect(styles(other)).toEqual(["/_a/site.a.css"]);
+	});
+
+	test("warm and prefetch hints are left alone by the head merge: never removed, never doubled", async () => {
+		const p = open({
+			html: cold({ head: `<link rel="modulepreload" href="/_a/app.js" data-natsu-warm><meta name="description" content="about A">` }),
+			routes: { "/b": () => answer(part({ head: `<meta name="description" content="about B">` })), "/c": () => answer(part({ title: "C" })) },
+		});
+		const hint = p.document.createElement("link");
+		hint.setAttribute("rel", "prefetch");
+		hint.setAttribute("as", "script");
+		hint.setAttribute("href", "/_a/chunk.x.js");
+		hint.setAttribute("data-natsu-prefetch", "");
+		p.document.head.append(hint);
+		for (const to of ["#to-b", "#to-c"]) {
+			p.click(to);
+			await settle();
+			expect(count(p, "link[data-natsu-warm]")).toBe(2);
+			expect(count(p, "link[data-natsu-prefetch]")).toBe(1);
+			expect(hint.isConnected).toBe(true);
+		}
+		expect(count(p, 'meta[name="description"]')).toBe(0);
+		expect(p.loads).toEqual([]);
+	});
+
+	test("a script chunk the document already ran is never created or run again, however many pages list it", async () => {
+		const ran: string[] = [];
+		const js = (name: string) => (w: W) => (ran.push(name), w.natsu.mount("[data-" + name + "]", () => {}));
+		const p = open({
+			html: page({ scripts: ["/_a/x.js"] }),
+			scripts: { "/_a/x.js": js("x"), "/_a/y.js": js("y") },
+			routes: {
+				"/b": () => answer(part({ scripts: ["/_a/x.js", "/_a/y.js"] })),
+				"/c": () => answer(part({ title: "C", scripts: ["/_a/y.js", "/_a/x.js"] })),
+			},
+		});
+		p.click("#to-b");
+		await settle();
+		p.click("#to-c");
+		await settle();
+		p.click("#to-b");
+		await settle();
+		expect(ran).toEqual(["x", "y"]);
+		expect(p.document.querySelectorAll('script[src="/_a/x.js"]')).toHaveLength(1);
+		expect(p.document.querySelectorAll('script[src="/_a/y.js"]')).toHaveLength(1);
+		expect(p.loads).toEqual([]);
 	});
 });
 

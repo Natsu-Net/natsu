@@ -43,6 +43,7 @@
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import type { Assets } from "../assets.ts";
+import { addHeadTags, headTagsOf } from "../assets/head.ts";
 import { config } from "../config.ts";
 import type { Context, Handler } from "../context.ts";
 import { invalidate, liveScope, onInvalidate, signTags } from "../invalidate.ts";
@@ -645,12 +646,14 @@ export async function mountPages(options: PagesOptions): Promise<PageSite> {
 							status: out.status,
 							headers: { "content-type": out.html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", ...(out.location !== undefined && { location: out.location }) },
 							keep: out.status === 200 && !ctx.sessionLoaded,
+							...(headTagsOf(ctx).length > 0 && { headTags: headTagsOf(ctx) }),
 							...(out.tags && out.tags.size > 0 && { hold: liveHold(seconds) }),
 						};
 					},
 				);
 				if (kept) {
 					if (kept.prepared) options.assets?.markRewritten(ctx, kept);
+					if (kept.headTags) addHeadTags(ctx, kept.headTags);
 					return answer(ctx, kept);
 				}
 			}

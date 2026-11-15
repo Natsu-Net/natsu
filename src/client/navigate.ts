@@ -254,6 +254,10 @@ const keptInPlace = (had: string[], want: string[], weight: number[]): number[] 
 
 declare const NATSU_DEV: boolean | undefined;
 const DEV = typeof NATSU_DEV != "undefined" && NATSU_DEV;
+declare const NATSU_FIRST_LOAD: boolean | undefined;
+declare const NATSU_CHUNKS: boolean | undefined;
+const FIRST = typeof NATSU_FIRST_LOAD == "undefined" || NATSU_FIRST_LOAD;
+const HINTS = typeof NATSU_CHUNKS == "undefined" || NATSU_CHUNKS;
 const why = (...a: unknown[]) => console.info("natsu: real load,", ...a);
 
 /** A registration: selector, function, and the src of the script that made it ("" = everywhere). */
@@ -640,7 +644,7 @@ if (!first && KEY && regions(D)[0]) {
 	} catch {}
 
 	/** Head elements the server sent: the only ones a merge may remove. */
-	const owned = new Set([...D.head.children].filter((e) => !e.matches("script")));
+	const owned = new Set([...D.head.children].filter((e) => !e.matches("script" + (FIRST ? ",[data-natsu-warm]" : "") + (HINTS ? ",link[data-natsu-prefetch]" : ""))));
 	let parsed = new Set<Node>(D.body.childNodes);
 	const sync = (to: Element, from: Element) => {
 		for (const { name } of [...to.attributes]) from.hasAttribute(name) || name == LOADING || to.removeAttribute(name);
@@ -975,7 +979,7 @@ if (!first && KEY && regions(D)[0]) {
 	/** The regions' ids in order, each closed by a space, which no id holds. */
 	const ids = (els: Element[]) => "" + els.map((e) => e.id + " ");
 	const styles = (doc: { head: Element }) => [...doc.head.querySelectorAll<HTMLElement>("style," + SHEET)];
-	const styleKey = (e: Element) => (e.matches(SHEET) ? `${href(e)} ${e.getAttribute("media")} ${e.hasAttribute("disabled")}` : e.outerHTML);
+	const styleKey = (e: Element) => ((FIRST ? href(e) : e.matches(SHEET)) ? `${href(e)} ${e.getAttribute("media")} ${e.hasAttribute("disabled")}` : e.outerHTML);
 	const half = (e: Element | null) => {
 		const p = e?.previousElementSibling;
 		return !!p && e!.matches(SHEET) && p.matches(SHEET) && href(e!) == p.getAttribute(LATER);
@@ -991,7 +995,7 @@ if (!first && KEY && regions(D)[0]) {
 		}
 		return { root, head: root.querySelector("head")!, body: root.querySelector("body")! };
 	};
-	const href = (l: Element) => l.getAttribute("href");
+	const href = (l: Element) => (FIRST ? l.getAttribute("href") || l.getAttribute("data-natsu-critical") : l.getAttribute("href"));
 
 	const visit = async (url: string | URL, o: Opts = {}): Promise<void> => {
 		const u = new URL(url, L.href);

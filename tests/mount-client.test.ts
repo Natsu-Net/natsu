@@ -121,3 +121,89 @@ describe("mount", () => {
 		expect(order.slice(0, 4)).toEqual([C[0], C[1], C[3], C[2]]);
 	});
 });
+
+describe("critical styles and idle prefetch", () => {
+	function openRaw(html: string, chunks?: unknown): { w: W; fetched: string[]; idles: Array<() => void> } {
+		const window: W = new Window({ url: "https://shop.test/", settings: { disableCSSFileLoading: true, disableJavaScriptFileLoading: true, handleDisabledFileLoadingAsSuccess: true } } as never);
+		windows.push(window);
+		for (const name of ["Map", "Set", "WeakMap", "Promise", "JSON", "Array", "Object", "Number", "String", "RegExp", "Error", "Math", "URL"]) if (window[name] === undefined) window[name] = (globalThis as W)[name];
+		const fetched: string[] = [];
+		const idles: Array<() => void> = [];
+		window.fetch = async (url: string) => {
+			const path = String(url).replace("https://shop.test", "");
+			fetched.push(path);
+			if (path == "/_a/site.mounts.json") return new Response(MANIFEST, { headers: { "content-type": "application/json" } });
+			if (path == "/_a/chunks.json" && chunks) return new Response(JSON.stringify(chunks), { headers: { "content-type": "application/json" } });
+			return new Response("", { status: 404 });
+		};
+		window.requestIdleCallback = (fn: () => void) => (idles.push(fn), 0);
+		window.document.write(html);
+		Object.defineProperty(window.document, "readyState", { configurable: true, value: "complete" });
+		new Function("window", "document", `with (window) {${CODE}}`)(window, window.document);
+		return { w: window, fetched, idles };
+	}
+	const all = (w: W) => [...w.document.querySelectorAll("link[rel=stylesheet],style[data-natsu-critical]")].map((e: W) => e.getAttribute("data-natsu-critical") ?? e.getAttribute("href"));
+	const doc = (head: string, body: string) => `<!doctype html><html><head>${head}</head><body>${body}</body></html>`;
+	const CORE = `<style data-natsu-critical="${C[0]}" nonce="n1" data-natsu-families="/_a/site.mounts.json">.core{}</style><link rel="preload" as="style" href="${C[0]}" data-natsu-warm>`;
+
+	test("an inlined core sheet stands in for the core link: families link after it, with its nonce", async () => {
+		const { w } = openRaw(doc(CORE + `<link rel="stylesheet" href="${C[3]}">`, "<div data-ab></div>"));
+		let mounted = 0;
+		w.__mount("[data-ab]", async () => ({ mount: () => void mounted++ }));
+		await tick(10);
+		expect(all(w)).toEqual([C[0], C[1], C[2], C[3]]);
+		expect(mounted).toBe(1);
+		expect(sheets(w)).toEqual([C[1], C[2], C[3]]);
+		expect(w.document.querySelector(`link[href="${C[1]}"]`).getAttribute("nonce")).toBe("n1");
+		expect(w.document.querySelector(`link[href="${C[2]}"]`).getAttribute("nonce")).toBe("n1");
+	});
+
+	test("an inlined family counts as that family on the page: it is not linked again", async () => {
+		const { w } = openRaw(doc(CORE + `<style data-natsu-critical="${C[1]}" nonce="n1">.a{}</style>`, "<div data-ab></div>"));
+		w.__mount("[data-ab]", async () => ({ mount: () => {} }));
+		await tick(10);
+		expect(all(w)).toEqual([C[0], C[1], C[2]]);
+		expect(sheets(w)).toEqual([C[2]]);
+	});
+
+	test("an inlined family that ends up out of order is put back as a copy that keeps its rules", async () => {
+		const { w } = openRaw(doc(CORE + `<style data-natsu-critical="${C[1]}" nonce="n1">.a{color:red}</style><link rel="stylesheet" href="${C[3]}">`, "<div data-none></div>"));
+		w.__mount("[data-none]", async () => ({ mount: () => {} }));
+		await tick(10);
+		const b = w.document.createElement("link");
+		b.rel = "stylesheet";
+		b.href = C[2];
+		w.document.head.append(b);
+		await tick(10);
+		const order = all(w);
+		const last = (href: string) => order.lastIndexOf(href);
+		expect(last(C[0]!)).toBeLessThan(last(C[1]!));
+		expect(last(C[1]!)).toBeLessThan(last(C[2]!));
+		expect(last(C[2]!)).toBeLessThan(last(C[3]!));
+		expect(order.slice(0, 4)).toEqual([C[0], C[1], C[3], C[2]]);
+		for (const style of w.document.querySelectorAll("style[data-natsu-critical]")) expect(style.textContent).not.toBe("");
+		expect(w.document.querySelectorAll("[data-natsu-families]")).toHaveLength(1);
+	});
+
+	test("with the chunks meta tag, the first mount starts idle prefetch once; without it nothing is fetched for it", async () => {
+		const chunks = { i: {}, m: { "/_a/app.js": [["[data-late]", "/_a/chunk.late.js"], ["[data-a]", "/_a/chunk.a.js"]] } };
+		const head = `<link rel="stylesheet" href="${C[0]}" data-natsu-families="/_a/site.mounts.json"><script type="module" src="/_a/app.js"></script>`;
+		const on = openRaw(doc(`<meta name="natsu-chunks" content="/_a/chunks.json">` + head, "<div data-a></div>"), chunks);
+		on.w.__mount("[data-a]", async () => ({ mount: () => {} }));
+		on.w.__mount("[data-late]", async () => ({ mount: () => {} }));
+		await tick(10);
+		expect(on.idles).toHaveLength(1);
+		expect(on.fetched).not.toContain("/_a/chunks.json");
+		for (const fn of on.idles.splice(0)) fn();
+		await tick(10);
+		expect(on.fetched.filter((path) => path == "/_a/chunks.json")).toHaveLength(1);
+		expect([...on.w.document.querySelectorAll("link[data-natsu-prefetch]")].map((l: W) => `${l.getAttribute("rel")} ${l.getAttribute("href")}`)).toEqual(["prefetch /_a/chunk.a.js", "prefetch /_a/chunk.late.js"]);
+
+		const off = openRaw(doc(head, "<div data-a></div>"), chunks);
+		off.w.__mount("[data-a]", async () => ({ mount: () => {} }));
+		await tick(10);
+		expect(off.idles).toHaveLength(0);
+		expect(off.fetched).not.toContain("/_a/chunks.json");
+		expect(off.w.document.querySelectorAll("link[data-natsu-prefetch]")).toHaveLength(0);
+	});
+});

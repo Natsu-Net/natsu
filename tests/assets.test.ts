@@ -236,6 +236,32 @@ describe("script formats", () => {
 	});
 });
 
+describe("classic scripts that also export for tests", () => {
+	const run = (code: string): Record<string, unknown> => {
+		const window: Record<string, unknown> = {};
+		new Function("window", "globalThis", "document", code)(window, window, {});
+		return window;
+	};
+
+	for (const minify of [true, false]) {
+		test(`a script guarded by typeof module still runs, with module undefined (minify ${minify})`, async () => {
+			writeFileSync(
+				join(dir, "guarded.js"),
+				'(() => {\n\tconst twice = (n) => n * 2;\n\tif (typeof module !== "undefined") module.exports = { twice };\n\tif (typeof document === "undefined") return;\n\twindow.ran = twice(21);\n})();\n',
+			);
+			writeFileSync(
+				join(dir, "umd.js"),
+				'(function (root, factory) {\n\tif (typeof exports === "object" && typeof module !== "undefined") module.exports = factory();\n\telse root.Lib = factory();\n})(this, function () {\n\treturn { v: 1 };\n});\n',
+			);
+			const pipeline = new Assets({ outDir: out, classicScripts: { guarded: join(dir, "guarded.js"), umd: join(dir, "umd.js") }, minify });
+			await pipeline.build();
+
+			expect(run(await read(pipeline, pipeline.url("guarded"))).ran).toBe(42);
+			expect(run(await read(pipeline, pipeline.url("umd"))).Lib).toEqual({ v: 1 });
+		});
+	}
+});
+
 describe("deduplication", () => {
 	test("two pages that need the same rules share one chunk", async () => {
 		const pipeline = assets();
